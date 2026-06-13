@@ -1,0 +1,20 @@
+[Desktop Entry]
+Type=Application
+Version=1.0
+Name=daw-ai
+GenericName=Digital Audio Workstation
+Comment=Keyboard-driven, LLM-native DAW (desktop interface)
+# Forces XWayland (unset WAYLAND_DISPLAY) for a normal decorated, resizable window
+# on GNOME/Wayland — same as run-gui.sh. __DAW_AI_BIN__ is filled in by install-desktop.sh.
+Exec=env -u WAYLAND_DISPLAY XMODIFIERS=@im=none GTK_IM_MODULE=none QT_IM_MODULE=none __DAW_AI_BIN__ --gui
+# Working directory = repo root, so the app resolves relative asset paths
+# (assets/GeneralUser.sf2, assets/samples/…) exactly like `cargo run` does.
+# Without this, an icon launch runs from $HOME, the soundfont isn't found, the
+# audio engine never starts, and Play is silent. Filled in by install-desktop.sh.
+Path=__DAW_AI_DIR__
+Icon=daw-ai
+Terminal=false
+Categories=AudioVideo;Audio;Music;
+Keywords=daw;audio;music;sequencer;midi;synth;
+StartupWMClass=daw-ai
+StartupNotify=true

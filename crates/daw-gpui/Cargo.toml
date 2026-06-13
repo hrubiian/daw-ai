@@ -1,0 +1,12 @@
+[package]
+name = "daw-gpui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+base64 = "0.22"
+daw-core = { path = "../daw-core" }
+daw-io   = { path = "../daw-io" }
+gpui     = "0.2"
+rfd      = "0.15"

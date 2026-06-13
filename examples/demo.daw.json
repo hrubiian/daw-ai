@@ -1,0 +1,2266 @@
+{
+  "version": "0.1",
+  "project": {
+    "name": "Demo Groove",
+    "bpm": 126.0,
+    "time_signature": [
+      4,
+      4
+    ],
+    "key": "B",
+    "scale": "minor",
+    "swing": 0.12,
+    "metronome": false,
+    "humanize": 0.15
+  },
+  "tracks": [
+    {
+      "id": "t1",
+      "name": "Drums",
+      "type": "drum",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 0,
+        "bank": 128
+      },
+      "volume": 0.9,
+      "pan": 0.0,
+      "muted": false,
+      "patterns": [
+        "p_drum_intro",
+        "p_drum_main",
+        "p_drum_transition",
+        "p_drum_climax"
+      ],
+      "effects": {
+        "reverb": 0.05,
+        "chorus": 0.0,
+        "cutoff": 1.0,
+        "resonance": 0.0,
+        "lfo_depth": 0.0,
+        "send_delay": 0.05,
+        "delay_time_ms": 0,
+        "delay_feedback": 0.4,
+        "delay_mix": 0.0,
+        "drive": 0.45,
+        "eq_low_gain": 3.0,
+        "eq_mid_gain": 0.0,
+        "eq_high_gain": 2.5,
+        "eq_mid_freq": 1000.0,
+        "comp_threshold": -10.0,
+        "comp_ratio": 2.0,
+        "comp_attack_ms": 10.0,
+        "comp_release_ms": 100.0
+      },
+      "modulators": []
+    },
+    {
+      "id": "t2",
+      "name": "Bass",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 38,
+        "bank": 0
+      },
+      "volume": 0.82,
+      "pan": 0.0,
+      "muted": false,
+      "patterns": [
+        "p_bass"
+      ],
+      "effects": {
+        "reverb": 0.08,
+        "chorus": 0.15,
+        "cutoff": 0.58,
+        "resonance": 0.35,
+        "lfo_depth": 0.1,
+        "send_delay": 0.0,
+        "delay_time_ms": 0,
+        "delay_feedback": 0.4,
+        "delay_mix": 0.0,
+        "drive": 0.38,
+        "eq_low_gain": 3.0,
+        "eq_mid_gain": -2.0,
+        "eq_high_gain": -1.0,
+        "eq_mid_freq": 800.0,
+        "comp_threshold": -15.0,
+        "comp_ratio": 4.0,
+        "comp_attack_ms": 5.0,
+        "comp_release_ms": 80.0
+      },
+      "modulators": []
+    },
+    {
+      "id": "t3",
+      "name": "Lead",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 80,
+        "bank": 0
+      },
+      "volume": 0.74,
+      "pan": 0.0,
+      "muted": false,
+      "patterns": [
+        "p_lead",
+        "p_lead_transition",
+        "p_lead_climax"
+      ],
+      "effects": {
+        "reverb": 0.38,
+        "chorus": 0.2,
+        "cutoff": 0.8,
+        "resonance": 0.25,
+        "lfo_depth": 0.2,
+        "send_delay": 0.35,
+        "delay_time_ms": 238,
+        "delay_feedback": 0.38,
+        "delay_mix": 0.25,
+        "drive": 0.15,
+        "eq_low_gain": -3.0,
+        "eq_mid_gain": 1.0,
+        "eq_high_gain": 2.0,
+        "eq_mid_freq": 2000.0,
+        "comp_threshold": -12.0,
+        "comp_ratio": 2.5,
+        "comp_attack_ms": 10.0,
+        "comp_release_ms": 100.0
+      },
+      "modulators": [
+        {
+          "dest": "pan",
+          "shape": "sine",
+          "rate_hz": 0.08,
+          "depth": 0.35,
+          "phase": 0.0
+        },
+        {
+          "dest": "cutoff",
+          "shape": "sine",
+          "rate_hz": 0.12,
+          "depth": 0.2,
+          "phase": 0.0
+        }
+      ],
+      "clap_fx": []
+    },
+    {
+      "id": "t4",
+      "name": "Pad",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 50,
+        "bank": 0
+      },
+      "volume": 0.6,
+      "pan": 0.0,
+      "muted": false,
+      "patterns": [
+        "p_pad"
+      ],
+      "effects": {
+        "reverb": 0.45,
+        "chorus": 0.25,
+        "cutoff": 0.65,
+        "resonance": 0.2,
+        "lfo_depth": 0.15,
+        "send_delay": 0.2,
+        "delay_time_ms": 0,
+        "delay_feedback": 0.4,
+        "delay_mix": 0.0,
+        "drive": 0.05,
+        "eq_low_gain": -2.0,
+        "eq_mid_gain": 0.0,
+        "eq_high_gain": 1.0,
+        "eq_mid_freq": 1000.0,
+        "comp_threshold": 0.0,
+        "comp_ratio": 1.0,
+        "comp_attack_ms": 10.0,
+        "comp_release_ms": 100.0
+      },
+      "modulators": [
+        {
+          "dest": "cutoff",
+          "shape": "triangle",
+          "rate_hz": 0.05,
+          "depth": 0.25,
+          "phase": 0.0
+        },
+        {
+          "dest": "pan",
+          "shape": "sine",
+          "rate_hz": 0.03,
+          "depth": 0.2,
+          "phase": 0.0
+        }
+      ]
+    },
+    {
+      "id": "t5",
+      "name": "Arp",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 81,
+        "bank": 0
+      },
+      "volume": 0.55,
+      "pan": 0.0,
+      "muted": false,
+      "patterns": [
+        "p_arp"
+      ],
+      "effects": {
+        "reverb": 0.4,
+        "chorus": 0.1,
+        "cutoff": 0.7,
+        "resonance": 0.2,
+        "lfo_depth": 0.0,
+        "send_delay": 0.25,
+        "delay_time_ms": 119,
+        "delay_feedback": 0.3,
+        "delay_mix": 0.2,
+        "drive": 0.1,
+        "eq_low_gain": -4.0,
+        "eq_mid_gain": 0.0,
+        "eq_high_gain": 1.0,
+        "eq_mid_freq": 1000.0,
+        "comp_threshold": -10.0,
+        "comp_ratio": 2.0,
+        "comp_attack_ms": 10.0,
+        "comp_release_ms": 100.0
+      },
+      "modulators": [
+        {
+          "dest": "pan",
+          "shape": "sine",
+          "rate_hz": 0.15,
+          "depth": 0.45,
+          "phase": 0.0
+        },
+        {
+          "dest": "cutoff",
+          "shape": "sine",
+          "rate_hz": 0.08,
+          "depth": 0.25,
+          "phase": 0.0
+        }
+      ]
+    },
+    {
+      "id": "t6",
+      "name": "Sweep",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 95,
+        "bank": 0
+      },
+      "volume": 0.58,
+      "pan": 0.0,
+      "muted": false,
+      "patterns": [
+        "p_sweep"
+      ],
+      "effects": {
+        "reverb": 0.55,
+        "chorus": 0.2,
+        "cutoff": 0.5,
+        "resonance": 0.3,
+        "lfo_depth": 0.3,
+        "send_delay": 0.4,
+        "delay_time_ms": 238,
+        "delay_feedback": 0.45,
+        "delay_mix": 0.3,
+        "drive": 0.0,
+        "eq_low_gain": -4.0,
+        "eq_mid_gain": 0.0,
+        "eq_high_gain": 2.0,
+        "eq_mid_freq": 2000.0,
+        "comp_threshold": 0.0,
+        "comp_ratio": 1.0,
+        "comp_attack_ms": 10.0,
+        "comp_release_ms": 100.0
+      },
+      "modulators": [
+        {
+          "dest": "cutoff",
+          "shape": "sine",
+          "rate_hz": 0.04,
+          "depth": 0.3,
+          "phase": 0.0
+        }
+      ]
+    },
+    {
+      "id": "t7",
+      "name": "Chime",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 98,
+        "bank": 0
+      },
+      "volume": 0.65,
+      "pan": 0.0,
+      "muted": false,
+      "patterns": [
+        "p_chime"
+      ],
+      "effects": {
+        "reverb": 0.5,
+        "chorus": 0.2,
+        "cutoff": 0.85,
+        "resonance": 0.3,
+        "lfo_depth": 0.15,
+        "send_delay": 0.45,
+        "delay_time_ms": 0,
+        "delay_feedback": 0.4,
+        "delay_mix": 0.0,
+        "drive": 0.0,
+        "eq_low_gain": -6.0,
+        "eq_mid_gain": 0.0,
+        "eq_high_gain": 2.0,
+        "eq_mid_freq": 2000.0,
+        "comp_threshold": -10.0,
+        "comp_ratio": 2.0,
+        "comp_attack_ms": 10.0,
+        "comp_release_ms": 100.0
+      },
+      "modulators": [
+        {
+          "dest": "pan",
+          "shape": "sine",
+          "rate_hz": 0.25,
+          "depth": 0.6,
+          "phase": 0.0
+        }
+      ]
+    },
+    {
+      "id": "t8",
+      "name": "Gated Synth",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 81,
+        "bank": 0
+      },
+      "volume": 0.52,
+      "pan": 0.0,
+      "muted": false,
+      "patterns": [
+        "p_clap_tone"
+      ],
+      "effects": {
+        "reverb": 0.45,
+        "chorus": 0.2,
+        "cutoff": 0.75,
+        "resonance": 0.2,
+        "lfo_depth": 0.0,
+        "send_delay": 0.3,
+        "delay_time_ms": 0,
+        "delay_feedback": 0.4,
+        "delay_mix": 0.0,
+        "drive": 0.0,
+        "eq_low_gain": -4.0,
+        "eq_mid_gain": 0.0,
+        "eq_high_gain": 0.0,
+        "eq_mid_freq": 1000.0,
+        "comp_threshold": 0.0,
+        "comp_ratio": 1.0,
+        "comp_attack_ms": 10.0,
+        "comp_release_ms": 100.0
+      },
+      "modulators": [
+        {
+          "dest": "pan",
+          "shape": "sine",
+          "rate_hz": 0.2,
+          "depth": 0.5,
+          "phase": 0.0
+        }
+      ],
+      "clap_fx": []
+    }
+  ],
+  "patterns": [
+    {
+      "type": "step",
+      "id": "p_drum_intro",
+      "name": "Intro Beat",
+      "bars": 1,
+      "steps": 16,
+      "rows": [
+        {
+          "name": "p36",
+          "pitch": 36,
+          "vel": 100,
+          "steps": [
+            100,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "p42",
+          "pitch": 42,
+          "vel": 80,
+          "steps": [
+            70,
+            70,
+            90,
+            70,
+            70,
+            70,
+            90,
+            70,
+            70,
+            70,
+            90,
+            70,
+            70,
+            70,
+            90,
+            70
+          ]
+        },
+        {
+          "name": "p46",
+          "pitch": 46,
+          "vel": 95,
+          "steps": [
+            0,
+            0,
+            95,
+            0,
+            0,
+            0,
+            95,
+            0,
+            0,
+            0,
+            95,
+            0,
+            0,
+            0,
+            95,
+            0
+          ]
+        }
+      ],
+      "gate": 0.5
+    },
+    {
+      "type": "step",
+      "id": "p_drum_main",
+      "name": "Electro House Beat",
+      "bars": 1,
+      "steps": 16,
+      "rows": [
+        {
+          "name": "p36",
+          "pitch": 36,
+          "vel": 105,
+          "steps": [
+            105,
+            0,
+            0,
+            0,
+            105,
+            0,
+            0,
+            0,
+            105,
+            0,
+            70,
+            0,
+            105,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "p38",
+          "pitch": 38,
+          "vel": 100,
+          "steps": [
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "p39",
+          "pitch": 39,
+          "vel": 95,
+          "steps": [
+            0,
+            0,
+            0,
+            0,
+            95,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            95,
+            0,
+            0,
+            90
+          ]
+        },
+        {
+          "name": "p40",
+          "pitch": 40,
+          "vel": 90,
+          "steps": [
+            0,
+            0,
+            0,
+            0,
+            90,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            90,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "p42",
+          "pitch": 42,
+          "vel": 80,
+          "steps": [
+            75,
+            55,
+            80,
+            55,
+            75,
+            55,
+            80,
+            55,
+            75,
+            55,
+            80,
+            55,
+            75,
+            55,
+            80,
+            55
+          ]
+        },
+        {
+          "name": "p46",
+          "pitch": 46,
+          "vel": 95,
+          "steps": [
+            0,
+            0,
+            95,
+            0,
+            0,
+            0,
+            95,
+            0,
+            0,
+            0,
+            95,
+            0,
+            0,
+            0,
+            95,
+            0
+          ]
+        }
+      ],
+      "gate": 0.5
+    },
+    {
+      "type": "step",
+      "id": "p_drum_transition",
+      "name": "Snare Build Transition",
+      "bars": 1,
+      "steps": 16,
+      "rows": [
+        {
+          "name": "p38",
+          "pitch": 38,
+          "vel": 100,
+          "steps": [
+            40,
+            45,
+            50,
+            55,
+            60,
+            65,
+            70,
+            75,
+            80,
+            85,
+            90,
+            95,
+            100,
+            105,
+            110,
+            115
+          ]
+        },
+        {
+          "name": "p40",
+          "pitch": 40,
+          "vel": 90,
+          "steps": [
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            60,
+            70,
+            80,
+            90,
+            100,
+            105,
+            110,
+            120
+          ]
+        }
+      ],
+      "gate": 0.5
+    },
+    {
+      "type": "step",
+      "id": "p_drum_climax",
+      "name": "Climax Electro Beat",
+      "bars": 1,
+      "steps": 16,
+      "rows": [
+        {
+          "name": "p36",
+          "pitch": 36,
+          "vel": 110,
+          "steps": [
+            110,
+            0,
+            0,
+            0,
+            110,
+            0,
+            0,
+            0,
+            110,
+            0,
+            80,
+            0,
+            110,
+            0,
+            80,
+            0
+          ]
+        },
+        {
+          "name": "p38",
+          "pitch": 38,
+          "vel": 110,
+          "steps": [
+            0,
+            0,
+            0,
+            0,
+            110,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            110,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "p39",
+          "pitch": 39,
+          "vel": 100,
+          "steps": [
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0,
+            95,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            95
+          ]
+        },
+        {
+          "name": "p40",
+          "pitch": 40,
+          "vel": 100,
+          "steps": [
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "p42",
+          "pitch": 42,
+          "vel": 80,
+          "steps": [
+            80,
+            60,
+            85,
+            60,
+            80,
+            60,
+            85,
+            60,
+            80,
+            60,
+            85,
+            60,
+            80,
+            60,
+            85,
+            60
+          ]
+        },
+        {
+          "name": "p46",
+          "pitch": 46,
+          "vel": 100,
+          "steps": [
+            0,
+            0,
+            100,
+            0,
+            0,
+            0,
+            100,
+            60,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0,
+            100,
+            60
+          ]
+        }
+      ],
+      "gate": 0.5
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_bass",
+      "name": "Pulsing Bass",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 35,
+          "tick": 0,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 35,
+          "tick": 60,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 35,
+          "tick": 180,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 35,
+          "tick": 240,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 35,
+          "tick": 360,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 31,
+          "tick": 480,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 31,
+          "tick": 540,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 31,
+          "tick": 660,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 31,
+          "tick": 720,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 31,
+          "tick": 840,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 38,
+          "tick": 960,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 38,
+          "tick": 1020,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 38,
+          "tick": 1140,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 38,
+          "tick": 1200,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 38,
+          "tick": 1320,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 33,
+          "tick": 1440,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 33,
+          "tick": 1500,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 33,
+          "tick": 1620,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 33,
+          "tick": 1680,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 33,
+          "tick": 1800,
+          "duration": 60,
+          "vel": 100
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_lead",
+      "name": "Saw Hook",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 66,
+          "tick": 0,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 60,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 120,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 180,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 240,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 300,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 360,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 480,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 540,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 600,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 660,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 720,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 780,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 840,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 960,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 1020,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1080,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 1140,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1200,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 1260,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1320,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1440,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 64,
+          "tick": 1500,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1560,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 64,
+          "tick": 1620,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1680,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 64,
+          "tick": 1740,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1800,
+          "duration": 60,
+          "vel": 100
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_lead_transition",
+      "name": "Drop Transition Lead",
+      "bars": 1,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 83,
+          "tick": 0,
+          "duration": 120,
+          "vel": 100
+        },
+        {
+          "pitch": 83,
+          "tick": 0,
+          "duration": 120,
+          "vel": 100
+        },
+        {
+          "pitch": 83,
+          "tick": 0,
+          "duration": 120,
+          "vel": 100
+        },
+        {
+          "pitch": 83,
+          "tick": 0,
+          "duration": 120,
+          "vel": 100
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_lead_climax",
+      "name": "Climax Lead",
+      "bars": 8,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 71,
+          "tick": 0,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 120,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 74,
+          "tick": 240,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 360,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 480,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 600,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 74,
+          "tick": 720,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 840,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 960,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 1080,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 74,
+          "tick": 1200,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1320,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 73,
+          "tick": 1440,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1560,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 76,
+          "tick": 1680,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 73,
+          "tick": 1800,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 74,
+          "tick": 1920,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 2040,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 78,
+          "tick": 2160,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 74,
+          "tick": 2280,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 74,
+          "tick": 2400,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 2520,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 79,
+          "tick": 2640,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 74,
+          "tick": 2760,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 78,
+          "tick": 2880,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 74,
+          "tick": 3000,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 81,
+          "tick": 3120,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 78,
+          "tick": 3240,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 76,
+          "tick": 3360,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 73,
+          "tick": 3480,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 81,
+          "tick": 3600,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 76,
+          "tick": 3720,
+          "duration": 60,
+          "vel": 100
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_pad",
+      "name": "French Chords",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 59,
+          "tick": 0,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 0,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 0,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 55,
+          "tick": 480,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 59,
+          "tick": 480,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 480,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 50,
+          "tick": 960,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 54,
+          "tick": 960,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 960,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1440,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 61,
+          "tick": 1440,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 64,
+          "tick": 1440,
+          "duration": 480,
+          "vel": 100
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_arp",
+      "name": "Arp",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 59,
+          "tick": 0,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 30,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 60,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 90,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 59,
+          "tick": 120,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 150,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 180,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 210,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 59,
+          "tick": 240,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 270,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 300,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 330,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 59,
+          "tick": 360,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 390,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 66,
+          "tick": 420,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 450,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 55,
+          "tick": 480,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 59,
+          "tick": 510,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 540,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 570,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 55,
+          "tick": 600,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 59,
+          "tick": 630,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 660,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 690,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 55,
+          "tick": 720,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 59,
+          "tick": 750,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 780,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 810,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 55,
+          "tick": 840,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 59,
+          "tick": 870,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 900,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 930,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 50,
+          "tick": 960,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 54,
+          "tick": 990,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1020,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 1050,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 50,
+          "tick": 1080,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 54,
+          "tick": 1110,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1140,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 1170,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 50,
+          "tick": 1200,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 54,
+          "tick": 1230,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1260,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 1290,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 50,
+          "tick": 1320,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 54,
+          "tick": 1350,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1380,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 62,
+          "tick": 1410,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1440,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 61,
+          "tick": 1470,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 64,
+          "tick": 1500,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1530,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1560,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 61,
+          "tick": 1590,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 64,
+          "tick": 1620,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1650,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1680,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 61,
+          "tick": 1710,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 64,
+          "tick": 1740,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1770,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 57,
+          "tick": 1800,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 61,
+          "tick": 1830,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 64,
+          "tick": 1860,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 69,
+          "tick": 1890,
+          "duration": 30,
+          "vel": 100
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_sweep",
+      "name": "Wind Sweep",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 59,
+          "tick": 0,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 480,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 55,
+          "tick": 960,
+          "duration": 480,
+          "vel": 100
+        },
+        {
+          "pitch": 67,
+          "tick": 1440,
+          "duration": 480,
+          "vel": 100
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_chime",
+      "name": "Chimes",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 90,
+          "tick": 120,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 86,
+          "tick": 300,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 93,
+          "tick": 600,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 85,
+          "tick": 780,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 83,
+          "tick": 1080,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 90,
+          "tick": 1260,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 88,
+          "tick": 1560,
+          "duration": 60,
+          "vel": 100
+        },
+        {
+          "pitch": 85,
+          "tick": 1740,
+          "duration": 60,
+          "vel": 100
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "p_clap_tone",
+      "name": "CLAP Gated Synth",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 71,
+          "tick": 0,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 60,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 120,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 180,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 240,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 300,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 360,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 420,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 480,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 540,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 600,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 660,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 720,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 780,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 840,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 900,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 960,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1020,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1080,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1140,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1200,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1260,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1320,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1380,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1440,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1500,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1560,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1620,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1680,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1740,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1800,
+          "duration": 30,
+          "vel": 100
+        },
+        {
+          "pitch": 71,
+          "tick": 1860,
+          "duration": 30,
+          "vel": 100
+        }
+      ]
+    }
+  ],
+  "arrangement": [
+    {
+      "track": "t1",
+      "pattern": "p_drum_intro",
+      "bar": 0,
+      "len_bars": 4
+    },
+    {
+      "track": "t1",
+      "pattern": "p_drum_main",
+      "bar": 4,
+      "len_bars": 8
+    },
+    {
+      "track": "t1",
+      "pattern": "p_drum_intro",
+      "bar": 12,
+      "len_bars": 4
+    },
+    {
+      "track": "t1",
+      "pattern": "p_drum_main",
+      "bar": 16,
+      "len_bars": 7
+    },
+    {
+      "track": "t1",
+      "pattern": "p_drum_transition",
+      "bar": 23,
+      "len_bars": 1
+    },
+    {
+      "track": "t1",
+      "pattern": "p_drum_climax",
+      "bar": 24,
+      "len_bars": 8
+    },
+    {
+      "track": "t1",
+      "pattern": "p_drum_intro",
+      "bar": 32,
+      "len_bars": 4
+    },
+    {
+      "track": "t2",
+      "pattern": "p_bass",
+      "bar": 0,
+      "len_bars": 23
+    },
+    {
+      "track": "t2",
+      "pattern": "p_bass",
+      "bar": 24,
+      "len_bars": 12
+    },
+    {
+      "track": "t3",
+      "pattern": "p_lead",
+      "bar": 4,
+      "len_bars": 8
+    },
+    {
+      "track": "t3",
+      "pattern": "p_lead_transition",
+      "bar": 23,
+      "len_bars": 1
+    },
+    {
+      "track": "t3",
+      "pattern": "p_lead_climax",
+      "bar": 24,
+      "len_bars": 8
+    },
+    {
+      "track": "t4",
+      "pattern": "p_pad",
+      "bar": 0,
+      "len_bars": 36
+    },
+    {
+      "track": "t5",
+      "pattern": "p_arp",
+      "bar": 16,
+      "len_bars": 7
+    },
+    {
+      "track": "t5",
+      "pattern": "p_arp",
+      "bar": 24,
+      "len_bars": 8
+    },
+    {
+      "track": "t6",
+      "pattern": "p_sweep",
+      "bar": 0,
+      "len_bars": 36
+    },
+    {
+      "track": "t7",
+      "pattern": "p_chime",
+      "bar": 0,
+      "len_bars": 4
+    },
+    {
+      "track": "t7",
+      "pattern": "p_chime",
+      "bar": 24,
+      "len_bars": 8
+    },
+    {
+      "track": "t8",
+      "pattern": "p_clap_tone",
+      "bar": 24,
+      "len_bars": 8
+    }
+  ],
+  "returns": {
+    "reverb": {
+      "gain": 1.0,
+      "muted": false,
+      "room_size": 0.65,
+      "damping": 0.3,
+      "width": 0.8
+    },
+    "delay": {
+      "gain": 1.0,
+      "muted": false,
+      "time_ms": 238,
+      "feedback": 0.42
+    }
+  },
+  "loop_region": {
+    "start_bar": 0,
+    "end_bar": 36,
+    "enabled": false,
+    "punch_in": false,
+    "punch_out": false
+  }
+}

@@ -1,0 +1,9 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="256" height="256" viewBox="0 0 256 256">
+  <!-- daw-ai app icon: a step-sequencer / EQ motif in the app's accent on its dark panel -->
+  <rect width="256" height="256" rx="48" fill="#16161a"/>
+  <rect x="35"  y="150" width="26" height="70"  rx="8" fill="#ff9d4d"/>
+  <rect x="75"  y="96"  width="26" height="124" rx="8" fill="#ff9d4d"/>
+  <rect x="115" y="56"  width="26" height="164" rx="8" fill="#ff9d4d"/>
+  <rect x="155" y="112" width="26" height="108" rx="8" fill="#ffb877"/>
+  <rect x="195" y="80"  width="26" height="140" rx="8" fill="#ffb877"/>
+</svg>

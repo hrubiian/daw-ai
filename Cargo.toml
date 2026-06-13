@@ -1,0 +1,21 @@
+[package]
+name = "daw-ai"
+version = "0.1.0"
+edition = "2021"
+
+[workspace]
+members = [
+    "crates/daw-core", "crates/daw-io", "crates/daw-tui", "crates/daw-gpui",
+    # Hermetic CLAP test fixtures (cdylibs loaded by daw-core's host tests).
+    "crates/daw-clap-testplug-gain", "crates/daw-clap-testplug-tone",
+    "crates/daw-mcp",
+]
+resolver = "2"
+
+[dependencies]
+daw-tui             = { path = "crates/daw-tui" }
+daw-core            = { path = "crates/daw-core" }
+daw-io              = { path = "crates/daw-io" }
+daw-gpui            = { path = "crates/daw-gpui" }
+anyhow              = "1"
+crossbeam-channel   = "0.5"

@@ -1,0 +1,10 @@
+{
+  "mcpServers": {
+    "daw": {
+      "command": "target/debug/daw-mcp",
+      "args": [
+        "examples/demo.daw.json"
+      ]
+    }
+  }
+}

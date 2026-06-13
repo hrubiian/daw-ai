@@ -1,0 +1,14 @@
+[package]
+name = "daw-tui"
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+
+[dependencies]
+daw-core            = { path = "../daw-core" }
+daw-io              = { path = "../daw-io" }
+ratatui             = "0.29"
+crossterm           = { version = "0.28", features = ["event-stream"] }
+anyhow              = "1"
+crossbeam-channel   = "0.5"
+rustfft             = "6"

@@ -1,0 +1,20 @@
+.superpowers/
+assets/*.sf2
+/target/
+
+# Audio assets & renders — kept out of git (large binaries); fetch/generate locally.
+*.wav
+/recordings/
+/assets/samples/
+/assets/tesla-driver-master/
+renders/
+
+# personal workspace (never committed)
+scratch/
+projects/
+todos.txt
+__pycache__/
+.DS_Store
+/*.wav
+recordings/
+/untitled.daw.json
