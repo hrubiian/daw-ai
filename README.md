@@ -14,9 +14,9 @@ GUI, terminal UI, and an MCP server that lets AI agents compose, mix, and
 ## Why this exists
 
 - **The project file is the API.** Songs are human-readable `.daw.json`
-  ([format docs](docs/project-format.md)); JAM mode hot-reloads every
-  external edit into the running app — an LLM (or you, in a text editor)
-  co-produces live, with full undo.
+  ([format docs](docs/project-format.md)); a local shared session lets a musician
+  and an LLM edit with revision checks and shared undo. File-based MCP and conflict-checked JAM import remain
+  available for offline work.
 - **Agents can hear.** The bundled MCP server exposes ~30 tools: compose
   (drum grids, mini-notation melodies, arrangement), mix (faders, sends,
   CLAP plugins, auto-balance) — and `listen`, which renders any bar range
@@ -25,8 +25,9 @@ GUI, terminal UI, and an MCP server that lets AI agents compose, mix, and
 - **It's a real DAW.** Per-track mixer with insert FX, reverb/delay send
   buses and live meters; CLAP plugin hosting (instruments and effects);
   transport-synced audio recording with count-in and loop/punch takes;
-  a piano roll with multi-bar legato; WAV export that is bit-identical to
-  playback by construction.
+  a piano roll with multi-bar legato; WAV and MP3 export through the shared
+  mixer. Scheduling, device/plugin settings and normalization can affect
+  live/offline results.
 
 ## Quickstart
 
@@ -37,7 +38,7 @@ cargo run --release -- --gui examples/demo.daw.json  # desktop GUI
 ```
 
 - GNOME/Wayland: use `./run-gui.sh` for a normal resizable window
-  (gpui's native Wayland window can't be decorated yet).
+  on systems that need XWayland. Native Wayland also has client window controls.
 - Terminal UI instead: `cargo run --release` ([TUI guide](docs/tui.md)).
 - The example song was composed entirely by an LLM through the MCP server.
 
@@ -57,16 +58,19 @@ returns a fresh project summary), the GUI follows live, `auto_balance`
 levels the tracks by measured loudness, and `listen` tells it what the
 render actually sounds like — numbers it can act on.
 
+For direct live-session editing, [discover and select the running session](docs/live-collaboration.md).
+A disconnected agent reports an error instead of falling back to file replacement.
+
 ## Features
 
 | Area | Today |
 |---|---|
 | **Sequencing** | 16th-note step grid with per-step velocity, piano roll with drag-stretch legato across bars, Strudel-style mini-notation REPL, arrangement timeline with clip content previews, loop region |
-| **Mixing** | Per-track inserts (EQ/comp/delay/drive/filter), reverb + delay send buses, live meters, master limiter, one-click auto-balance, faders to +6 dB |
+| **Mixing** | Dedicated Mixing workspace, EQ/comp/delay/drive/filter, shaped reverb, synced stereo echoes, sends, live meters, master limiter and auto-balance |
 | **Recording** | Transport-synced takes with count-in, punch-in/out, loop-cycle takes (one WAV per pass), MIDI recording into patterns, input metering with clip latch |
 | **Plugins** | CLAP hosting: instruments and insert effects, plugin discovery, generic param editing, state saved in the project |
 | **AI** | MCP server (~30 tools), JSON project format, JAM hot-reload, listening/analysis tools, auto-balance |
-| **I/O** | GM soundfonts (per-track `.sf2`), one-shot samplers, audio clips with waveforms and crop, MIDI keyboard input, WAV export |
+| **I/O** | GM soundfonts (per-track `.sf2`), velocity-layered samplers with alternate takes, audio clips, MIDI input, WAV and MP3 export |
 
 ## Architecture
 
@@ -76,7 +80,7 @@ render actually sounds like — numbers it can act on.
 | `daw-io` | Host glue: audio/MIDI device handling, capture, the engine relay |
 | `daw-gpui` | Desktop GUI (gpui) |
 | `daw-tui` | Terminal UI (ratatui) |
-| `daw-mcp` | MCP server over one project file (rmcp, stdio) |
+| `daw-mcp` | MCP server over a selected live session or project file (rmcp, stdio) |
 
 Every feature was built spec-first — designed, planned, then implemented
 and verified one slice at a time.
@@ -85,12 +89,19 @@ and verified one slice at a time.
 
 - [Terminal UI guide & keybindings](docs/tui.md)
 - [The `.daw.json` project format](docs/project-format.md)
+- [Desktop UI and Mixing](docs/desktop-ui.md)
+- [Live collaboration, safe saves and background rendering](docs/live-collaboration.md)
+- [Creative effects and CLAP controls](docs/creative-effects.md)
+- [MP3 export](docs/mp3-export.md)
+- [Listening and analysis tools](docs/analysis-and-ci.md)
+- [Musical collaboration workflow](docs/music-collaboration.md)
+- [Reusable composer skill](skills/bonobo-composer/SKILL.md)
 - [CLAUDE.md](CLAUDE.md) — working on the codebase (with an AI or without)
 
 ## Roadmap
 
 Automation lanes · piano-roll velocity/CC editing · take comping ·
-time-stretch · live transport control for agents (IPC) · DAWproject
+time-stretch · richer expression/articulation editing · DAWproject
 export · de-click micro-fades.
 
 ## License
@@ -113,3 +124,10 @@ and feel free to share what your model makes.
 **Ideas are very welcome.** If you have a feature, a direction, or just
 want to talk about where this could go, open an issue or get in touch with
 the developer: **nazariihrubiian@gmail.com**.
+
+## Verification
+
+Run `bash scripts/check.sh` for the Linux build, MCP protocol checks, workspace
+tests and Clippy. Set `DAW_REQUIRE_TEST_ASSETS=1` when the test soundfont is
+installed. MP3 integration tests require FFmpeg with libmp3lame. Hardware tests
+remain explicit; headless checks do not certify every audio device or plugin.

@@ -7,9 +7,7 @@ use std::collections::BTreeMap;
 use std::sync::{Arc, atomic::{AtomicU32, AtomicU8, Ordering}};
 use std::time::{Duration, Instant};
 
-pub const TICKS_PER_BAR: u32 = 480;
-pub const BEATS_PER_BAR: u32 = 4;
-pub const TICKS_PER_BEAT: u32 = TICKS_PER_BAR / BEATS_PER_BAR; // 120
+pub use crate::musical_time::{TICKS_PER_BAR, BEATS_PER_BAR, TICKS_PER_BEAT};
 
 pub enum SequencerCommand {
     Play,
@@ -19,9 +17,11 @@ pub enum SequencerCommand {
     Seek(u32),
     SetBpm(f64),
     SetSwing(f32),
+    SetTiming(f32),
     LoadProject(Project),
     /// Like LoadProject but keeps the current playhead position (live edit).
     UpdateLive(Project),
+    UpdateRevision { project: Project, revision: u64, ack: Arc<std::sync::atomic::AtomicU64> },
     SetTrackVolume  { track_id: String, volume: f32 },
     SetTrackMute    { track_id: String, muted: bool },
     SetTrackPan     { track_id: String, pan: f32 },
@@ -63,6 +63,39 @@ pub fn swung_step_tick(step: u32, swing: f32) -> u32 {
 /// `(channel, pitch, tick)`, so live playback and offline export agree and
 /// renders are reproducible. At `humanize = 1.0`, velocity varies by ±35%.
 /// `humanize <= 0` returns the input unchanged. Result is clamped to `1..=127`.
+/// Deterministic per-note timing jitter in ticks, seeded from note identity
+/// (pitch + note_tick + strip) so a note's micro-shift is stable across loop
+/// passes. Returns 0 when `timing <= 0`. Bounded by ±15 ticks (a 32nd).
+pub fn humanize_timing_offset(pitch: u8, note_tick: u32, strip: u8, timing: f32) -> i32 {
+    let t = timing.clamp(0.0, 1.0);
+    if t <= 0.0 {
+        return 0;
+    }
+    const MAX_TICKS: f32 = 15.0;
+    let mut x = note_tick
+        .wrapping_mul(2_246_822_519)
+        ^ (pitch as u32).wrapping_mul(2_654_435_761)
+        ^ (strip as u32).wrapping_mul(40_503);
+    x ^= x >> 13;
+    x = x.wrapping_mul(2_654_435_761);
+    x ^= x >> 16;
+    let unit = (x as f32 / u32::MAX as f32) * 2.0 - 1.0; // [-1, 1]
+    (unit * t * MAX_TICKS).round() as i32
+}
+
+/// Shared live/offline note placement, including deterministic timing humanization.
+pub fn note_fire_tick(pitch: u8, nominal: u32, strip: u8, timing: f32, pattern_len: u32) -> u32 {
+    let offset = humanize_timing_offset(pitch, nominal, strip, timing);
+    (nominal as i64 + offset as i64).clamp(0, pattern_len.saturating_sub(1) as i64) as u32
+}
+
+pub fn piano_note_duration(pattern: &crate::project::PianoRollPattern, note: &crate::project::Note) -> u32 {
+    if pattern.legato {
+        pattern.notes.iter().map(|n| n.tick).filter(|&tick| tick > note.tick).min()
+            .map(|next| next - note.tick).unwrap_or(note.duration)
+    } else { note.duration }
+}
+
 pub fn humanize_velocity(vel: u8, channel: u8, pitch: u8, tick: u32, humanize: f32) -> u8 {
     let h = humanize.clamp(0.0, 1.0);
     if h <= 0.0 || vel == 0 {
@@ -119,6 +152,7 @@ pub fn sec_to_tick(sec: f64, bpm: f64) -> u32 {
 // One arranged audio clip, resolved to ticks for triggering. Track volume,
 // pan, and mute are applied by the clip's strip in the mixer, so the job only
 // carries the clip's own gain.
+#[derive(PartialEq)]
 struct AudioClipJob {
     clip_id:    u32,
     strip:      u8,
@@ -162,13 +196,18 @@ pub fn mod_base01(dest: ModDest, track: &crate::project::Track) -> f32 {
 pub struct Sequencer {
     cmd_rx:        Receiver<SequencerCommand>,
     audio_tx:      Sender<AudioEvent>,
+    pub audio_clock: Option<Arc<crate::audio::scheduling::AudioClock>>,
+    next_sample: Option<f64>,
+    event_frame: Option<u64>,
     bpm:           f64,
     swing:         f32,
     humanize:      f32,
+    timing:        f32,
     playing:       bool,
     /// A live edit waiting to be applied on the next bar boundary (Strudel-style
     /// cycle-quantized eval). `None` when nothing is queued.
     pending_update: Option<Project>,
+    pending_ack: Option<(u64, Arc<std::sync::atomic::AtomicU64>)>,
     tick:          u32,
     tracks:        Vec<(String, TrackState)>,
     schedule:      BTreeMap<u32, Vec<AudioEvent>>,
@@ -189,6 +228,10 @@ pub struct Sequencer {
     pub take_gate: Arc<AtomicU32>,
     /// True between RecordStart and RecordStop/pause (punch gating active).
     recording: bool,
+    logical_gate: u32,
+    strip_state: Vec<(String, StripSpec)>,
+    clip_state: Vec<(u32, String)>,
+    legacy_paths: Vec<Option<String>>,
 }
 
 impl Sequencer {
@@ -196,11 +239,16 @@ impl Sequencer {
         Sequencer {
             cmd_rx,
             audio_tx,
+            audio_clock: None,
+            next_sample: None,
+            event_frame: None,
             bpm: 120.0,
             swing: 0.0,
             humanize: 0.0,
+            timing: 0.0,
             playing: false,
             pending_update: None,
+            pending_ack: None,
             tick: 0,
             tracks: Vec::new(),
             schedule: BTreeMap::new(),
@@ -213,23 +261,66 @@ impl Sequencer {
             loop_region: crate::project::LoopRegion::default(),
             take_gate: Arc::new(AtomicU32::new(0)),
             recording: false,
+            logical_gate: 0,
+            strip_state: Vec::new(),
+            clip_state: Vec::new(),
+            legacy_paths: Vec::new(),
         }
     }
 
     fn gate_is_open(&self) -> bool {
-        self.take_gate.load(Ordering::Relaxed) % 2 == 1
+        self.logical_gate % 2 == 1
     }
 
     fn open_gate(&mut self) {
         if !self.gate_is_open() {
-            self.roll_start_tick.store(self.tick, Ordering::Release);
-            self.take_gate.fetch_add(1, Ordering::Release);
+            self.publish_u32(&self.roll_start_tick, self.tick);
+            self.logical_gate = self.logical_gate.wrapping_add(1);
+            self.publish_u32(&self.take_gate, self.logical_gate);
         }
     }
 
     fn close_gate(&mut self) {
         if self.gate_is_open() {
-            self.take_gate.fetch_add(1, Ordering::Release);
+            self.logical_gate = self.logical_gate.wrapping_add(1);
+            self.publish_u32(&self.take_gate, self.logical_gate);
+        }
+    }
+
+    fn publish_u32(&self, target: &Arc<AtomicU32>, value: u32) {
+        if self.event_frame.is_some() && self.audio_clock.is_some() {
+            let _ = self.emit(AudioEvent::PublishU32 { target: target.clone(), value });
+        } else { target.store(value, Ordering::Release); }
+    }
+    fn publish_transport(&self, value: u8) {
+        if self.event_frame.is_some() && self.audio_clock.is_some() {
+            let _ = self.emit(AudioEvent::PublishU8 { target: self.transport_state.clone(), value });
+        } else { self.transport_state.store(value, Ordering::Release); }
+    }
+
+    fn emit(&self, event: AudioEvent) -> Result<(), crossbeam_channel::TrySendError<AudioEvent>> {
+        let event = match (&self.audio_clock, self.event_frame) {
+            (Some(clock), Some(frame)) => AudioEvent::Scheduled(Box::new(crate::audio::scheduling::ScheduledEvent {
+                frame, generation: clock.generation.load(Ordering::Acquire), event,
+            })),
+            _ => event,
+        };
+        self.audio_tx.try_send(event)
+    }
+
+    fn reset_audio_timeline(&mut self) {
+        if let Some(clock) = &self.audio_clock { clock.generation.fetch_add(1, Ordering::AcqRel); }
+        self.next_sample = None;
+        self.event_frame = None;
+        self.schedule.clear();
+        let _ = self.emit(AudioEvent::Panic);
+    }
+
+    fn prepare_audio_start(&mut self) {
+        if let Some(clock) = &self.audio_clock {
+            let frame = clock.horizon();
+            self.next_sample = Some(frame as f64);
+            self.event_frame = Some(frame);
         }
     }
 
@@ -276,7 +367,7 @@ impl Sequencer {
             .find(|(id, _)| id == track_id)
             .map(|(_, ts)| { ts.muted = muted; ts.strip });
         if let Some(strip) = strip {
-            let _ = self.audio_tx.try_send(AudioEvent::SetStripMute { strip, muted });
+            let _ = self.emit(AudioEvent::SetStripMute { strip, muted });
         }
     }
 
@@ -287,12 +378,14 @@ impl Sequencer {
     /// clip plays from that point rather than only from its very beginning.
     /// Muted clips are still triggered; the engine silences them via its mute set.
     fn arm_audio_clips_at_playhead(&self) {
-        let _ = self.audio_tx.try_send(AudioEvent::StopAudioClips);
+        let _ = self.emit(AudioEvent::StopAudioClips);
         let spt = 60.0 / self.bpm / TICKS_PER_BEAT as f64; // seconds per tick
         for job in &self.audio_jobs {
-            if job.start_tick <= self.tick && self.tick < job.end_tick {
+            // Clips starting exactly here are triggered by fire_tick. Arming
+            // them too would double their voices on Play/Seek/loop boundaries.
+            if job.start_tick < self.tick && self.tick < job.end_tick {
                 let into_sec = (self.tick - job.start_tick) as f32 * spt as f32;
-                let _ = self.audio_tx.try_send(AudioEvent::TriggerAudioClip {
+                let _ = self.emit(AudioEvent::TriggerAudioClip {
                     strip: job.strip,
                     clip_id: job.clip_id,
                     offset_sec: job.offset_sec + into_sec,
@@ -308,7 +401,7 @@ impl Sequencer {
     fn seek(&mut self, tick: u32) {
         let max = self.song_length_ticks().max(1);
         self.tick = tick % max;
-        self.playback_tick.store(self.tick, Ordering::Relaxed);
+        self.publish_u32(&self.playback_tick, self.tick);
         self.schedule.clear();
         // Scrubbing *during* playback re-arms clips from the new offset. When the
         // transport is stopped/paused (e.g. Stop sends Pause then Seek(0)), just
@@ -317,15 +410,15 @@ impl Sequencer {
         if self.playing {
             self.arm_audio_clips_at_playhead();
         } else {
-            let _ = self.audio_tx.try_send(AudioEvent::StopAudioClips);
+            let _ = self.emit(AudioEvent::StopAudioClips);
         }
     }
 
     /// Transition into rolling playback: mark the state, restart the preview
     /// clip, and arm arranged audio clips at the playhead (mirrors Play).
     fn start_roll(&mut self) {
-        self.transport_state.store(TRANSPORT_ROLLING, Ordering::Release);
-        let _ = self.audio_tx.try_send(AudioEvent::PlayClip);
+        self.publish_transport(TRANSPORT_ROLLING);
+        let _ = self.emit(AudioEvent::PlayClip);
         self.arm_audio_clips_at_playhead();
         // Legacy (no punch toggles): the gate opens right at the roll.
         self.update_gate();
@@ -336,9 +429,9 @@ impl Sequencer {
     /// roll point and keep rolling.
     fn record_start(&mut self, count_in_bars: u8) {
         self.recording = true;
-        self.roll_start_tick.store(self.tick, Ordering::Release);
+        self.publish_u32(&self.roll_start_tick, self.tick);
         if self.playing {
-            self.transport_state.store(TRANSPORT_ROLLING, Ordering::Release);
+            self.publish_transport(TRANSPORT_ROLLING);
             self.update_gate();
             return;
         }
@@ -347,19 +440,28 @@ impl Sequencer {
         if self.count_in == 0 {
             self.start_roll();
         } else {
-            self.transport_state.store(TRANSPORT_COUNT_IN, Ordering::Release);
+            self.publish_transport(TRANSPORT_COUNT_IN);
         }
     }
 
     /// Pause playback (also cancels a count-in).
     fn do_pause(&mut self) {
+        if self.audio_clock.is_some() { self.tick = self.playback_tick.load(Ordering::Acquire); }
+        self.reset_audio_timeline();
         self.close_gate();
         self.recording = false;
         self.playing = false;
         self.count_in = 0;
-        self.transport_state.store(TRANSPORT_STOPPED, Ordering::Release);
-        let _ = self.audio_tx.try_send(AudioEvent::StopClip);
-        let _ = self.audio_tx.try_send(AudioEvent::StopAudioClips);
+        self.publish_transport(TRANSPORT_STOPPED);
+        // A bar-quantized edit must not remain pending indefinitely after pause.
+        if let Some(project) = self.pending_update.take() {
+            self.apply_project(project, false);
+            if let Some((revision, ack)) = self.pending_ack.take() {
+                let _ = self.emit(AudioEvent::Applied { revision, ack });
+            }
+        }
+        let _ = self.emit(AudioEvent::StopClip);
+        let _ = self.emit(AudioEvent::StopAudioClips);
     }
 
     /// One count-in tick: click on beats (accented on the bar), playhead held.
@@ -367,12 +469,12 @@ impl Sequencer {
     fn fire_count_in_tick(&mut self) {
         if self.count_in % TICKS_PER_BEAT == 0 {
             let vel = if self.count_in % TICKS_PER_BAR == 0 { 110u8 } else { 80u8 };
-            let _ = self.audio_tx.try_send(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
-            let _ = self.audio_tx.try_send(AudioEvent::NoteOn { strip: STRIP_UTILITY, pitch: 75, velocity: vel });
+            let _ = self.emit(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
+            let _ = self.emit(AudioEvent::NoteOn { strip: STRIP_UTILITY, pitch: 75, velocity: vel });
         }
         self.count_in -= 1;
         if self.count_in == 0 {
-            let _ = self.audio_tx.try_send(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
+            let _ = self.emit(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
         }
     }
 
@@ -389,11 +491,15 @@ impl Sequencer {
     }
 
     fn fire_tick(&mut self) {
+        if self.event_frame.is_some() { self.publish_u32(&self.playback_tick, self.tick); }
         // 0. On a bar boundary, apply any queued live edit (cycle-quantized swap)
         //    before generating this bar's events, so it starts on the downbeat.
         if self.tick % TICKS_PER_BAR == 0 {
             if let Some(p) = self.pending_update.take() {
                 self.apply_project(p, false);
+                if let Some((revision, ack)) = self.pending_ack.take() {
+                    let _ = self.emit(AudioEvent::Applied { revision, ack });
+                }
             }
         }
 
@@ -402,7 +508,7 @@ impl Sequencer {
         for k in keys {
             if let Some(events) = self.schedule.remove(&k) {
                 for ev in events {
-                    let _ = self.audio_tx.try_send(ev);
+                    let _ = self.emit(ev);
                 }
             }
         }
@@ -433,18 +539,18 @@ impl Sequencer {
                     let ticks_per_step = TICKS_PER_BAR / 16; // steps are 16ths
                     let swing         = self.swing;
                     for step in 0..step_count {
-                        if swung_step_tick(step, swing) == pat_tick {
-                            let idx = step as usize;
-                            for row in &sp.rows {
-                                if let Some(velocity) = row.step_velocity(idx) {
-                                    let velocity = humanize_velocity(velocity, strip, row.pitch, self.tick, self.humanize);
-                                    if ts.is_sampler {
-                                        note_ons.push(AudioEvent::TriggerSample { strip, pitch: row.pitch, gain: velocity as f32 / 127.0 });
-                                    } else {
-                                        note_ons.push(AudioEvent::NoteOn { strip, pitch: row.pitch, velocity });
-                                        let off_tick = self.tick + sp.step_note_ticks(ticks_per_step);
-                                        note_offs.push((off_tick, AudioEvent::NoteOff { strip, pitch: row.pitch }));
-                                    }
+                        let nominal = swung_step_tick(step, swing);
+                        for row in &sp.rows {
+                            if let Some(velocity) = row.step_velocity(step as usize) {
+                                let fire = note_fire_tick(row.pitch, nominal, strip, self.timing, pat_len);
+                                if fire != pat_tick { continue; }
+                                let velocity = humanize_velocity(velocity, strip, row.pitch, self.tick, self.humanize);
+                                if ts.is_sampler {
+                                    note_ons.push(AudioEvent::TriggerSample { strip, pitch: row.pitch, gain: velocity as f32 / 127.0 });
+                                } else {
+                                    note_ons.push(AudioEvent::NoteOn { strip, pitch: row.pitch, velocity });
+                                    let off_tick = self.tick + sp.step_note_ticks(ticks_per_step);
+                                    note_offs.push((off_tick, AudioEvent::NoteOff { strip, pitch: row.pitch }));
                                 }
                             }
                         }
@@ -452,13 +558,16 @@ impl Sequencer {
                 }
                 Pattern::PianoRoll(pr) => {
                     for note in &pr.notes {
-                        if note.tick == pat_tick {
+                        let fire = note_fire_tick(note.pitch, note.tick, strip, self.timing, pat_len);
+                        if fire == pat_tick {
                             let velocity = humanize_velocity(note.vel, strip, note.pitch, self.tick, self.humanize);
                             if ts.is_sampler {
                                 note_ons.push(AudioEvent::TriggerSample { strip, pitch: note.pitch, gain: velocity as f32 / 127.0 });
                             } else {
                                 note_ons.push(AudioEvent::NoteOn { strip, pitch: note.pitch, velocity });
-                                let off_tick = self.tick + note.duration;
+                                // Legato: hold to the next note's nominal start; else natural duration.
+                                let span = piano_note_duration(pr, note);
+                                let off_tick = self.tick + span;
                                 note_offs.push((off_tick, AudioEvent::NoteOff { strip, pitch: note.pitch }));
                             }
                         }
@@ -469,7 +578,7 @@ impl Sequencer {
 
         // Apply collected events (mutable write phase — no borrow conflict)
         for ev in note_ons {
-            let _ = self.audio_tx.try_send(ev);
+            let _ = self.emit(ev);
         }
         for (off_tick, ev) in note_offs {
             self.schedule.entry(off_tick).or_default().push(ev);
@@ -478,7 +587,7 @@ impl Sequencer {
         // Fire arranged audio clips whose start tick is the current tick.
         for job in &self.audio_jobs {
             if job.start_tick == self.tick {
-                let _ = self.audio_tx.try_send(AudioEvent::TriggerAudioClip {
+                let _ = self.emit(AudioEvent::TriggerAudioClip {
                     strip: job.strip,
                     clip_id: job.clip_id,
                     offset_sec: job.offset_sec,
@@ -504,13 +613,13 @@ impl Sequencer {
                     });
                 }
             }
-            for ev in ccs { let _ = self.audio_tx.try_send(ev); }
+            for ev in ccs { let _ = self.emit(ev); }
         }
 
         // Metronome click (utility synth, pitch 75 = Claves)
         if self.metronome && self.tick % TICKS_PER_BEAT == 0 {
             let vel = if self.tick % TICKS_PER_BAR == 0 { 100u8 } else { 60u8 };
-            let _ = self.audio_tx.try_send(AudioEvent::NoteOn { strip: STRIP_UTILITY, pitch: 75, velocity: vel });
+            let _ = self.emit(AudioEvent::NoteOn { strip: STRIP_UTILITY, pitch: 75, velocity: vel });
             let off = self.tick + TICKS_PER_BEAT / 4;
             self.schedule.entry(off).or_default().push(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
         }
@@ -531,7 +640,7 @@ impl Sequencer {
                 })
                 .collect();
             for (strip, pitch) in pending {
-                let _ = self.audio_tx.try_send(AudioEvent::NoteOff { strip, pitch });
+                let _ = self.emit(AudioEvent::NoteOff { strip, pitch });
             }
             let was_open = self.gate_is_open();
             if was_open {
@@ -549,13 +658,13 @@ impl Sequencer {
             // run toward its end even past the song's content length
             // (silence beyond the content, then cycle).
             self.tick = next;
-            self.playback_tick.store(self.tick, Ordering::Relaxed);
+            if self.event_frame.is_none() { self.publish_u32(&self.playback_tick, self.tick); }
             self.update_gate();
             return;
         }
         let max = self.song_length_ticks();
         self.tick = next % max;
-        self.playback_tick.store(self.tick, Ordering::Relaxed);
+        if self.event_frame.is_none() { self.publish_u32(&self.playback_tick, self.tick); }
         self.update_gate();
         if self.tick == 0 {
             // Flush pending NoteOffs to prevent stuck notes on loop
@@ -568,9 +677,9 @@ impl Sequencer {
                 .collect();
             self.schedule.clear();
             for (strip, pitch) in pending {
-                let _ = self.audio_tx.try_send(AudioEvent::NoteOff { strip, pitch });
+                let _ = self.emit(AudioEvent::NoteOff { strip, pitch });
             }
-            let _ = self.audio_tx.try_send(AudioEvent::StopAudioClips);
+            let _ = self.emit(AudioEvent::StopAudioClips);
         }
     }
 
@@ -579,44 +688,62 @@ impl Sequencer {
         self.apply_project(project, true);
     }
 
-    /// Rebuild from `project`. With `reset_tick = false` the playhead keeps its
-    /// current position (a live swap), so editing a pattern continues the groove
-    /// instead of jumping back to bar 1; currently-ringing notes are silenced so
-    /// the now-removed note-offs can't leave anything hanging.
+    /// Update scheduling while retaining voices/tails for unchanged instruments.
+    /// Structural changes still rebuild strips because strip indices route audio.
     fn apply_project(&mut self, project: Project, reset_tick: bool) {
+        let specs = StripSpec::from_project(&project);
+        let legacy_paths: Vec<_> = project.tracks.iter().map(|t| match &t.instrument {
+            Instrument::AudioFile { path } => Some(path.clone()), _ => None,
+        }).collect();
+        let reusable = !reset_tick && self.legacy_paths == legacy_paths && self.strip_state.len() == specs.len()
+            && self.strip_state.iter().zip(project.tracks.iter().zip(&specs)).all(|((id, old), (track, new))| {
+                id == &track.id && old.kind == new.kind
+                    && old.clap_instrument == new.clap_instrument && old.clap_fx == new.clap_fx
+                    && old.tuning_cents == new.tuning_cents
+                    && (!matches!(track.instrument, Instrument::AudioFile { .. })
+                        || (old.gain == new.gain && old.effects == new.effects))
+            });
         if reset_tick {
             self.schedule.clear();
             self.tick = 0;
-            self.playback_tick.store(0, Ordering::Relaxed);
-        } else {
-            // Live swap: send the note-offs that were scheduled so the rebuild
-            // (which drops the schedule) can't leave a note hanging — without
-            // silencing the whole synth on every edit.
+            self.publish_u32(&self.playback_tick, 0);
+        } else if !reusable {
             for (_, evs) in std::mem::take(&mut self.schedule) {
-                for ev in evs { let _ = self.audio_tx.try_send(ev); }
+                for ev in evs { let _ = self.emit(ev); }
             }
         }
+        if reusable {
+            for (index, ((_, old), new)) in self.strip_state.iter().zip(&specs).enumerate() {
+                let strip = index as u8;
+                if old.gain != new.gain { let _ = self.emit(AudioEvent::SetStripGain { strip, gain: new.gain }); }
+                if old.pan != new.pan { let _ = self.emit(AudioEvent::SetStripPan { strip, pan: new.pan }); }
+                if old.muted != new.muted { let _ = self.emit(AudioEvent::SetStripMute { strip, muted: new.muted }); }
+                if old.effects != new.effects { let _ = self.emit(AudioEvent::SetStripEffects { strip, effects: new.effects.clone() }); }
+            }
+        } else {
+            let _ = self.emit(AudioEvent::LoadStrips { specs: specs.clone() });
+        }
+        self.legacy_paths = legacy_paths;
+        self.strip_state = project.tracks.iter().map(|track| track.id.clone()).zip(specs).collect();
         self.bpm       = project.project.bpm.clamp(20.0, 300.0);
+        let _ = self.emit(AudioEvent::SetTempo { bpm: self.bpm });
         self.swing     = project.project.swing;
         self.humanize  = project.project.humanize;
+        self.timing    = project.project.timing;
         self.metronome = project.project.metronome;
         self.loop_region = project.loop_region.clone();
         self.tracks.clear();
 
-        // ── Mixer strips: one per track, built off-thread by the relay ────────
-        let _ = self.audio_tx.try_send(AudioEvent::LoadStrips {
-            specs: StripSpec::from_project(&project),
-        });
-        let _ = self.audio_tx.try_send(AudioEvent::SetReturns {
+        let _ = self.emit(AudioEvent::SetReturns {
             returns: project.returns.clone(),
         });
         // CLAP instances: the relay diffs these against what's live, so this
         // is cheap when nothing plugin-related changed.
-        let _ = self.audio_tx.try_send(AudioEvent::LoadClapInstances {
+        let _ = self.emit(AudioEvent::LoadClapInstances {
             specs: crate::audio::clap::slot_specs(&project),
         });
 
-        self.audio_jobs.clear();
+        let old_audio_jobs = std::mem::take(&mut self.audio_jobs);
         let mut clip_specs: Vec<(u32, String)> = Vec::new();
         for (ci, clip) in project.audio_clips.iter().enumerate() {
             let strip = project.tracks.iter().position(|t| t.id == clip.track).unwrap_or(0) as u8;
@@ -631,8 +758,12 @@ impl Sequencer {
             });
             clip_specs.push((clip_id, clip.path.clone()));
         }
-        if !clip_specs.is_empty() {
-            let _ = self.audio_tx.try_send(AudioEvent::LoadAudioClips { specs: clip_specs });
+        if reset_tick || clip_specs != self.clip_state {
+            let _ = self.emit(AudioEvent::LoadAudioClips { specs: clip_specs.clone() });
+            self.clip_state = clip_specs;
+        }
+        if self.playing && !reset_tick && (!reusable || self.audio_jobs != old_audio_jobs) {
+            self.arm_audio_clips_at_playhead();
         }
 
         // Compute the longest first-pattern length across all tracks (used for auto-loop mode)
@@ -653,13 +784,13 @@ impl Sequencer {
             // StripSpec build above; nothing per-track to send here.
             if track.track_type == TrackType::Audio {
                 if let Instrument::AudioFile { path } = &track.instrument {
-                    if !path.is_empty() {
-                        let _ = self.audio_tx.try_send(AudioEvent::LoadClipFromFile {
+                    if !path.is_empty() && !reusable {
+                        let _ = self.emit(AudioEvent::LoadClipFromFile {
                             path: path.clone(),
                             volume: track.volume,
                         });
                         let fx = &track.effects;
-                        let _ = self.audio_tx.try_send(AudioEvent::SetClipEffects {
+                        let _ = self.emit(AudioEvent::SetClipEffects {
                             delay_time_ms:  fx.delay_time_ms,
                             delay_feedback: fx.delay_feedback,
                             delay_mix:      fx.delay_mix,
@@ -695,7 +826,7 @@ impl Sequencer {
                     .filter(|s| s.track == track.id)
                     .filter_map(|s| {
                         let pat = project.patterns.iter().find(|p| p.id() == s.pattern)?.clone();
-                        let start = s.bar * TICKS_PER_BAR;
+                        let start = s.bar * TICKS_PER_BAR + s.offset_ticks;
                         let (end, loop_pat) = match s.len_bars {
                             Some(n) => (start + n.max(1) * TICKS_PER_BAR, true), // loop to fill
                             None => (start + pattern_length_ticks(&pat), false), // natural, unchanged
@@ -741,8 +872,26 @@ impl Sequencer {
         if !reset_tick {
             let max = self.song_length_ticks().max(1);
             self.tick %= max;
-            self.playback_tick.store(self.tick, Ordering::Relaxed);
+            self.publish_u32(&self.playback_tick, self.tick);
         }
+    }
+
+    fn advance_audio_clock(&mut self) {
+                let clock = self.audio_clock.as_ref().unwrap().clone();
+                let sample_rate = clock.sample_rate.load(Ordering::Acquire);
+                if sample_rate > 0 {
+                    let horizon = clock.horizon();
+                    let mut frame = self.next_sample.unwrap_or(horizon as f64);
+                    // Bound catch-up work so commands remain responsive on overload.
+                    for _ in 0..64 {
+                        if frame.round() as u64 > horizon { break; }
+                        self.event_frame = Some(frame.round() as u64);
+                        self.advance();
+                        frame += sample_rate as f64 * 60.0 / self.bpm / TICKS_PER_BEAT as f64;
+                    }
+                    self.next_sample = Some(frame);
+                    self.event_frame = None;
+                }
     }
 
     pub fn run(mut self) {
@@ -751,39 +900,63 @@ impl Sequencer {
             while let Ok(cmd) = self.cmd_rx.try_recv() {
                 match cmd {
                     SequencerCommand::Play  => {
+                        if self.playing { continue; }
+                        self.reset_audio_timeline();
+                        self.prepare_audio_start();
                         self.playing = true;
-                        self.roll_start_tick.store(self.tick, Ordering::Release);
-                        self.transport_state.store(TRANSPORT_ROLLING, Ordering::Release);
-                        let _ = self.audio_tx.try_send(AudioEvent::PlayClip);
+                        self.publish_u32(&self.roll_start_tick, self.tick);
+                        self.publish_transport(TRANSPORT_ROLLING);
+                        let _ = self.emit(AudioEvent::PlayClip);
                         // Start any audio clip spanning the playhead from the right
                         // offset, so pressing Play mid-clip plays audio from there
                         // (not silence, and not only from the clip's start).
                         self.arm_audio_clips_at_playhead();
+                        self.event_frame = None;
                     }
                     SequencerCommand::Pause => {
                         self.do_pause();
                     }
                     SequencerCommand::RecordStart { count_in_bars } => {
+                        if !self.playing { self.reset_audio_timeline(); self.prepare_audio_start(); }
                         self.record_start(count_in_bars);
+                        self.event_frame = None;
                         next_tick = Instant::now();
                     }
                     SequencerCommand::Seek(tick) => {
+                        self.reset_audio_timeline();
+                        if self.playing { self.prepare_audio_start(); }
                         self.seek(tick);
-                        let _ = self.audio_tx.try_send(AudioEvent::Panic);
+                        self.event_frame = None;
                         next_tick = Instant::now();
                     }
                     SequencerCommand::SetBpm(bpm) => {
                         self.bpm = bpm;
+                        let _ = self.emit(AudioEvent::SetTempo { bpm });
                         next_tick = Instant::now();
                     }
                     SequencerCommand::SetSwing(sw) => {
                         self.swing = sw.clamp(0.0, 1.0);
                     }
+                    SequencerCommand::SetTiming(t) => {
+                        self.timing = t.clamp(0.0, 1.0);
+                    }
                     SequencerCommand::LoadProject(p) => {
                         self.pending_update = None;
+                        self.pending_ack = None;
+                        self.reset_audio_timeline();
                         self.load_project(p);
                     }
+                    SequencerCommand::UpdateRevision { project, revision, ack } => {
+                        if self.playing {
+                            self.pending_update = Some(project);
+                            self.pending_ack = Some((revision, ack));
+                        } else {
+                            self.apply_project(project, false);
+                            let _ = self.emit(AudioEvent::Applied { revision, ack });
+                        }
+                    }
                     SequencerCommand::UpdateLive(p)  => {
+                        self.pending_ack = None;
                         // While playing, defer to the next bar so the swap lands
                         // on the downbeat (latest queued edit wins). When paused,
                         // apply immediately.
@@ -795,7 +968,7 @@ impl Sequencer {
                     }
                     SequencerCommand::SetTrackVolume { track_id, volume } => {
                         if let Some((_, ts)) = self.tracks.iter().find(|(id, _)| id == &track_id) {
-                            let _ = self.audio_tx.try_send(AudioEvent::SetStripGain { strip: ts.strip, gain: volume });
+                            let _ = self.emit(AudioEvent::SetStripGain { strip: ts.strip, gain: volume });
                         }
                     }
                     SequencerCommand::SetTrackMute { track_id, muted } => {
@@ -803,14 +976,14 @@ impl Sequencer {
                     }
                     SequencerCommand::SetTrackPan { track_id, pan } => {
                         if let Some((_, ts)) = self.tracks.iter().find(|(id, _)| id == &track_id) {
-                            let _ = self.audio_tx.try_send(AudioEvent::SetStripPan { strip: ts.strip, pan });
+                            let _ = self.emit(AudioEvent::SetStripPan { strip: ts.strip, pan });
                         }
                     }
                     SequencerCommand::SetTrackEffects { track_id, effects } => {
                         if let Some((_, ts)) = self.tracks.iter().find(|(id, _)| id == &track_id) {
                             // Legacy preview-clip chain (TUI audio-file path).
                             if ts.is_audio {
-                                let _ = self.audio_tx.try_send(AudioEvent::SetClipEffects {
+                                let _ = self.emit(AudioEvent::SetClipEffects {
                                     delay_time_ms:   effects.delay_time_ms,
                                     delay_feedback:  effects.delay_feedback,
                                     delay_mix:       effects.delay_mix,
@@ -826,17 +999,17 @@ impl Sequencer {
                                     comp_release_ms: effects.comp_release_ms,
                                 });
                             }
-                            let _ = self.audio_tx.try_send(AudioEvent::SetStripEffects {
+                            let _ = self.emit(AudioEvent::SetStripEffects {
                                 strip: ts.strip,
                                 effects,
                             });
                         }
                     }
                     SequencerCommand::SetReturns(returns) => {
-                        let _ = self.audio_tx.try_send(AudioEvent::SetReturns { returns });
+                        let _ = self.emit(AudioEvent::SetReturns { returns });
                     }
                     SequencerCommand::SetClapParam { uid, param_id, value } => {
-                        let _ = self.audio_tx.try_send(AudioEvent::SetClapParam { uid, param_id, value });
+                        let _ = self.emit(AudioEvent::SetClapParam { uid, param_id, value });
                     }
                     SequencerCommand::SetLoopRegion(r) => {
                         self.loop_region = r;
@@ -847,34 +1020,36 @@ impl Sequencer {
                     }
                     SequencerCommand::PreviewNote { track_id, pitch, velocity } => {
                         if let Some((_, ts)) = self.tracks.iter().find(|(id, _)| id == &track_id) {
-                            let _ = self.audio_tx.try_send(AudioEvent::NoteOn {
+                            let _ = self.emit(AudioEvent::NoteOn {
                                 strip: ts.strip, pitch, velocity,
                             });
                         }
                     }
                     SequencerCommand::PreviewNoteOff { track_id, pitch } => {
                         if let Some((_, ts)) = self.tracks.iter().find(|(id, _)| id == &track_id) {
-                            let _ = self.audio_tx.try_send(AudioEvent::NoteOff {
+                            let _ = self.emit(AudioEvent::NoteOff {
                                 strip: ts.strip, pitch,
                             });
                         }
                     }
                     SequencerCommand::RawCC { channel, cc, value } => {
                         // The command's `channel` field now carries a strip index.
-                        let _ = self.audio_tx.try_send(AudioEvent::RawCC { strip: channel, cc, value });
+                        let _ = self.emit(AudioEvent::RawCC { strip: channel, cc, value });
                     }
                     SequencerCommand::SetMetronome(enabled) => {
                         self.metronome = enabled;
                     }
                     SequencerCommand::Panic => {
-                        self.schedule.clear();
-                        let _ = self.audio_tx.try_send(AudioEvent::Panic);
+                        self.reset_audio_timeline();
                     }
                     SequencerCommand::Quit => { return; }
                 }
             }
 
-            if self.playing {
+            if self.playing && self.audio_clock.is_some() {
+                self.advance_audio_clock();
+                std::thread::sleep(Duration::from_millis(1));
+            } else if self.playing {
                 self.advance();
                 next_tick += self.tick_duration();
                 let now = Instant::now();
@@ -904,6 +1079,85 @@ mod tests {
     }
 
     use crate::audio::input::{TRANSPORT_COUNT_IN, TRANSPORT_ROLLING, TRANSPORT_STOPPED};
+
+    #[test]
+    fn ordinary_edits_preserve_sustains_and_instrument_instances() {
+        let (mut seq, _, rx) = make_sequencer();
+        let mut project = Project::default_project();
+        seq.load_project(project.clone());
+        rx.try_iter().for_each(drop);
+        seq.schedule.insert(240, vec![AudioEvent::NoteOff { strip: 0, pitch: 60 }]);
+        project.project.bpm = 137.;
+        project.tracks[0].volume = 0.41;
+        project.tracks[0].effects.reverb = 0.37;
+        seq.apply_project(project.clone(), false);
+        let edits: Vec<_> = rx.try_iter().collect();
+        assert!(!edits.iter().any(|e| matches!(e, AudioEvent::LoadStrips { .. } | AudioEvent::NoteOff { .. } | AudioEvent::LoadAudioClips { .. })));
+        assert!(edits.iter().any(|e| matches!(e, AudioEvent::SetStripGain { strip: 0, gain } if *gain == 0.41)));
+        assert!(edits.iter().any(|e| matches!(e, AudioEvent::SetStripEffects { strip: 0, .. })));
+        assert!(seq.schedule.contains_key(&240));
+        seq.tick = 240;
+        seq.fire_tick();
+        assert!(rx.try_iter().any(|e| matches!(e, AudioEvent::NoteOff { strip: 0, pitch: 60 })));
+        // Structural edits must not incorrectly reuse instruments by index.
+        project.tracks.swap(0, 1);
+        seq.apply_project(project, false);
+        assert!(rx.try_iter().any(|e| matches!(e, AudioEvent::LoadStrips { .. })));
+    }
+
+    #[test]
+    fn removing_last_audio_asset_clears_the_engine_clip_table() {
+        let (mut seq, _, rx) = make_sequencer();
+        let mut project = Project::default_project();
+        let track = project.add_track(TrackType::Audio);
+        project.add_audio_clip(&track, "fixture.wav", 0., 2.);
+        seq.load_project(project.clone());
+        rx.try_iter().for_each(drop);
+        project.audio_clips.clear();
+        seq.playing = true;
+        seq.apply_project(project, false);
+        let events: Vec<_> = rx.try_iter().collect();
+        assert!(events.iter().any(|e| matches!(e, AudioEvent::LoadAudioClips { specs } if specs.is_empty())));
+        assert!(events.iter().any(|e| matches!(e, AudioEvent::StopAudioClips)));
+    }
+
+    #[test]
+    fn legato_duration_spans_to_next_chord_group() {
+        let pattern: crate::project::PianoRollPattern = serde_json::from_value(serde_json::json!({
+            "id":"chords", "name":"Chords", "bars":1, "ticks_per_bar":480, "legato":true,
+            "notes":[{"pitch":60,"tick":0,"duration":20,"vel":80},
+                     {"pitch":64,"tick":0,"duration":30,"vel":80},
+                     {"pitch":67,"tick":120,"duration":60,"vel":80}]
+        })).unwrap();
+        assert_eq!(piano_note_duration(&pattern, &pattern.notes[0]), 120);
+        assert_eq!(piano_note_duration(&pattern, &pattern.notes[1]), 120);
+        assert_eq!(piano_note_duration(&pattern, &pattern.notes[2]), 60);
+    }
+
+    #[test]
+    fn sample_clock_keeps_tick_spacing_across_irregular_wakeups() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let (audio, events) = crossbeam_channel::unbounded();
+        let mut seq = Sequencer::new(rx, audio);
+        let clock = Arc::new(crate::audio::scheduling::AudioClock::default());
+        clock.sample_rate.store(44100, Ordering::Release);
+        clock.quantum.store(128, Ordering::Relaxed);
+        seq.audio_clock = Some(clock.clone());
+        seq.bpm = 120.; seq.playing = true;
+        let start = clock.horizon();
+        seq.advance_audio_clock();
+        clock.frame.store(400, Ordering::Release);
+        seq.advance_audio_clock();
+        let frames: Vec<_> = events.try_iter().filter_map(|e| match e {
+            AudioEvent::Scheduled(e) if matches!(e.event, AudioEvent::PublishU32 { .. }) => Some(e.frame),
+            _ => None,
+        }).collect();
+        assert_eq!(frames, [start, start + 184, start + 368]);
+        assert_eq!(seq.playback_tick.load(Ordering::Acquire), 0, "UI state waits for audio callback");
+        seq.do_pause();
+        assert_eq!(clock.generation.load(Ordering::Acquire), 1);
+        assert!(seq.next_sample.is_none());
+    }
 
     #[test]
     fn record_start_counts_in_then_rolls() {
@@ -1096,6 +1350,34 @@ mod tests {
     }
 
     #[test]
+    fn pause_applies_pending_session_revision() {
+        let (mut seq, _, audio_rx) = make_sequencer();
+        let mut project = Project::default_project();
+        project.project.bpm = 97.;
+        seq.pending_update = Some(project);
+        seq.pending_ack = Some((7, Arc::new(std::sync::atomic::AtomicU64::new(0))));
+        seq.playing = true;
+        seq.do_pause();
+        assert_eq!(seq.bpm, 97.);
+        assert!(seq.pending_update.is_none());
+        assert!(seq.pending_ack.is_none());
+        assert!(audio_rx.try_iter().any(|e| matches!(e, AudioEvent::Applied { revision: 7, .. })));
+    }
+
+    #[test]
+    fn arrangement_offset_shifts_slot_start() {
+        let (mut seq, _, _) = make_sequencer();
+        let mut p = crate::project::Project::default_project();
+        // Push the t1 clip half a bar (240 ticks) late.
+        p.arrangement.iter_mut().find(|s| s.track == "t1").unwrap().offset_ticks = 240;
+        seq.load_project(p);
+        let ts = &seq.tracks.iter().find(|(id, _)| id == "t1").unwrap().1;
+        // The slot now starts at 240, not 0, and its end shifts with it.
+        let slot = ts.slots.iter().find(|s| s.start_tick == 240).expect("a slot at tick 240");
+        assert_eq!(slot.end_tick, 240 + TICKS_PER_BAR); // 1-bar pattern, natural length
+    }
+
+    #[test]
     fn arrangement_natural_length_unchanged() {
         let (mut seq, _, _) = make_sequencer();
         let p = crate::project::Project::default_project(); // no len_bars
@@ -1146,6 +1428,7 @@ mod tests {
             effects: Default::default(),
             modulators: vec![],
             clap_fx: vec![],
+            tuning_cents: 0.0,
         });
         p.audio_clips.push(AudioClip {
             track: "vox".into(),
@@ -1156,6 +1439,19 @@ mod tests {
             gain: 1.0,
         });
         p
+    }
+
+    #[test]
+    fn starting_at_audio_clip_boundary_triggers_only_once() {
+        let (mut seq, _, rx) = make_sequencer();
+        seq.load_project(project_with_audio_clip(false));
+        rx.try_iter().for_each(drop);
+        seq.playing = true;
+        seq.tick = seq.audio_jobs[0].start_tick;
+        seq.arm_audio_clips_at_playhead();
+        seq.fire_tick();
+        let triggers = rx.try_iter().filter(|e| matches!(e, AudioEvent::TriggerAudioClip { clip_id: 0, .. })).count();
+        assert_eq!(triggers, 1, "arming and tick dispatch must not double the clip");
     }
 
     #[test]
@@ -1174,14 +1470,65 @@ mod tests {
             "a paused seek must not trigger audio clips"
         );
 
-        // Positive control: scrubbing *during* playback still re-arms the clip.
+        // Positive control: scrubbing into an already-started clip re-arms it.
+        // Exact starts are owned by tick dispatch (covered separately above).
         seq.playing = true;
-        seq.seek(0);
+        seq.seek(1);
         let evs: Vec<_> = audio_rx.try_iter().collect();
         assert!(
             evs.iter().any(|e| matches!(e, AudioEvent::TriggerAudioClip { clip_id: 0, .. })),
             "scrubbing during playback should re-arm the clip"
         );
+    }
+
+    #[test]
+    fn timing_offset_shifts_note_fire() {
+        let (mut seq, _, rx) = make_sequencer();
+        let mut p = Project::default_project();
+        if let Pattern::PianoRoll(pr) = p.patterns.iter_mut().find(|x| x.id()=="p2").unwrap() {
+            pr.notes = vec![crate::project::Note { pitch: 60, tick: 240, duration: 120, vel: 100 }];
+        }
+        p.project.timing = 1.0;
+        let off = humanize_timing_offset(60, 240, 1, 1.0);
+        seq.load_project(p); let _ = rx.try_iter().count();
+        seq.playing = true;
+        let fire = (240 + off).max(0) as u32;
+        for _ in 0..=fire { seq.advance(); }
+        let on = rx.try_iter().any(|e| matches!(e, AudioEvent::NoteOn { strip:1, pitch:60, .. }));
+        assert!(on, "note fires at shifted tick {fire} (off {off})");
+    }
+
+    #[test]
+    fn legato_extends_off_to_next_note() {
+        let (mut seq, _, rx) = make_sequencer();
+        let mut p = Project::default_project();
+        if let Pattern::PianoRoll(pr) = p.patterns.iter_mut().find(|x| x.id()=="p2").unwrap() {
+            pr.notes = vec![
+                crate::project::Note { pitch: 60, tick: 0, duration: 60, vel: 100 },
+                crate::project::Note { pitch: 62, tick: 240, duration: 60, vel: 100 },
+            ];
+            pr.legato = true;
+        }
+        seq.load_project(p); let _ = rx.try_iter().count();
+        seq.playing = true;
+        for _ in 0..120 { seq.advance(); }
+        let early = rx.try_iter().any(|e| matches!(e, AudioEvent::NoteOff { strip:1, pitch:60 }));
+        assert!(!early, "legato holds pitch 60 past its natural 60-tick length");
+        for _ in 120..241 { seq.advance(); }
+        let off = rx.try_iter().any(|e| matches!(e, AudioEvent::NoteOff { strip:1, pitch:60 }));
+        assert!(off, "legato note releases at the next note's start");
+    }
+
+    #[test]
+    fn timing_offset_bounded_deterministic_two_signed() {
+        assert_eq!(humanize_timing_offset(60, 480, 0, 0.0), 0);
+        let a = humanize_timing_offset(60, 480, 0, 1.0);
+        let b = humanize_timing_offset(60, 480, 0, 1.0);
+        assert_eq!(a, b, "deterministic");
+        assert!(a.abs() <= 15, "bounded, got {a}");
+        let offs: Vec<i32> = (40..90).map(|p| humanize_timing_offset(p, 0, 0, 1.0)).collect();
+        assert!(offs.iter().any(|&o| o < 0) && offs.iter().any(|&o| o > 0), "{offs:?}");
+        assert!(humanize_timing_offset(72, 240, 1, 0.3).abs() <= 5);
     }
 
     #[test]

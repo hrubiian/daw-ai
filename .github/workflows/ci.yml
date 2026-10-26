@@ -1,0 +1,28 @@
+name: Rust validation
+on: [push, pull_request]
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      matrix:
+        audio-assets: [false, true]
+    env:
+      CARGO_INCREMENTAL: 0
+      CARGO_PROFILE_DEV_DEBUG: 0
+      CARGO_PROFILE_TEST_DEBUG: 0
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: System libraries
+        run: sudo apt-get update && sudo apt-get install -y libasound2-dev libxkbcommon-x11-dev libwayland-dev libvulkan-dev libxcb1-dev libfontconfig1-dev libssl-dev pkg-config ffmpeg
+      - uses: Swatinem/rust-cache@v2
+      - name: Required audio fixtures
+        if: matrix.audio-assets
+        run: |
+          sudo apt-get install -y fluid-soundfont-gm
+          cp /usr/share/sounds/sf2/FluidR3_GM.sf2 assets/GeneralUser.sf2
+          echo DAW_REQUIRE_TEST_ASSETS=1 >> "$GITHUB_ENV"
+      - run: cargo build --workspace --locked
+      - run: python3 scripts/test-mcp-protocol.py
+      - run: cargo test --workspace --locked
+      - run: cargo clippy --workspace --all-targets --locked

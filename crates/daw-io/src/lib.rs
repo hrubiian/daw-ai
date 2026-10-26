@@ -9,3 +9,5 @@ pub mod midi_map;
 
 pub use host::Host;
 pub use midi::{connect_midi_port, list_midi_ports};
+
+pub mod session;

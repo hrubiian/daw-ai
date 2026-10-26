@@ -52,9 +52,12 @@ fn track_ids(p: &Project) -> String {
     p.tracks.iter().map(|t| t.id.clone()).collect::<Vec<_>>().join(", ")
 }
 
-fn clap_cache() -> &'static Vec<daw_core::audio::clap::ClapPluginDesc> {
-    static CACHE: OnceLock<Vec<daw_core::audio::clap::ClapPluginDesc>> = OnceLock::new();
-    CACHE.get_or_init(daw_core::audio::clap::discover)
+fn clap_catalog() -> &'static std::sync::Mutex<std::sync::Arc<Vec<daw_core::audio::clap::ClapPluginDesc>>> {
+    static CACHE: OnceLock<std::sync::Mutex<std::sync::Arc<Vec<daw_core::audio::clap::ClapPluginDesc>>>> = OnceLock::new();
+    CACHE.get_or_init(||std::sync::Mutex::new(std::sync::Arc::new(daw_core::audio::clap::discover())))
+}
+fn clap_cache() -> std::sync::Arc<Vec<daw_core::audio::clap::ClapPluginDesc>> {
+    clap_catalog().lock().unwrap_or_else(|e|e.into_inner()).clone()
 }
 
 impl DawTools {
@@ -67,7 +70,11 @@ impl DawTools {
 
     fn with_summary(&self, head: String) -> Result<String, String> {
         let p = self.store.load()?;
-        Ok(format!("{head}\n\n{}", summary(&p)))
+        let live = if self.store.live_socket.is_some() {
+            let state = self.store.inspect_live()?;
+            format!("\nSession revision {} · engine {}", state.revision, state.engine_status)
+        } else { String::new() };
+        Ok(format!("{head}{live}\n\n{}", summary(&p)))
     }
 
     // ── Orientation ──────────────────────────────────────────────────────────
@@ -83,7 +90,7 @@ impl DawTools {
     pub fn set_project(&self, json: String) -> Result<String, String> {
         let p: Project = serde_json::from_str(&json)
             .map_err(|e| format!("invalid project JSON (nothing saved): {e}"))?;
-        self.store.save(&p)?;
+        self.store.mutate(|current| { *current = p; Ok("project replaced".into()) })?;
         self.with_summary("project replaced".into())
     }
 
@@ -171,6 +178,19 @@ impl DawTools {
         self.with_summary(format!("swing set to {amount}"))
     }
 
+    pub fn set_timing(&self, amount: f32) -> Result<String, String> {
+        self.store.mutate(|p| { p.set_timing(amount); Ok(format!("timing {:.2}", p.project.timing)) })?;
+        self.with_summary(format!("timing set to {amount}"))
+    }
+
+    pub fn set_legato(&self, pattern_id: String, on: bool) -> Result<String, String> {
+        self.store.mutate(|p| {
+            if p.set_legato(&pattern_id, on) { Ok(format!("legato {on}")) }
+            else { Err(format!("no piano-roll pattern '{pattern_id}'")) }
+        })?;
+        self.with_summary(format!("legato {on} on {pattern_id}"))
+    }
+
     // ── Patterns + notes ─────────────────────────────────────────────────────
 
     pub fn add_pattern(&self, track_id: String) -> Result<String, String> {
@@ -243,6 +263,7 @@ impl DawTools {
         pattern_id: String,
         bar: u32,
         len_bars: Option<u32>,
+        offset_ticks: Option<u32>,
     ) -> Result<String, String> {
         self.store.mutate(|p| {
             if !p.place_pattern_id(&track_id, bar, &pattern_id) {
@@ -254,9 +275,25 @@ impl DawTools {
             if let Some(len) = len_bars {
                 p.resize_clip(&track_id, bar, len);
             }
+            if let Some(off) = offset_ticks {
+                p.set_clip_offset(&track_id, bar, off);
+            }
             Ok(format!("placed {pattern_id} on {track_id} @ bar {bar}"))
         })?;
         self.with_summary(format!("placed {pattern_id} at bar {bar}"))
+    }
+
+    /// Nudge an existing clip off the bar line by `offset_ticks` (480/bar; e.g.
+    /// 240 = half a bar, 120 = one beat). Whole bars fold into the slot's bar.
+    pub fn set_clip_offset(&self, track_id: String, bar: u32, offset_ticks: u32) -> Result<String, String> {
+        self.store.mutate(|p| {
+            if p.set_clip_offset(&track_id, bar, offset_ticks) {
+                Ok("offset set".into())
+            } else {
+                Err(format!("no clip on '{track_id}' at bar {bar}"))
+            }
+        })?;
+        self.with_summary(format!("clip at bar {bar} on {track_id} offset {offset_ticks}t"))
     }
 
     pub fn remove_clip(&self, track_id: String, bar: u32) -> Result<String, String> {
@@ -282,6 +319,15 @@ impl DawTools {
     }
 
     // ── Effects / sends / returns / region ───────────────────────────────────
+
+    pub fn set_sampler_variants(&self, track_id: String, pitch: u8, variants: serde_json::Value) -> Result<String, String> {
+        let variants: Vec<daw_core::project::SampleVariant> = serde_json::from_value(variants).map_err(|e| e.to_string())?;
+        self.store.mutate(|p| {
+            p.set_sampler_variants(&track_id, pitch, variants)?;
+            Ok("sampler takes updated".into())
+        })?;
+        self.with_summary(format!("velocity layers / alternate takes updated on {track_id} p{pitch}"))
+    }
 
     pub fn set_effects(&self, track_id: String, params: serde_json::Value) -> Result<String, String> {
         self.store.mutate(|p| {
@@ -330,6 +376,13 @@ impl DawTools {
             Ok("returns updated".into())
         })?;
         self.with_summary("returns updated".into())
+    }
+
+    pub fn apply_spatial_preset(&self, name: String) -> Result<String, String> {
+        let preset: daw_core::project::SpatialPreset = serde_json::from_value(serde_json::Value::String(name))
+            .map_err(|e| format!("unknown spatial preset: {e}"))?;
+        self.store.mutate(|p| { p.apply_spatial_preset(preset); Ok("space preset applied".into()) })?;
+        self.with_summary(format!("{} applied; shared bus gain/mute preserved",preset.label()))
     }
 
     pub fn set_loop_region(
@@ -423,6 +476,33 @@ impl DawTools {
             .join("\n"))
     }
 
+    pub fn rescan_clap_plugins(&self) -> Result<String, String> {
+        let found=std::sync::Arc::new(daw_core::audio::clap::discover());
+        *clap_catalog().lock().unwrap_or_else(|e|e.into_inner())=found;
+        self.list_clap_plugins()
+    }
+
+    /// Read plugin-declared parameter bounds/defaults from a separate instance.
+    /// Saved overrides are identified explicitly; this does not claim to read
+    /// an active plugin's meter, automation or unsaved internal state.
+    pub fn get_clap_params(&self, uid: String) -> Result<String, String> {
+        let (project,base)=if self.store.live_socket.is_some() {
+            let state=self.store.inspect_live()?;
+            (state.project,state.project_directory.unwrap_or_default())
+        } else {(self.store.load()?,self.store.path.parent().unwrap_or(std::path::Path::new(".")).to_path_buf())};
+        let resolved=daw_core::project::format::resolve_assets(&project,&base,std::path::Path::new("."));
+        let spec=daw_core::audio::clap::slot_specs(&resolved).into_iter().find(|s|s.uid==uid)
+            .ok_or_else(||format!("no CLAP slot '{uid}'"))?;
+        let mut instance=daw_core::audio::clap::ClapInstance::from_spec(&spec,44100)?;
+        let params: Vec<_>=instance.handle.param_infos.iter().map(|p|serde_json::json!({
+            "id":p.id,"name":p.name,"min":p.min,"max":p.max,"default":p.default,"stepped":p.stepped,"readonly":p.readonly,
+            "saved_override":spec.params.iter().find(|(id,_)|*id==p.id).map(|(_,value)|*value)
+        })).collect();
+        let name=instance.handle.name.clone();
+        if let Some(processor)=instance.processor.take() {instance.handle.deactivate(processor);}
+        Ok(serde_json::json!({"uid":uid,"name":name,"source":"plugin metadata and saved overrides; not live readback","params":params}).to_string())
+    }
+
     fn resolve_clap(&self, plugin_id: &str) -> Result<(String, String), String> {
         clap_cache()
             .iter()
@@ -503,13 +583,105 @@ impl DawTools {
                 r.new_volume
             ));
         }
+        let analyzed_hash = daw_core::project::format::project_revision(&p).map_err(|e| e.to_string())?;
         self.store.mutate(|p| {
+            if daw_core::project::format::project_revision(p).map_err(|e| e.to_string())? != analyzed_hash {
+                return Err("project changed during analysis; rerun auto_balance".into());
+            }
             for r in &plan {
                 p.set_track_volume(&r.track_id, r.new_volume);
             }
             Ok(String::new())
         })?;
         self.with_summary(report)
+    }
+
+    /// Symbolic groove report: how notes sit against the 16th grid plus the
+    /// project's swing/humanize/timing. No render needed.
+    pub fn analyze_groove(&self) -> Result<String, String> {
+        Ok(crate::groove::groove_report(&self.store.load()?))
+    }
+
+    /// Baseline snapshot path: `<project>.snapshot.json` beside the project.
+    fn snapshot_path(&self) -> std::path::PathBuf {
+        let mut p = self.store.path.clone();
+        p.set_extension("snapshot.json");
+        p
+    }
+
+    /// Render the project and save an analyzed fingerprint as the CI baseline.
+    pub fn snapshot(&self) -> Result<String, String> {
+        let p = self.store.load()?;
+        if !self.sf2_path.exists() {
+            return Err(format!("soundfont missing at {} — download GeneralUser.sf2 (see README)", self.sf2_path.display()));
+        }
+        let fp = crate::snapshot::render_fingerprint(&p, &self.sf2_path).map_err(|e| e.to_string())?;
+        let path = self.snapshot_path();
+        let json = serde_json::to_string_pretty(&fp).map_err(|e| e.to_string())?;
+        std::fs::write(&path, json).map_err(|e| e.to_string())?;
+        Ok(format!(
+            "snapshot saved to {}: peak {:.1} dBFS, rms {:.1} dBFS, {} tracks, {} notes, {} clipped",
+            path.display(), fp.peak_db, fp.rms_db, fp.tracks, fp.notes, fp.clipped_samples
+        ))
+    }
+
+    /// Re-render and report regressions vs the saved snapshot baseline.
+    pub fn check(&self) -> Result<String, String> {
+        let p = self.store.load()?;
+        if !self.sf2_path.exists() {
+            return Err(format!("soundfont missing at {} — download GeneralUser.sf2 (see README)", self.sf2_path.display()));
+        }
+        let path = self.snapshot_path();
+        let baseline: crate::snapshot::Fingerprint = std::fs::read_to_string(&path)
+            .map_err(|_| format!("no snapshot at {} — run `snapshot` first", path.display()))
+            .and_then(|s| serde_json::from_str(&s).map_err(|e| e.to_string()))?;
+        let current = crate::snapshot::render_fingerprint(&p, &self.sf2_path).map_err(|e| e.to_string())?;
+        let regs = crate::snapshot::regressions(&baseline, &current);
+        if regs.is_empty() {
+            return Ok(format!("PASS: no regressions vs {}", path.display()));
+        }
+        let mut s = format!("{} regression(s) vs {}:\n", regs.len(), path.display());
+        for r in &regs {
+            s.push_str(&format!("  [{:?}] {}\n", r.level, r.msg));
+        }
+        Ok(s)
+    }
+
+    /// Describe the musical changes from another `.daw.json` (the "before") to
+    /// the current project.
+    pub fn diff_project(&self, other_path: String) -> Result<String, String> {
+        let current = self.store.load()?;
+        let other = daw_core::project::format::load(&other_path)
+            .map_err(|e| format!("load {other_path}: {e}"))?;
+        let changes = crate::diff::diff_projects(&other, &current);
+        let body = changes.iter().map(|c| format!("  {c}")).collect::<Vec<_>>().join("\n");
+        Ok(format!("changes from {other_path} to current project:\n{body}"))
+    }
+
+    /// Report the song's density (tracks active per bar) and dynamic arc, and
+    /// flag flat/static textures or missing intro builds.
+    pub fn analyze_arrangement(&self) -> Result<String, String> {
+        let p = self.store.load()?;
+        if !self.sf2_path.exists() {
+            return Err(format!(
+                "soundfont missing at {} — download GeneralUser.sf2 (see README)",
+                self.sf2_path.display()
+            ));
+        }
+        crate::arrangement::arrangement_report(&p, &self.sf2_path).map_err(|e| e.to_string())
+    }
+
+    /// Solo-render each track, profile its spectrum, and report where each
+    /// track lives + which tracks mask each other (frequency collisions).
+    pub fn analyze_mix(&self) -> Result<String, String> {
+        let p = self.store.load()?;
+        if !self.sf2_path.exists() {
+            return Err(format!(
+                "soundfont missing at {} — download GeneralUser.sf2 (see README)",
+                self.sf2_path.display()
+            ));
+        }
+        crate::mix_analysis::mix_report(&p, &self.sf2_path).map_err(|e| e.to_string())
     }
 
     // ── Listening ────────────────────────────────────────────────────────────
@@ -557,32 +729,15 @@ impl DawTools {
             .to_string();
         let s = start_bar.unwrap_or(0);
         let e_label = end_bar.map(|e| e.to_string()).unwrap_or_else(|| "end".into());
-        let out = dir.join(format!("{stem}-{s}-{e_label}.wav"));
+        let out = dir.join(format!("{stem}-{s}-{e_label}-{}.wav", daw_io::session::operation_id()));
         let bpm = p.project.bpm;
-        daw_core::audio::export_wav(&p, &self.sf2_path, &out).map_err(|e| e.to_string())?;
-
-        // Trim to the bar range (export always starts at t=0).
-        if start_bar.is_some() || end_bar.is_some() {
-            let mut rd = hound::WavReader::open(&out).map_err(|e| e.to_string())?;
-            let spec = rd.spec();
-            let samples: Vec<f32> = rd.samples::<f32>().map(|x| x.unwrap_or(0.0)).collect();
-            let ch = spec.channels.max(1) as usize;
-            let frames = samples.len() / ch;
-            let spb = 240.0 / bpm.max(1.0);
-            let fpb = (spb * spec.sample_rate as f64) as usize;
-            let a = (s as usize).saturating_mul(fpb).min(frames);
-            let b = end_bar
-                .map(|e| (e as usize).saturating_mul(fpb).min(frames))
-                .unwrap_or(frames)
-                .max(a);
-            let mut wr = hound::WavWriter::create(&out, spec).map_err(|e| e.to_string())?;
-            for f in a..b {
-                for c in 0..ch {
-                    let _ = wr.write_sample(samples[f * ch + c]);
-                }
-            }
-            wr.finalize().map_err(|e| e.to_string())?;
-        }
+        let p = daw_core::project::format::resolve_assets(&p, self.store.path.parent().unwrap_or(std::path::Path::new(".")), &std::env::current_dir().map_err(|e| e.to_string())?);
+        let range = if start_bar.is_some() || end_bar.is_some() { Some((s, end_bar.unwrap_or_else(|| p.song_bars()))) } else { None };
+        let (samples, sr) = daw_core::audio::export::render_range_samples(&p, &self.sf2_path, false, range, &Default::default()).map_err(|e| e.to_string())?;
+        let spec = hound::WavSpec { channels: 2, sample_rate: sr, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
+        let mut writer = hound::WavWriter::create(&out, spec).map_err(|e| e.to_string())?;
+        for sample in samples { writer.write_sample(sample).map_err(|e| e.to_string())?; }
+        writer.finalize().map_err(|e| e.to_string())?;
         Ok((out, bpm))
     }
 
@@ -628,6 +783,30 @@ mod tests {
     }
 
     #[test]
+    fn sampler_variants_are_validated_and_preserved_by_mcp_mutations() {
+        let (t,path)=tools("sampler-variants");
+        t.store.mutate(|p| {
+            p.tracks[0].instrument=serde_json::from_value(serde_json::json!({"type":"sampler","pads":[{"pitch":36,"path":"base.wav"}]})).unwrap();
+            Ok("sampler".into())
+        }).unwrap();
+        t.set_sampler_variants("t1".into(),36,serde_json::json!([
+            {"path":"soft.wav","min_velocity":1,"max_velocity":63},
+            {"path":"soft-2.wav","min_velocity":1,"max_velocity":63}
+        ])).unwrap();
+        let before=std::fs::read(&path).unwrap();
+        assert!(t.set_sampler_variants("t1".into(),36,serde_json::json!([
+            {"path":"one.wav","min_velocity":1,"max_velocity":80},
+            {"path":"two.wav","min_velocity":60,"max_velocity":127}
+        ])).is_err());
+        assert_eq!(before,std::fs::read(&path).unwrap());
+        t.set_sampler_variants("t1".into(),36,serde_json::json!([])).unwrap();
+        let p=t.store.load().unwrap();
+        let daw_core::project::Instrument::Sampler { pads }=&p.tracks[0].instrument else { panic!("sampler") };
+        assert!(pads[0].variants.is_empty());
+        std::fs::remove_dir_all(path.parent().unwrap()).unwrap();
+    }
+
+    #[test]
     fn track_and_tempo_ops() {
         let (t, path) = tools("track");
         let out = t.add_track("melodic".into()).unwrap();
@@ -664,14 +843,14 @@ mod tests {
     #[test]
     fn arrange_region_effects_and_raw_json() {
         let (t, path) = tools("arrange");
-        t.place_clip("t1".into(), "p1".into(), 4, Some(2)).unwrap();
+        t.place_clip("t1".into(), "p1".into(), 4, Some(2), Some(240)).unwrap();
         t.set_loop_region(0, 4, Some(true), None, None).unwrap();
         t.set_effects("t1".into(), serde_json::json!({"reverb": 0.4, "drive": 0.2})).unwrap();
         let p = daw_core::project::format::load(&path).unwrap();
         assert!(p
             .arrangement
             .iter()
-            .any(|a| a.track == "t1" && a.bar == 4 && a.len_bars == Some(2)));
+            .any(|a| a.track == "t1" && a.bar == 4 && a.len_bars == Some(2) && a.offset_ticks == 240));
         assert!(p.loop_region.enabled);
         let fx = &p.tracks[0].effects;
         assert_eq!((fx.reverb, fx.drive), (0.4, 0.2));
@@ -689,7 +868,7 @@ mod tests {
     fn auto_balance_tool_applies_volumes() {
         let sf2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/GeneralUser.sf2");
         if !sf2.exists() {
-            eprintln!("skip: no soundfont");
+            assert!(std::env::var_os("DAW_REQUIRE_TEST_ASSETS").is_none(), "required audio test assets missing"); eprintln!("skip: no soundfont");
             return;
         }
         let (_, path) = tools("balance");
@@ -705,7 +884,7 @@ mod tests {
     fn listen_renders_and_reports() {
         let sf2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/GeneralUser.sf2");
         if !sf2.exists() {
-            eprintln!("skip: no soundfont");
+            assert!(std::env::var_os("DAW_REQUIRE_TEST_ASSETS").is_none(), "required audio test assets missing"); eprintln!("skip: no soundfont");
             return;
         }
         let (_, path) = tools("listen");
@@ -735,5 +914,35 @@ mod tests {
         assert_eq!(p.returns.delay.time_ms, 500);
         let err = t.set_returns(serde_json::json!({"chorus": {}})).unwrap_err();
         assert!(err.contains("chorus"));
+    }
+
+    #[test]
+    fn spatial_options_are_saved_and_invalid_controls_do_not_write() {
+        let (t,path)=tools("spatial");
+        t.set_returns(serde_json::json!({"reverb":{"gain":0.37,"predelay_ms":24,"low_cut_hz":180.,"high_cut_hz":7000.},"delay":{"gain":0.28,"sync":"eighth_dotted","modulation_ms":2.5}})).unwrap();
+        t.apply_spatial_preset("tape_echo".into()).unwrap();
+        let p=daw_core::project::format::load(&path).unwrap();
+        assert_eq!(p.returns.delay.sync,Some(daw_core::project::EchoDivision::EighthDotted));
+        assert_eq!(p.returns.delay.gain,0.28);assert_eq!(p.returns.reverb.predelay_ms,24);
+        let saved=std::fs::read(&path).unwrap();
+        for bad in [serde_json::json!({"delay":{"modulation_ms":21}}),serde_json::json!({"reverb":{"low_cut_hz":1800,"high_cut_hz":1000}}),serde_json::json!({"delay":{"sync":"random"}})] {
+            assert!(t.set_returns(bad).is_err()); assert_eq!(std::fs::read(&path).unwrap(),saved);
+        }
+        assert!(t.apply_spatial_preset("unknown".into()).is_err());assert_eq!(std::fs::read(&path).unwrap(),saved);
+    }
+
+    #[test]
+    fn clap_parameter_metadata_uses_real_ids_without_editing_project() {
+        let (t,path)=tools("clap-metadata");
+        let plugin=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/libdaw_clap_testplug_gain.so");
+        assert!(plugin.exists(),"build the workspace test plugin before this regression");
+        let uid=t.store.mutate(|p|Ok(p.add_clap_fx("t1",plugin.to_str().unwrap(),"test.gain").unwrap())).unwrap();
+        let saved=std::fs::read(&path).unwrap();
+        let data: serde_json::Value=serde_json::from_str(&t.get_clap_params(uid).unwrap()).unwrap();
+        let gain=&data["params"][0];
+        assert_eq!(gain["name"],"Gain");assert_eq!(gain["default"],1.0);
+        assert_eq!(gain["readonly"],false);assert_eq!(gain["stepped"],false);
+        assert!(gain["id"].is_u64());assert_eq!(std::fs::read(&path).unwrap(),saved);
+        assert!(t.get_clap_params("missing".into()).is_err());
     }
 }

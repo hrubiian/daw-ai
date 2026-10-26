@@ -1,10 +1,13 @@
 pub mod format;
+mod validation;
+mod spatial_presets;
+pub use spatial_presets::SpatialPreset;
 
 use serde::{Deserialize, Serialize};
 
 // ── Effects ───────────────────────────────────────────────────────────────────
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct EffectChain {
     // MIDI CC effects (synth/drum tracks)
     #[serde(default)]                        pub reverb:          f32,
@@ -163,6 +166,9 @@ pub struct ReverbReturn {
     #[serde(default = "ReverbReturn::h")]  pub room_size: f32, // 0..1
     #[serde(default = "ReverbReturn::h")]  pub damping:   f32, // 0..1
     #[serde(default = "ReverbReturn::g")]  pub width:     f32, // 0..1
+    #[serde(default)] pub predelay_ms: u32,
+    #[serde(default)] pub low_cut_hz: f32,
+    #[serde(default = "return_high_cut")] pub high_cut_hz: f32,
 }
 impl ReverbReturn {
     fn g() -> f32 { 1.0 }
@@ -170,7 +176,8 @@ impl ReverbReturn {
 }
 impl Default for ReverbReturn {
     fn default() -> Self {
-        ReverbReturn { gain: 1.0, muted: false, room_size: 0.5, damping: 0.5, width: 1.0 }
+        ReverbReturn { gain: 1.0, muted: false, room_size: 0.5, damping: 0.5, width: 1.0,
+            predelay_ms: 0, low_cut_hz: 0., high_cut_hz: return_high_cut() }
     }
 }
 
@@ -180,15 +187,51 @@ pub struct DelayReturn {
     #[serde(default)]                     pub muted:    bool,
     #[serde(default = "DelayReturn::t")]  pub time_ms:  u32, // 1..2000
     #[serde(default = "DelayReturn::fb")] pub feedback: f32, // 0..0.95
+    /// None keeps the legacy millisecond setting. Synced echoes follow tempo.
+    #[serde(default)] pub sync: Option<EchoDivision>,
+    #[serde(default)] pub mode: EchoMode,
+    #[serde(default)] pub low_cut_hz: f32,
+    #[serde(default = "return_high_cut")] pub high_cut_hz: f32,
+    #[serde(default = "DelayReturn::g")] pub width: f32,
+    #[serde(default)] pub modulation_ms: f32,
+    #[serde(default = "echo_mod_rate")] pub modulation_hz: f32,
+}
+fn return_high_cut() -> f32 { 20_000. }
+fn echo_mod_rate() -> f32 { 0.3 }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EchoMode { #[default] PingPong, Stereo }
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum EchoDivision { Sixteenth, Eighth, EighthDotted, EighthTriplet, Quarter, QuarterDotted, Half, Whole }
+impl EchoDivision {
+    pub const ALL: [Self; 8] = [Self::Sixteenth, Self::EighthTriplet, Self::Eighth, Self::EighthDotted, Self::Quarter, Self::QuarterDotted, Self::Half, Self::Whole];
+    pub fn beats(self) -> f64 { match self {
+        Self::Sixteenth => 0.25, Self::Eighth => 0.5, Self::EighthDotted => 0.75,
+        Self::EighthTriplet => 1./3., Self::Quarter => 1., Self::QuarterDotted => 1.5,
+        Self::Half => 2., Self::Whole => 4.,
+    } }
+    pub fn label(self) -> &'static str { match self {
+        Self::Sixteenth => "1/16", Self::Eighth => "1/8", Self::EighthDotted => "1/8 dot",
+        Self::EighthTriplet => "1/8 tri", Self::Quarter => "1/4", Self::QuarterDotted => "1/4 dot",
+        Self::Half => "1/2", Self::Whole => "1/1",
+    } }
 }
 impl DelayReturn {
     fn g() -> f32 { 1.0 }
     fn t() -> u32 { 300 }
     fn fb() -> f32 { 0.35 }
+    pub fn effective_time_ms(&self, bpm: f64) -> u32 {
+        self.sync.map_or(self.time_ms, |division| (60_000. / bpm.clamp(20., 300.) * division.beats()).round() as u32)
+    }
 }
 impl Default for DelayReturn {
     fn default() -> Self {
-        DelayReturn { gain: 1.0, muted: false, time_ms: 300, feedback: 0.35 }
+        DelayReturn { gain: 1.0, muted: false, time_ms: 300, feedback: 0.35,
+            sync: None, mode: EchoMode::default(), low_cut_hz: 0., high_cut_hz: return_high_cut(),
+            width: 1., modulation_ms: 0., modulation_hz: echo_mod_rate() }
     }
 }
 
@@ -221,15 +264,19 @@ impl Default for LoopRegion {
 pub enum ReturnParam {
     RevGain, RevRoomSize, RevDamping, RevWidth,
     DlyGain, DlyTimeMs, DlyFeedback,
+    RevPredelay, RevLowCut, RevHighCut,
+    DlyLowCut, DlyHighCut, DlyWidth, DlyModDepth, DlyModRate,
 }
 
 impl ReturnParam {
-    pub const REVERB: [ReturnParam; 4] = [
+    pub const REVERB: [ReturnParam; 7] = [
         ReturnParam::RevGain, ReturnParam::RevRoomSize,
         ReturnParam::RevDamping, ReturnParam::RevWidth,
+        Self::RevPredelay, Self::RevLowCut, Self::RevHighCut,
     ];
-    pub const DELAY: [ReturnParam; 3] = [
+    pub const DELAY: [ReturnParam; 8] = [
         ReturnParam::DlyGain, ReturnParam::DlyTimeMs, ReturnParam::DlyFeedback,
+        Self::DlyLowCut, Self::DlyHighCut, Self::DlyWidth, Self::DlyModDepth, Self::DlyModRate,
     ];
 
     pub fn label(self) -> &'static str {
@@ -238,6 +285,9 @@ impl ReturnParam {
             ReturnParam::RevDamping => "Damp", ReturnParam::RevWidth => "Width",
             ReturnParam::DlyGain => "Gain",    ReturnParam::DlyTimeMs => "Time ms",
             ReturnParam::DlyFeedback => "Feedbk",
+            Self::RevPredelay => "Pre-delay ms", Self::RevLowCut | Self::DlyLowCut => "Low cut Hz",
+            Self::RevHighCut | Self::DlyHighCut => "High cut Hz", Self::DlyWidth => "Width",
+            Self::DlyModDepth => "Wobble ms", Self::DlyModRate => "Wobble Hz",
         }
     }
 
@@ -250,6 +300,11 @@ impl ReturnParam {
             ReturnParam::DlyGain => r.delay.gain,
             ReturnParam::DlyTimeMs => r.delay.time_ms as f32,
             ReturnParam::DlyFeedback => r.delay.feedback,
+            Self::RevPredelay => r.reverb.predelay_ms as f32,
+            Self::RevLowCut => r.reverb.low_cut_hz, Self::RevHighCut => r.reverb.high_cut_hz,
+            Self::DlyLowCut => r.delay.low_cut_hz, Self::DlyHighCut => r.delay.high_cut_hz,
+            Self::DlyWidth => r.delay.width, Self::DlyModDepth => r.delay.modulation_ms,
+            Self::DlyModRate => r.delay.modulation_hz,
         }
     }
 
@@ -260,8 +315,16 @@ impl ReturnParam {
             ReturnParam::RevDamping => r.reverb.damping = (r.reverb.damping + delta).clamp(0.0, 1.0),
             ReturnParam::RevWidth => r.reverb.width = (r.reverb.width + delta).clamp(0.0, 1.0),
             ReturnParam::DlyGain => r.delay.gain = (r.delay.gain + delta).clamp(0.0, 1.25),
-            ReturnParam::DlyTimeMs => r.delay.time_ms = (r.delay.time_ms as f32 + delta).clamp(1.0, 2000.0) as u32,
+            ReturnParam::DlyTimeMs => { r.delay.sync = None; r.delay.time_ms = (r.delay.time_ms as f32 + delta).clamp(1.0, 12000.0) as u32; },
             ReturnParam::DlyFeedback => r.delay.feedback = (r.delay.feedback + delta).clamp(0.0, 0.95),
+            Self::RevPredelay => r.reverb.predelay_ms = (r.reverb.predelay_ms as f32 + delta).clamp(0., 250.) as u32,
+            Self::RevLowCut => r.reverb.low_cut_hz = (r.reverb.low_cut_hz+delta).clamp(0., 2000.).min(r.reverb.high_cut_hz-10.),
+            Self::RevHighCut => r.reverb.high_cut_hz = (r.reverb.high_cut_hz+delta).clamp(500., 20000.).max(r.reverb.low_cut_hz+10.),
+            Self::DlyLowCut => r.delay.low_cut_hz = (r.delay.low_cut_hz+delta).clamp(0., 2000.).min(r.delay.high_cut_hz-10.),
+            Self::DlyHighCut => r.delay.high_cut_hz = (r.delay.high_cut_hz+delta).clamp(500., 20000.).max(r.delay.low_cut_hz+10.),
+            Self::DlyWidth => r.delay.width = (r.delay.width+delta).clamp(0., 1.),
+            Self::DlyModDepth => r.delay.modulation_ms = (r.delay.modulation_ms+delta).clamp(0., 20.),
+            Self::DlyModRate => r.delay.modulation_hz = (r.delay.modulation_hz+delta).clamp(0.05, 8.),
         }
     }
 }
@@ -280,6 +343,9 @@ pub struct ProjectMeta {
     /// Velocity humanization amount, 0.0 (off) ..= 1.0 (±35% variation).
     #[serde(default)]
     pub humanize: f32,
+    /// Note-timing humanization, 0.0 (dead-on grid) ..= 1.0 (±~32nd jitter).
+    #[serde(default)]
+    pub timing: f32,
 }
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -301,6 +367,13 @@ pub struct Track {
     /// CLAP insert-effect chain, processed after the built-in effects.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub clap_fx: Vec<ClapSlot>,
+    /// Constant microtonal detune for the whole track, in cents (100 = one
+    /// semitone up, negative = down). Applied as a fixed pitch bend to the
+    /// strip's synth, so every note on this track sounds this many cents off
+    /// 12-TET — letting a voice sit between the piano keys. Effective range is
+    /// the synth's default ±200-cent bend. Defaults to 0 (older files unchanged).
+    #[serde(default, skip_serializing_if = "is_zero_f32")]
+    pub tuning_cents: f32,
 }
 
 // ── Modulation (per-track LFO matrix) ──────────────────────────────────────────
@@ -399,16 +472,45 @@ pub struct ClapSlot {
     pub params: std::collections::BTreeMap<String, f64>,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct SamplePad {
     pub pitch: u8,
     pub path: String,
+    #[serde(default = "SamplePad::unity")]
+    pub gain: f32,
+    /// Matching velocity ranges select a timbre; equal ranges rotate takes.
+    /// Empty keeps legacy single-sample playback. Gaps use `path` as fallback.
+    #[serde(default, skip_serializing_if = "Vec::is_empty")]
+    pub variants: Vec<SampleVariant>,
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(deny_unknown_fields)]
+pub struct SampleVariant {
+    pub path: String,
+    pub min_velocity: u8,
+    pub max_velocity: u8,
     #[serde(default = "SamplePad::unity")]
     pub gain: f32,
 }
 
 impl SamplePad {
     fn unity() -> f32 { 1.0 }
+    pub fn validate_variants(&self) -> anyhow::Result<()> {
+        anyhow::ensure!(self.variants.len() <= 32, "at most 32 variants per sampler pad");
+        for (i, v) in self.variants.iter().enumerate() {
+            anyhow::ensure!(!v.path.trim().is_empty(), "empty sampler variant path");
+            anyhow::ensure!(v.min_velocity >= 1 && v.min_velocity <= v.max_velocity
+                && v.max_velocity <= 127, "invalid sampler velocity range");
+            anyhow::ensure!(v.gain.is_finite() && (0.0..=2.0).contains(&v.gain), "invalid sampler variant gain");
+            for other in &self.variants[..i] {
+                let overlap = v.min_velocity <= other.max_velocity && other.min_velocity <= v.max_velocity;
+                anyhow::ensure!(!overlap || (v.min_velocity == other.min_velocity && v.max_velocity == other.max_velocity),
+                    "sampler velocity ranges must be disjoint or identical for alternate takes");
+            }
+        }
+        Ok(())
+    }
 }
 
 /// Minimum cropped length of an audio clip, in seconds.
@@ -564,6 +666,10 @@ pub struct PianoRollPattern {
     pub bars: u8,
     pub ticks_per_bar: u32,
     pub notes: Vec<Note>,
+    /// Legato: connect each note to the next (note-off at the next note's
+    /// start). Off by default. Tuned for melodic lines.
+    #[serde(default)]
+    pub legato: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -579,10 +685,37 @@ pub struct ArrangementSlot {
     pub track: String,
     pub pattern: String,
     pub bar: u32,
+    /// Sub-bar start offset in ticks (480/bar). `0` = exactly on the bar line;
+    /// e.g. `240` starts the clip half a bar late. The clip's absolute start is
+    /// `bar * TICKS_PER_BAR + offset_ticks`. Kept in `[0, TICKS_PER_BAR)` —
+    /// whole bars fold into `bar`. Defaults to 0 so older files load unchanged.
+    #[serde(default, skip_serializing_if = "is_zero_u32")]
+    pub offset_ticks: u32,
     /// Clip length in bars. `None` = the pattern's natural bar count. `Some(n)`
     /// = the clip spans `n` bars and the pattern loops to fill.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub len_bars: Option<u32>,
+}
+
+fn is_zero_u32(n: &u32) -> bool { *n == 0 }
+fn is_zero_f32(x: &f32) -> bool { *x == 0.0 }
+
+/// Fold whole bars out of a tick offset so the invariant `offset < TICKS_PER_BAR`
+/// always holds: `(bar, off)` → `(bar + off/TPB, off % TPB)`.
+fn normalize_bar_offset(bar: u32, offset_ticks: u32) -> (u32, u32) {
+    (bar + offset_ticks / ARR_TICKS_PER_BAR, offset_ticks % ARR_TICKS_PER_BAR)
+}
+
+/// Ticks per bar on the arrangement timeline (4/4, 480/bar). Mirrors
+/// `sequencer::TICKS_PER_BAR`; duplicated here so `daw-core::project` has no
+/// dependency on the sequencer module for the bar→tick conversion.
+pub const ARR_TICKS_PER_BAR: u32 = 480;
+
+impl ArrangementSlot {
+    /// Absolute start position on the timeline, in ticks.
+    pub fn start_tick(&self) -> u32 {
+        self.bar * ARR_TICKS_PER_BAR + self.offset_ticks
+    }
 }
 
 impl Project {
@@ -597,7 +730,7 @@ impl Project {
                 scale: "major".into(),
                 swing: 0.0,
                 metronome: false,
-                humanize: 0.0,
+                humanize: 0.0, timing: 0.0,
             },
             tracks: vec![
                 Track {
@@ -612,6 +745,7 @@ impl Project {
                     effects: EffectChain::default(),
                     modulators: Vec::new(),
                     clap_fx: Vec::new(),
+                    tuning_cents: 0.0,
                 },
                 Track {
                     id: "t2".into(),
@@ -625,6 +759,7 @@ impl Project {
                     effects: EffectChain::default(),
                     modulators: Vec::new(),
                     clap_fx: Vec::new(),
+                    tuning_cents: 0.0,
                 },
             ],
             patterns: vec![
@@ -650,11 +785,12 @@ impl Project {
                         Note { pitch: 38, tick: 480,  duration: 240, vel: 75 },
                         Note { pitch: 41, tick: 720,  duration: 120, vel: 70 },
                     ],
+                    legato: false,
                 }),
             ],
             arrangement: vec![
-                ArrangementSlot { track: "t1".into(), pattern: "p1".into(), bar: 0, len_bars: None },
-                ArrangementSlot { track: "t2".into(), pattern: "p2".into(), bar: 0, len_bars: None },
+                ArrangementSlot { track: "t1".into(), pattern: "p1".into(), bar: 0, offset_ticks: 0, len_bars: None },
+                ArrangementSlot { track: "t2".into(), pattern: "p2".into(), bar: 0, offset_ticks: 0, len_bars: None },
             ],
             audio_clips: Vec::new(),
             returns: Returns::default(),
@@ -674,8 +810,16 @@ impl Project {
         }
     }
 
-    /// Set the duration of the note at (pitch, tick) in a piano-roll pattern
-    /// (min one 16th = 30 ticks). Grows the pattern's bars to fit.
+    /// Change an existing note's dynamics without moving or stretching it.
+    pub fn set_note_velocity(&mut self, pid: &str, pitch: u8, tick: u32, velocity: u8) -> bool {
+        if velocity == 0 || velocity > 127 { return false; }
+        let Some(Pattern::PianoRoll(pattern)) = self.patterns.iter_mut().find(|p| p.id() == pid) else { return false };
+        let Some(note) = pattern.notes.iter_mut().find(|n| n.pitch == pitch && n.tick == tick) else { return false };
+        note.vel = velocity;
+        true
+    }
+
+    /// Set note duration (minimum 30 ticks), growing pattern length when needed.
     pub fn set_note_duration(&mut self, pid: &str, pitch: u8, tick: u32, duration: u32) -> bool {
         for p in &mut self.patterns {
             if let Pattern::PianoRoll(pr) = p {
@@ -769,9 +913,40 @@ impl Project {
         let Some(t) = self.track_mut(id) else { return false };
         let Instrument::Sampler { pads } = &mut t.instrument else { return false };
         match pads.iter_mut().find(|p| p.pitch == pitch) {
-            Some(pad) => pad.path = path,
-            None => pads.push(SamplePad { pitch, path, gain: 1.0 }),
+            Some(pad) => { pad.path = path; pad.variants.clear(); },
+            None => pads.push(SamplePad { pitch, path, gain: 1.0, variants: Vec::new() }),
         }
+        true
+    }
+
+    /// Replace alternate takes atomically; the legacy pad remains the fallback.
+    pub fn set_sampler_variants(&mut self, id: &str, pitch: u8, variants: Vec<SampleVariant>) -> Result<(), String> {
+        let Some(t) = self.track_mut(id) else { return Err(format!("no track {id}")) };
+        let Instrument::Sampler { pads } = &mut t.instrument else { return Err("track is not a sampler".into()) };
+        let pad = pads.iter_mut().find(|p| p.pitch == pitch).ok_or_else(|| format!("no pad at pitch {pitch}"))?;
+        let mut updated = pad.clone();
+        updated.variants = variants;
+        updated.validate_variants().map_err(|e| e.to_string())?;
+        *pad = updated;
+        Ok(())
+    }
+
+    pub fn add_sampler_variant(&mut self, id: &str, pitch: u8, variant: SampleVariant) -> Result<(), String> {
+        let variants = self.tracks.iter().find(|t| t.id == id).and_then(|t| match &t.instrument {
+            Instrument::Sampler { pads } => pads.iter().find(|p| p.pitch == pitch).map(|p| p.variants.clone()),
+            _ => None,
+        }).ok_or_else(|| "select an existing sampler pad first".to_string())?;
+        let mut variants = variants;
+        variants.push(variant);
+        self.set_sampler_variants(id, pitch, variants)
+    }
+
+    /// Explicit velocity: 0 disables, 2..127 sets dynamics; 1 is the legacy row-default marker.
+    pub fn set_step_velocity(&mut self, pattern_id: &str, row: usize, step: usize, velocity: u8) -> bool {
+        if velocity == 1 || velocity > 127 { return false; }
+        let Some(Pattern::Step(pattern)) = self.patterns.iter_mut().find(|p| p.id() == pattern_id) else { return false };
+        let Some(cell) = pattern.rows.get_mut(row).and_then(|r| r.steps.get_mut(step)) else { return false };
+        *cell = velocity;
         true
     }
 
@@ -997,6 +1172,17 @@ impl Project {
     }
 
     pub fn set_swing(&mut self, swing: f32) { self.project.swing = swing.clamp(0.0, 1.0); }
+    pub fn set_timing(&mut self, timing: f32) { self.project.timing = timing.clamp(0.0, 1.0); }
+
+    /// Toggle legato on a piano-roll pattern. `false` for unknown/step ids.
+    pub fn set_legato(&mut self, pid: &str, on: bool) -> bool {
+        for p in &mut self.patterns {
+            if let Pattern::PianoRoll(pr) = p {
+                if pr.id == pid { pr.legato = on; return true; }
+            }
+        }
+        false
+    }
     pub fn set_metronome(&mut self, on: bool) { self.project.metronome = on; }
 
     fn pattern_bars(&self, pid: &str) -> u32 {
@@ -1106,7 +1292,7 @@ impl Project {
             }
             None => track_pats[0].clone(),
         };
-        self.arrangement.push(ArrangementSlot { track: track_id.to_string(), pattern: next, bar, len_bars: None });
+        self.arrangement.push(ArrangementSlot { track: track_id.to_string(), pattern: next, bar, offset_ticks: 0, len_bars: None });
         true
     }
 
@@ -1128,7 +1314,7 @@ impl Project {
             !(s.bar <= bar && bar < s.bar + span)
         });
         self.arrangement.push(ArrangementSlot {
-            track: track_id.to_string(), pattern: pattern_id.to_string(), bar, len_bars: None,
+            track: track_id.to_string(), pattern: pattern_id.to_string(), bar, offset_ticks: 0, len_bars: None,
         });
         true
     }
@@ -1160,11 +1346,18 @@ impl Project {
         self.arrangement.len() != before
     }
 
-    /// Move the clip at `(from_track, from_bar)` to `(to_track, to_bar)`, keeping its
-    /// pattern and explicit length. Clears any clips overlapping the destination first.
-    /// No-op (false) if there's no clip at the source or the source == destination.
-    pub fn move_clip(&mut self, from_track: &str, from_bar: u32, to_track: &str, to_bar: u32) -> bool {
-        if from_track == to_track && from_bar == to_bar { return false; }
+    /// Move the clip at `(from_track, from_bar)` to `(to_track, to_bar)` with a
+    /// sub-bar `to_offset_ticks`, keeping its pattern and explicit length. Clears
+    /// any clips overlapping the destination first. No-op (false) if there's no
+    /// clip at the source or the destination equals the source position.
+    pub fn move_clip(&mut self, from_track: &str, from_bar: u32, to_track: &str, to_bar: u32, to_offset_ticks: u32) -> bool {
+        let (to_bar, to_offset) = normalize_bar_offset(to_bar, to_offset_ticks);
+        if from_track == to_track && from_bar == to_bar && to_offset == 0 {
+            // Same bar, on the grid: nothing to do (offset 0 == old behavior).
+            if self.arrangement.iter().any(|s| s.track == from_track && s.bar == from_bar && s.offset_ticks == 0) {
+                return false;
+            }
+        }
         let Some((pattern, len_bars)) = self.arrangement.iter()
             .find(|s| s.track == from_track && s.bar == from_bar)
             .map(|s| (s.pattern.clone(), s.len_bars)) else { return false };
@@ -1175,8 +1368,19 @@ impl Project {
             let span = spans.get(&s.bar).copied().unwrap_or(1);
             !(s.bar <= to_bar && to_bar < s.bar + span)
         });
-        self.arrangement.push(ArrangementSlot { track: to_track.to_string(), pattern, bar: to_bar, len_bars });
+        self.arrangement.push(ArrangementSlot { track: to_track.to_string(), pattern, bar: to_bar, offset_ticks: to_offset, len_bars });
         true
+    }
+
+    /// Set the sub-bar start offset (ticks) of the clip at `(track, bar)`. The
+    /// offset is normalized into `[0, TICKS_PER_BAR)`; any whole bars fold into
+    /// the slot's `bar`. False if there's no clip there.
+    pub fn set_clip_offset(&mut self, track_id: &str, bar: u32, offset_ticks: u32) -> bool {
+        let (new_bar, new_off) = normalize_bar_offset(bar, offset_ticks);
+        match self.arrangement.iter_mut().find(|s| s.track == track_id && s.bar == bar) {
+            Some(s) => { s.bar = new_bar; s.offset_ticks = new_off; true }
+            None => false,
+        }
     }
 
     fn next_track_id(&self) -> String {
@@ -1213,7 +1417,7 @@ impl Project {
             TrackType::Melodic => {
                 self.patterns.push(Pattern::PianoRoll(PianoRollPattern {
                     id: pid.clone(), name: format!("Pattern {}", &pid[1..]), bars: 4,
-                    ticks_per_bar: 480, notes: vec![],
+                    ticks_per_bar: 480, notes: vec![], legato: false,
                 }));
                 (Instrument::Soundfont { preset: 0, bank: 0, soundfont: None }, vec![pid.clone()])
             }
@@ -1223,7 +1427,7 @@ impl Project {
             id: tid.clone(), name: format!("{label} {}", &tid[1..]), track_type,
             instrument, volume: 0.8, pan: 0.0, muted: false, patterns,
             effects: EffectChain::default(), modulators: Vec::new(),
-                    clap_fx: Vec::new(),
+            clap_fx: Vec::new(), tuning_cents: 0.0,
         });
         tid
     }
@@ -1270,7 +1474,7 @@ impl Project {
                 gate: 0.5,
             })),
             TrackType::Melodic => self.patterns.push(Pattern::PianoRoll(PianoRollPattern {
-                id: pid.clone(), name: format!("Pattern {}", &pid[1..]), bars: 4, ticks_per_bar: 480, notes: vec![],
+                id: pid.clone(), name: format!("Pattern {}", &pid[1..]), bars: 4, ticks_per_bar: 480, notes: vec![], legato: false,
             })),
             TrackType::Audio => return None,
         }
@@ -1381,6 +1585,44 @@ mod tests {
     }
 
     #[test]
+    fn clip_offset_start_tick_and_normalize() {
+        // start_tick = bar*480 + offset.
+        let s = ArrangementSlot { track: "t1".into(), pattern: "p1".into(), bar: 2, offset_ticks: 240, len_bars: None };
+        assert_eq!(s.start_tick(), 2 * 480 + 240);
+        // A zero offset behaves exactly like the old whole-bar placement.
+        let s0 = ArrangementSlot { track: "t1".into(), pattern: "p1".into(), bar: 3, offset_ticks: 0, len_bars: None };
+        assert_eq!(s0.start_tick(), 3 * 480);
+        // Whole bars fold out of the offset.
+        assert_eq!(normalize_bar_offset(1, 600), (2, 120)); // 600 = one bar + 120
+        assert_eq!(normalize_bar_offset(0, 480), (1, 0));
+        assert_eq!(normalize_bar_offset(4, 240), (4, 240)); // already in range
+    }
+
+    #[test]
+    fn set_clip_offset_folds_whole_bars() {
+        let mut p = Project::default_project();
+        // default_project places clips at bar 0 on t1/t2.
+        assert!(p.set_clip_offset("t1", 0, 240));
+        let s = p.arrangement.iter().find(|s| s.track == "t1").unwrap();
+        assert_eq!((s.bar, s.offset_ticks), (0, 240));
+        // An offset past a bar moves the slot's bar and keeps offset < 480.
+        assert!(p.set_clip_offset("t1", 0, 600));
+        let s = p.arrangement.iter().find(|s| s.track == "t1").unwrap();
+        assert_eq!((s.bar, s.offset_ticks), (1, 120));
+        // No clip at that (track, bar) → false.
+        assert!(!p.set_clip_offset("t1", 9, 60));
+    }
+
+    #[test]
+    fn move_clip_carries_offset() {
+        let mut p = Project::default_project();
+        assert!(p.move_clip("t1", 0, "t1", 4, 120));
+        let s = p.arrangement.iter().find(|s| s.track == "t1").unwrap();
+        assert_eq!((s.bar, s.offset_ticks), (4, 120));
+        assert_eq!(s.start_tick(), 4 * 480 + 120);
+    }
+
+    #[test]
     fn resolve_soundfonts_routing() {
         fn sf_track(id: &str, sf: Option<&str>) -> Track {
             Track {
@@ -1388,7 +1630,7 @@ mod tests {
                 instrument: Instrument::Soundfont { preset: 0, bank: 0, soundfont: sf.map(String::from) },
                 volume: 1.0, pan: 0.0, muted: false, patterns: vec![],
                 effects: EffectChain::default(), modulators: vec![],
-            clap_fx: vec![],
+                clap_fx: vec![], tuning_cents: 0.0,
             }
         }
         let tracks = vec![
@@ -1436,7 +1678,7 @@ mod tests {
         assert_eq!(p.song_bars(), 8);
         // a slot placed beyond bar 8 raises the result above the floor
         let mut p2 = Project::default_project();
-        p2.arrangement[0] = ArrangementSlot { track: "t1".into(), pattern: "p1".into(), bar: 10, len_bars: None };
+        p2.arrangement[0] = ArrangementSlot { track: "t1".into(), pattern: "p1".into(), bar: 10, offset_ticks: 0, len_bars: None };
         assert_eq!(p2.song_bars(), 11); // 10 + 1-bar drum pattern p1
         // resizing that clip to 5 bars extends the timeline to cover it
         p2.resize_clip("t1", 10, 5);
@@ -1619,15 +1861,15 @@ mod tests {
     fn move_clip_repositions_and_changes_lane() {
         let mut p = Project::default_project();
         // default: t1/p1 at bar 0. Move within the lane to bar 3.
-        assert!(p.move_clip("t1", 0, "t1", 3));
+        assert!(p.move_clip("t1", 0, "t1", 3, 0));
         assert!(!p.arrangement.iter().any(|s| s.track == "t1" && s.bar == 0));
         assert!(p.arrangement.iter().any(|s| s.track == "t1" && s.bar == 3 && s.pattern == "p1"));
         // Move across lanes to t2 @ bar 3 (keeps the pattern, clears t2's overlap there).
-        assert!(p.move_clip("t1", 3, "t2", 3));
+        assert!(p.move_clip("t1", 3, "t2", 3, 0));
         assert!(p.arrangement.iter().any(|s| s.track == "t2" && s.bar == 3 && s.pattern == "p1"));
-        // No clip at the source, and source==dest, are no-ops.
-        assert!(!p.move_clip("t1", 99, "t1", 1));
-        assert!(!p.move_clip("t2", 3, "t2", 3));
+        // No clip at the source, and source==dest on the grid, are no-ops.
+        assert!(!p.move_clip("t1", 99, "t1", 1, 0));
+        assert!(!p.move_clip("t2", 3, "t2", 3, 0));
     }
 
     #[test]
@@ -1650,7 +1892,7 @@ mod tests {
     fn move_clip_preserves_length() {
         let mut p = Project::default_project();
         p.resize_clip("t1", 0, 3);
-        assert!(p.move_clip("t1", 0, "t1", 4));
+        assert!(p.move_clip("t1", 0, "t1", 4, 0));
         assert_eq!(p.clip_len_bars("t1", 4), Some(3));
     }
 
@@ -1855,6 +2097,27 @@ mod tests {
     }
 
     #[test]
+    fn timing_and_legato_schema() {
+        let mut p = Project::default_project();
+        assert_eq!(p.project.timing, 0.0);
+        p.set_timing(0.5);
+        assert_eq!(p.project.timing, 0.5);
+        p.set_timing(9.0);
+        assert_eq!(p.project.timing, 1.0, "clamped");
+        assert!(p.set_legato("p2", true));
+        assert!(matches!(p.patterns.iter().find(|x| x.id()=="p2").unwrap(),
+            Pattern::PianoRoll(pr) if pr.legato));
+        assert!(!p.set_legato("p1", true), "step pattern refuses");
+        let j = serde_json::to_string(&p).unwrap();
+        let mut v: serde_json::Value = serde_json::from_str(&j).unwrap();
+        v["project"].as_object_mut().unwrap().remove("timing");
+        v["patterns"][1].as_object_mut().unwrap().remove("legato");
+        let p2: Project = serde_json::from_value(v).unwrap();
+        assert_eq!(p2.project.timing, 0.0);
+        assert!(matches!(&p2.patterns[1], Pattern::PianoRoll(pr) if !pr.legato));
+    }
+
+    #[test]
     fn note_duration_and_pr_bars_ops() {
         let mut p = Project::default_project();
         // p2 is the default piano-roll with a note at pitch 36, tick 0.
@@ -1983,5 +2246,58 @@ mod tests {
         assert_eq!(p.tracks[0].effects.send_delay, 0.6);
         assert!(EffectParam::MIDI.contains(&EffectParam::SendDelay));
         assert!(EffectParam::AUDIO.contains(&EffectParam::SendDelay));
+    }
+}
+
+#[cfg(test)]
+mod expressive_sampler_tests {
+    use super::*;
+
+    fn pad() -> SamplePad {
+        serde_json::from_value(serde_json::json!({"pitch":36,"path":"base.wav"})).unwrap()
+    }
+    fn take(min: u8, max: u8) -> SampleVariant {
+        SampleVariant { path: "take.wav".into(), min_velocity: min, max_velocity: max, gain: 1. }
+    }
+    #[test]
+    fn legacy_pads_and_valid_layers_roundtrip_without_losing_data() {
+        let mut p = pad();
+        assert!(p.variants.is_empty());
+        assert!(serde_json::to_value(&p).unwrap().get("variants").is_none());
+        p.variants = vec![take(1, 63), take(1, 63), take(64, 127)];
+        p.validate_variants().unwrap();
+        assert_eq!(p, serde_json::from_slice(&serde_json::to_vec(&p).unwrap()).unwrap());
+    }
+    #[test]
+    fn invalid_sampler_edits_preserve_the_previous_pad() {
+        let mut p = Project::default_project();
+        p.tracks[0].instrument = Instrument::Sampler { pads: vec![pad()] };
+        p.set_sampler_variants("t1", 36, vec![take(1, 63)]).unwrap();
+        assert!(p.set_sampler_variants("t1", 36, vec![take(1, 63), take(60, 127)]).is_err());
+        assert!(p.set_sampler_variants("t1", 36, vec![take(0, 127)]).is_err());
+        assert!(p.set_sampler_variants("t1", 36, vec![take(64, 63)]).is_err());
+        assert!(p.set_sampler_variants("t1", 36, vec![take(1, 127); 33]).is_err());
+        let Instrument::Sampler { pads } = &p.tracks[0].instrument else { panic!("sampler") };
+        assert_eq!(pads[0].variants.len(), 1);
+        p.set_sampler_pad("t1", 36, "new-base.wav".into());
+        let Instrument::Sampler { pads } = &p.tracks[0].instrument else { panic!("sampler") };
+        assert!(pads[0].variants.is_empty(), "replacing the instrument sample clears obsolete takes");
+    }
+    #[test]
+    fn dynamics_edit_preserves_note_timing_and_legacy_step_defaults() {
+        let mut p = Project::default_project();
+        let Pattern::Step(sp) = &p.patterns[0] else { panic!("steps") };
+        let id = sp.id.clone();
+        assert!(p.set_step_velocity(&id, 0, 0, 42));
+        let Pattern::Step(sp) = &p.patterns[0] else { panic!("steps") };
+        assert_eq!(sp.rows[0].step_velocity(0), Some(42));
+        assert!(!p.set_step_velocity(&id, 0, 0, 1));
+        p.patterns.push(Pattern::PianoRoll(PianoRollPattern {
+            id: "phrase".into(), name: "Phrase".into(), bars: 1, ticks_per_bar: 480, legato: false,
+            notes: vec![Note { pitch: 60, tick: 62, duration: 79, vel: 80 }],
+        }));
+        assert!(p.set_note_velocity("phrase", 60, 62, 108));
+        let Pattern::PianoRoll(pr) = p.patterns.last().unwrap() else { panic!("piano") };
+        assert_eq!((pr.notes[0].tick, pr.notes[0].duration, pr.notes[0].vel), (62, 79, 108));
     }
 }

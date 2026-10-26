@@ -46,9 +46,14 @@ impl Tab {
 }
 
 pub struct App {
+    pub session: Option<daw_io::session::LiveSession>,
+    pub export_control: Option<std::sync::Arc<daw_core::render_control::RenderControl>>,
+    export_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     pub active_tab:    Tab,
     pub project:       Project,
     pub project_path:  Option<std::path::PathBuf>,
+    pub file_revision: Option<String>,
+    pub saved_hash: String,
     pub is_playing:    bool,
     pub seq_tx:        Sender<SequencerCommand>,
     pub should_quit:   bool,
@@ -121,10 +126,19 @@ impl App {
         playback_tick: Arc<AtomicU32>,
         vis_buf: Arc<Mutex<Vec<f32>>>,
     ) -> Self {
+        let file_revision = project_path.as_ref().and_then(|path| daw_core::project::format::load_versioned(path).ok().map(|(disk, revision)| {
+            if daw_core::project::format::project_revision(&disk).ok() == daw_core::project::format::project_revision(&project).ok() { revision } else { "stale-loaded-project".into() }
+        }));
+        let saved_hash = daw_core::project::format::project_revision(&project).unwrap_or_default();
         App {
+            session: None,
+            export_control: None,
+            export_result: Default::default(),
             active_tab: Tab::Tracks,
             project,
             project_path,
+            file_revision,
+            saved_hash,
             is_playing: false,
             seq_tx,
             should_quit: false,
@@ -184,6 +198,24 @@ impl App {
     }
 
     pub fn send(&self, cmd: SequencerCommand) {
+        if let Some(session) = &self.session {
+            let command = match &cmd {
+                SequencerCommand::Play => Some(daw_core::session::Command::Play),
+                SequencerCommand::Pause => Some(daw_core::session::Command::Pause),
+                SequencerCommand::Seek(tick) => Some(daw_core::session::Command::Seek { tick: *tick }),
+                _ => None,
+            };
+            if let Some(command) = command {
+                if let Err(e) = session.transport(command) { eprintln!("session transport: {e}"); }
+                return;
+            }
+        }
+        if let Some(session) = &self.session {
+            if daw_io::session::is_project_edit(&cmd) {
+                if let Err(e) = session.submit(&self.project) { eprintln!("session edit: {e}"); }
+                return;
+            }
+        }
         let _ = self.seq_tx.try_send(cmd);
     }
 
@@ -275,7 +307,8 @@ impl App {
     }
 
     pub fn refresh_all_waveforms(&mut self) {
-        let pairs: Vec<(String, String)> = self.project.tracks.iter()
+        let runtime = self.session.as_ref().map(|s| s.runtime_project(&self.project)).unwrap_or_else(|| self.project.clone());
+        let pairs: Vec<(String, String)> = runtime.tracks.iter()
             .filter_map(|t| {
                 if let Instrument::AudioFile { path } = &t.instrument {
                     if !path.is_empty() { return Some((t.id.clone(), path.clone())); }
@@ -559,6 +592,17 @@ impl App {
     /// Called from the event loop. Uses `UpdateLive`, so the playhead keeps
     /// running and the swap lands on the next bar.
     pub fn poll_hot_reload(&mut self) {
+        if let Some(message) = self.export_result.lock().ok().and_then(|mut r| r.take()) {
+            self.export_control = None;
+            self.dialog_status = message;
+        }
+        if let Some(session) = &self.session {
+            if let Err(e) = session.sync(&mut self.project) { self.jam_status = e.to_string(); }
+            if let Ok(state) = session.inspect() {
+                self.is_playing = state.playing;
+                if state.engine_status.starts_with("failed") || state.engine_status.starts_with("unavailable") { self.jam_status = state.engine_status; }
+            }
+        }
         if !self.jam_mode { return; }
         if self.last_reload_check.elapsed() < std::time::Duration::from_millis(300) { return; }
         self.last_reload_check = std::time::Instant::now();
@@ -569,8 +613,14 @@ impl App {
 
         // File changed externally. It may be mid-write (partial/invalid JSON);
         // on parse error we leave state untouched and retry on the next poll.
-        match daw_core::project::format::load(&path) {
-            Ok(proj) => {
+        if daw_core::project::format::project_revision(&self.project).ok().as_deref() != Some(self.saved_hash.as_str()) {
+            self.jam_status = "JAM conflict: local edits retained; save as a new file before loading external changes".into();
+            return;
+        }
+        match daw_core::project::format::load_versioned(&path) {
+            Ok((proj, revision)) => {
+                self.file_revision = Some(revision);
+                self.saved_hash = daw_core::project::format::project_revision(&proj).unwrap_or_default();
                 self.project = proj;
                 self.project_mtime = Some(mtime);
                 // Live update keeps the playhead so the groove continues.
@@ -585,7 +635,9 @@ impl App {
     pub fn save(&mut self) -> anyhow::Result<()> {
         let path = self.project_path.clone()
             .ok_or_else(|| anyhow::anyhow!("no project path set"))?;
-        daw_core::project::format::save(&self.project, &path)?;
+        let persisted = self.session.as_ref().filter(|s| Some(s.project_directory().as_path()) != path.parent()).map(|s| s.runtime_project(&self.project)).unwrap_or_else(|| self.project.clone());
+        self.file_revision = Some(daw_core::project::format::save_if_unchanged(&persisted, &path, self.file_revision.as_deref())?);
+        self.saved_hash = daw_core::project::format::project_revision(&self.project)?;
         // Remember our own write so JAM mode doesn't reload it as an external change.
         self.project_mtime = file_mtime(&path);
         Ok(())
@@ -598,8 +650,23 @@ impl App {
         } else {
             std::path::PathBuf::from(format!("{raw}.daw.json"))
         };
-        match daw_core::project::format::save(&self.project, &path) {
-            Ok(_)  => {
+        let path = match daw_core::project::format::absolute(&path) {
+            Ok(path) => path,
+            Err(e) => { self.dialog_status = format!("Save error: {e}"); return; }
+        };
+        let project = self.session.as_ref().map(|s| s.runtime_project(&self.project)).unwrap_or_else(|| self.project.clone());
+        match daw_core::project::format::save_if_unchanged(&project, &path, None) {
+            Ok(revision)  => {
+                if let Some(session) = &self.session {
+                    if let Err(e) = session.import(&project, &path) {
+                        self.dialog_status = format!("copy saved to {}; session conflict: {e}", path.display());
+                        self.dialog_mode = DialogMode::None;
+                        return;
+                    }
+                }
+                self.project = project;
+                self.file_revision = Some(revision);
+                self.saved_hash = daw_core::project::format::project_revision(&self.project).unwrap_or_default();
                 self.project_path  = Some(path.clone());
                 self.project_mtime = file_mtime(&path);
                 self.dialog_status = format!("Saved → {}", path.display());
@@ -650,6 +717,7 @@ impl App {
             track:   track_id,
             pattern: next_pat,
             bar,
+            offset_ticks: 0,
             len_bars: None,
         });
         self.send(SequencerCommand::UpdateLive(self.project.clone()));
@@ -674,17 +742,37 @@ impl App {
 
     pub fn confirm_export_wav(&mut self) {
         let raw = self.dialog_buf.trim().to_string();
-        let path = if raw.ends_with(".wav") {
+        let format = if std::path::Path::new(&raw).extension().is_some_and(|e| e.eq_ignore_ascii_case("mp3")) {
+            daw_core::audio::ExportFormat::Mp3
+        } else {
+            daw_core::audio::ExportFormat::Wav
+        };
+        let path = if format == daw_core::audio::ExportFormat::Mp3 || raw.to_ascii_lowercase().ends_with(".wav") {
             std::path::PathBuf::from(raw)
         } else {
             std::path::PathBuf::from(format!("{raw}.wav"))
         };
         let sf2 = std::path::PathBuf::from("assets/GeneralUser.sf2");
-        self.dialog_status = format!("Exporting → {}…", path.display());
-        match daw_core::audio::export_wav(&self.project, &sf2, &path) {
-            Ok(_)  => { self.dialog_status = format!("Exported → {}", path.display()); }
-            Err(e) => { self.dialog_status = format!("Export error: {e}"); }
-        }
+        if self.export_control.is_some() { return; }
+        let project = self.session.as_ref().map(|s| s.runtime_project(&self.project)).unwrap_or_else(|| self.project.clone());
+        let control = std::sync::Arc::new(daw_core::render_control::RenderControl::default());
+        self.export_control = Some(control.clone());
+        let result = self.export_result.clone();
+        self.dialog_status = format!("Exporting → {}… (Ctrl+E cancels)", path.display());
+        std::thread::spawn(move || {
+            let outcome = std::panic::catch_unwind(std::panic::AssertUnwindSafe(|| -> anyhow::Result<()> {
+                format.check_available()?;
+                let (samples, sr) = daw_core::audio::export::render_range_samples(&project, &sf2, true, None, &control)?;
+                control.check()?;
+                format.write(&path, &samples, sr, &control)
+            }));
+            let message = match outcome {
+                Ok(Ok(())) => format!("Exported → {}", path.display()),
+                Ok(Err(e)) => format!("Export error: {e}"),
+                Err(_) => "Export worker panicked".into(),
+            };
+            if let Ok(mut slot) = result.lock() { *slot = Some(message); }
+        });
         self.dialog_mode = DialogMode::None;
         self.dialog_buf.clear();
     }
@@ -731,6 +819,7 @@ mod tests {
             effects: EffectChain::default(),
             modulators: Vec::new(),
             clap_fx: Vec::new(),
+            tuning_cents: 0.0,
         }
     }
 
@@ -744,6 +833,7 @@ mod tests {
             effects: EffectChain::default(),
             modulators: Vec::new(),
             clap_fx: Vec::new(),
+            tuning_cents: 0.0,
         }
     }
 
@@ -757,6 +847,7 @@ mod tests {
             effects: EffectChain::default(),
             modulators: Vec::new(),
             clap_fx: Vec::new(),
+            tuning_cents: 0.0,
         }
     }
 
@@ -783,6 +874,7 @@ mod tests {
         let mut edited = Project::default_project();
         edited.project.bpm = 142.0;
         edited.tracks.clear();
+        edited.arrangement.clear();
         daw_core::project::format::save(&edited, &path).unwrap();
 
         // Force the poll to run and to see the file as "changed".

@@ -41,7 +41,7 @@ impl Biquad {
         let a      = (10.0f64).powf(gain_db as f64 / 40.0);
         let w0     = 2.0 * PI * freq as f64 / sr as f64;
         let cos_w  = w0.cos();
-        let alpha  = w0.sin() / 2.0 * ((a + 1.0 / a) * (1.0 / 1.0 - 1.0) + 2.0).sqrt();
+        let alpha  = w0.sin() / 2.0 * 2.0f64.sqrt();
         let b0 =   a * ((a+1.0) - (a-1.0)*cos_w + 2.0*a.sqrt()*alpha);
         let b1 = 2.0*a*((a-1.0) - (a+1.0)*cos_w);
         let b2 =   a * ((a+1.0) - (a-1.0)*cos_w - 2.0*a.sqrt()*alpha);
@@ -56,7 +56,7 @@ impl Biquad {
         let a      = (10.0f64).powf(gain_db as f64 / 40.0);
         let w0     = 2.0 * PI * freq as f64 / sr as f64;
         let cos_w  = w0.cos();
-        let alpha  = w0.sin() / 2.0 * ((a + 1.0 / a) * (1.0 / 1.0 - 1.0) + 2.0).sqrt();
+        let alpha  = w0.sin() / 2.0 * 2.0f64.sqrt();
         let b0 =   a * ((a+1.0) + (a-1.0)*cos_w + 2.0*a.sqrt()*alpha);
         let b1 =-2.0*a*((a-1.0) + (a+1.0)*cos_w);
         let b2 =   a * ((a+1.0) + (a-1.0)*cos_w - 2.0*a.sqrt()*alpha);
@@ -374,6 +374,8 @@ pub struct Freeverb {
     aps_r: Vec<Allpass>,
     wet1: f32,
     wet2: f32,
+    tone: super::spatial::ToneFilter,
+    predelay: super::spatial::Predelay,
 }
 
 impl Freeverb {
@@ -387,6 +389,8 @@ impl Freeverb {
             aps_r: ALLPASS_TUNINGS.iter().map(|&n| Allpass::new(sz(n + STEREO_SPREAD))).collect(),
             wet1: 0.75,
             wet2: 0.25,
+            tone: super::spatial::ToneFilter::new(sample_rate),
+            predelay: super::spatial::Predelay::new(sample_rate),
         };
         fv.set(0.5, 0.5, 1.0);
         fv
@@ -414,7 +418,8 @@ impl Freeverb {
     }
 
     pub fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
-        let input = (l + r) * FIXED_GAIN;
+        let (l, r) = self.tone.process(l, r);
+        let input = self.predelay.process((l + r) * FIXED_GAIN);
         let mut out_l = 0f32;
         let mut out_r = 0f32;
         for c in &mut self.combs_l {
@@ -446,11 +451,21 @@ pub struct PingPongDelay {
     delay_samples: usize,
     feedback: f32,
     sample_rate: f32,
+    mode: crate::project::EchoMode,
+    width: f32,
+    modulation_samples: f32,
+    phase: f32,
+    phase_step: f32,
+    tone: super::spatial::ToneFilter,
+    previous_delay: usize,
+    fade: usize,
+    started: bool,
 }
 
 impl PingPongDelay {
     pub fn new(sample_rate: u32) -> Self {
-        let max = (sample_rate as usize) * 2 + 1;
+        // A whole note at the minimum supported 20 BPM is 12 seconds.
+        let max = (sample_rate as usize) * 12 + (sample_rate as usize) / 50 + 2;
         let mut d = PingPongDelay {
             buf_l: vec![0.0; max],
             buf_r: vec![0.0; max],
@@ -458,27 +473,69 @@ impl PingPongDelay {
             delay_samples: 0,
             feedback: 0.35,
             sample_rate: sample_rate as f32,
+            mode: crate::project::EchoMode::PingPong, width: 1., modulation_samples: 0.,
+            phase: 0., phase_step: 0., tone: super::spatial::ToneFilter::new(sample_rate),
+            previous_delay: 0, fade: 0, started: false,
         };
         d.set(300, 0.35);
         d
     }
 
     pub fn set(&mut self, time_ms: u32, feedback: f32) {
-        self.delay_samples = (((time_ms as f32 / 1000.0) * self.sample_rate) as usize)
+        let samples = (((time_ms as f32 / 1000.0) * self.sample_rate) as usize)
             .clamp(1, self.buf_l.len() - 1);
+        if samples != self.delay_samples {
+            self.previous_delay = self.delay_samples;
+            self.fade = if self.started { 128 } else { 0 };
+            self.delay_samples = samples;
+        }
         self.feedback = feedback.clamp(0.0, 0.95);
+    }
+
+    pub fn configure(&mut self, settings: &crate::project::DelayReturn, bpm: f64) {
+        self.set(settings.effective_time_ms(bpm), settings.feedback);
+        self.mode = settings.mode;
+        self.width = settings.width.clamp(0., 1.);
+        self.modulation_samples = settings.modulation_ms.clamp(0., 20.)*self.sample_rate/1000.;
+        self.phase_step = std::f32::consts::TAU*settings.modulation_hz.clamp(0.05, 8.)/self.sample_rate;
+        self.tone.set(settings.low_cut_hz, settings.high_cut_hz);
+    }
+
+    fn read(&self, delay: f32) -> (f32, f32) {
+        let delay=delay.clamp(1., (self.buf_l.len()-1) as f32);
+        let whole=delay as usize;
+        let fraction=delay-whole as f32;
+        let a=(self.pos+self.buf_l.len()-whole)%self.buf_l.len();
+        if fraction==0. { return (self.buf_l[a],self.buf_r[a]); }
+        let b=(a+self.buf_l.len()-1)%self.buf_l.len();
+        (self.buf_l[a]*(1.-fraction)+self.buf_l[b]*fraction,
+         self.buf_r[a]*(1.-fraction)+self.buf_r[b]*fraction)
     }
 
     pub fn process(&mut self, l: f32, r: f32) -> (f32, f32) {
         let max = self.buf_l.len();
-        let read = (self.pos + max - self.delay_samples) % max;
-        let dl = self.buf_l[read];
-        let dr = self.buf_r[read];
-        let mono = (l + r) * 0.5;
-        self.buf_l[self.pos] = mono + dr * self.feedback;
-        self.buf_r[self.pos] = dl * self.feedback;
+        let modulation = if self.modulation_samples>0. { self.phase.sin()*self.modulation_samples } else { 0. };
+        self.phase+=self.phase_step;
+        if self.phase>=std::f32::consts::TAU { self.phase-=std::f32::consts::TAU; }
+        let (mut dl, mut dr)=self.read(self.delay_samples as f32+modulation);
+        if self.fade>0 {
+            let (old_l, old_r)=self.read(self.previous_delay.max(1) as f32+modulation);
+            let blend=self.fade as f32/128.; dl=dl*(1.-blend)+old_l*blend; dr=dr*(1.-blend)+old_r*blend;
+            self.fade-=1;
+        }
+        let (dl, dr)=self.tone.process(dl, dr);
+        if self.mode==crate::project::EchoMode::PingPong {
+            let mono = (l + r) * 0.5;
+            self.buf_l[self.pos] = mono + dr * self.feedback;
+            self.buf_r[self.pos] = dl * self.feedback;
+        } else {
+            self.buf_l[self.pos]=l+dl*self.feedback;
+            self.buf_r[self.pos]=r+dr*self.feedback;
+        }
         self.pos = (self.pos + 1) % max;
-        (dl, dr)
+        self.started=true;
+        // Skip the width matrix at unity for legacy sample-for-sample output.
+        if self.width==1. { (dl, dr) } else { let mid=(dl+dr)*0.5; let side=(dl-dr)*0.5*self.width; (mid+side, mid-side) }
     }
 }
 
@@ -489,8 +546,20 @@ impl PingPongDelay {
 /// previews). The `LoadClip*`/`PlayClip`/`StopClip`/`SetClipEffects` variants
 /// are the legacy TUI preview path, handled by the engine callback directly
 /// (not by `Mixer::handle_event`).
+/// Convert a microtonal detune in cents to a 14-bit MIDI pitch-bend value
+/// (0..=16383, where 8192 is no bend). Assumes the synth's default ±2-semitone
+/// (±200-cent) bend range; magnitudes beyond that clamp to the 14-bit endpoints.
+pub fn bend14_from_cents(cents: f32) -> i32 {
+    let v = (8192.0 + cents / 200.0 * 8192.0).round();
+    (v as i32).clamp(0, 16383)
+}
+
 #[derive(Debug)]
 pub enum AudioEvent {
+    Scheduled(Box<super::scheduling::ScheduledEvent>),
+    PublishU32 { target: Arc<std::sync::atomic::AtomicU32>, value: u32 },
+    PublishU8 { target: Arc<std::sync::atomic::AtomicU8>, value: u8 },
+    Applied { revision: u64, ack: Arc<std::sync::atomic::AtomicU64> },
     NoteOn  { strip: u8, pitch: u8, velocity: u8 },
     NoteOff { strip: u8, pitch: u8 },
     SetProgram { strip: u8, bank: u8, preset: u8 },
@@ -510,6 +579,7 @@ pub enum AudioEvent {
     // which loads the WAVs at engine SR and sends back SetAudioClips.
     LoadAudioClips { specs: Vec<(u32, String)> }, // (clip_id, path)
     SetAudioClips  { clips: Vec<(u32, Arc<Vec<f32>>, Arc<Vec<f32>>)> },
+    PreparedAudioClips { clips: std::collections::HashMap<u32, (Arc<Vec<f32>>, Arc<Vec<f32>>)> },
     /// Start clip `clip_id` on `strip` from `offset_sec` for `len_sec` at the
     /// clip's own gain (track volume/pan/mute are applied by the strip).
     TriggerAudioClip { strip: u8, clip_id: u32, offset_sec: f32, len_sec: f32, gain: f32 },
@@ -521,6 +591,8 @@ pub enum AudioEvent {
     /// Configure both return buses from the project's `Returns` (live-safe:
     /// updates coefficients without clearing DSP buffers/tails).
     SetReturns { returns: crate::project::Returns },
+    /// Tempo used by synced return effects, shared by live and offline rendering.
+    SetTempo { bpm: f64 },
     // ── CLAP hosting ─────────────────────────────────────────────────────────
     /// Install a freshly built plugin processor (relay/exporter → mixer).
     AddClapInstance { uid: String, processor: super::clap::ClapProcessor },
@@ -551,12 +623,12 @@ pub enum AudioEvent {
 // ── Strip construction specs ──────────────────────────────────────────────────
 
 /// What the relay thread needs to build one strip off the RT thread.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub enum StripKind {
     /// Soundfont instrument. `font: None` = the project's main soundfont.
     Melodic { font: Option<String>, bank: u8, preset: u8 },
     Drum    { font: Option<String>, bank: u8, preset: u8 },
-    Sampler { pads: Vec<(u8, String, f32)> }, // (pitch, wav path, pad gain)
+    Sampler { pads: Vec<crate::project::SamplePad> },
     Audio,
     /// CLAP instrument — no synth; the processor is looked up by uid.
     Clap,
@@ -573,6 +645,9 @@ pub struct StripSpec {
     pub clap_instrument: Option<String>,
     /// CLAP insert-chain slot uids, in order.
     pub clap_fx: Vec<String>,
+    /// Constant microtonal detune in cents, applied as a fixed pitch bend to the
+    /// strip's synth at build time. 0 = standard 12-TET.
+    pub tuning_cents: f32,
 }
 
 impl StripSpec {
@@ -584,7 +659,7 @@ impl StripSpec {
         project.tracks.iter().map(|t| StripSpec {
             kind: match (&t.instrument, t.track_type) {
                 (Instrument::Sampler { pads }, _) => StripKind::Sampler {
-                    pads: pads.iter().map(|p| (p.pitch, p.path.clone(), p.gain)).collect(),
+                    pads: pads.clone(),
                 },
                 (Instrument::Clap(_), _) => StripKind::Clap,
                 (_, TrackType::Audio) => StripKind::Audio,
@@ -607,6 +682,7 @@ impl StripSpec {
                 _ => None,
             },
             clap_fx: t.clap_fx.iter().map(|s| s.uid.clone()).collect(),
+            tuning_cents: t.tuning_cents,
         }).collect()
     }
 }
@@ -615,18 +691,70 @@ impl StripSpec {
 
 const MAX_BLOCK: usize = 8192;
 
+const MAX_SAMPLE_VOICES: usize = 128;
+pub static SAMPLER_VOICE_STEALS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+
+struct SampleTake {
+    left: Arc<Vec<f32>>,
+    right: Arc<Vec<f32>>,
+    gain: f32,
+}
+struct VelocityLayer {
+    min: u8,
+    max: u8,
+    takes: Vec<SampleTake>,
+    next: usize,
+}
+
+/// Built off-thread. Matching velocity layers rotate deterministically, while
+/// uncovered velocities use the original pad. Existing voices retain their take.
+pub struct SamplerPadAudio {
+    fallback: SampleTake,
+    layers: Vec<VelocityLayer>,
+}
+impl SamplerPadAudio {
+    pub fn new(left: Arc<Vec<f32>>, right: Arc<Vec<f32>>, gain: f32) -> Self {
+        Self { fallback: SampleTake { left, right, gain }, layers: Vec::new() }
+    }
+    fn add_take(&mut self, min: u8, max: u8, left: Arc<Vec<f32>>, right: Arc<Vec<f32>>, gain: f32) {
+        let take = SampleTake { left, right, gain };
+        if let Some(layer) = self.layers.iter_mut().find(|l| l.min == min && l.max == max) {
+            layer.takes.push(take);
+        } else {
+            self.layers.push(VelocityLayer { min, max, takes: vec![take], next: 0 });
+        }
+    }
+    fn select(&mut self, velocity: u8) -> (Option<usize>, usize) {
+        for (index, layer) in self.layers.iter_mut().enumerate() {
+            if velocity >= layer.min && velocity <= layer.max {
+                let take = layer.next;
+                layer.next = (take + 1) % layer.takes.len();
+                return (Some(index), take);
+            }
+        }
+        (None, 0)
+    }
+}
+struct SampleVoice {
+    pitch: u8,
+    layer: Option<usize>,
+    take: usize,
+    position: usize,
+    gain: f32,
+}
+
 /// One mixer channel. Built off the RT thread (relay), processed on it.
 pub struct Strip {
     /// Per-strip synthesizer; None for sampler/audio strips.
     pub synth: Option<rustysynth::Synthesizer>,
     /// GM channel inside this strip's synth: 9 for drums, else 0.
     pub gm_channel: i32,
-    /// pitch -> (left, right, pad gain). Pad gain no longer pre-bakes volume.
-    pub pads: std::collections::HashMap<u8, (Arc<Vec<f32>>, Arc<Vec<f32>>, f32)>,
-    /// Active one-shots: (pitch, position, velocity gain).
-    sample_voices: Vec<(u8, usize, f32)>,
+    /// Pitch -> preloaded base sample, velocity layers and alternate takes.
+    pub pads: std::collections::HashMap<u8, SamplerPadAudio>,
+    /// Active one-shots retain indices into their chosen preloaded take.
+    sample_voices: Vec<SampleVoice>,
     /// Active audio-clip voices: (left, right, pos, end, clip gain).
-    clip_voices: Vec<(Arc<Vec<f32>>, Arc<Vec<f32>>, usize, usize, f32)>,
+    clip_voices: Vec<(Arc<Vec<f32>>, Arc<Vec<f32>>, usize, usize, f32, usize)>,
     pub inserts: InsertChain,
     pub gain:  f32,
     pub pan:   f32,
@@ -642,13 +770,24 @@ pub struct Strip {
 }
 
 impl Strip {
+    fn trigger_sample(&mut self, pitch: u8, gain: f32) {
+        if !gain.is_finite() || gain <= 0. { return; }
+        let Some(pad) = self.pads.get_mut(&pitch) else { return };
+        let (layer, take) = pad.select((gain * 127.).round().clamp(1., 127.) as u8);
+        if self.sample_voices.len() == MAX_SAMPLE_VOICES {
+            self.sample_voices.remove(0);
+            SAMPLER_VOICE_STEALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
+        self.sample_voices.push(SampleVoice { pitch, layer, take, position: 0, gain });
+    }
+
     /// A synthless strip (sampler/audio) with bypass inserts at unity.
     pub fn new(sample_rate: u32) -> Self {
         Strip {
             synth: None,
             gm_channel: 0,
             pads: std::collections::HashMap::new(),
-            sample_voices: Vec::new(),
+            sample_voices: Vec::with_capacity(MAX_SAMPLE_VOICES),
             clip_voices: Vec::new(),
             inserts: InsertChain::new(sample_rate),
             gain: 1.0,
@@ -726,6 +865,24 @@ pub struct Mixer {
     pub sample_rate: u32,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
+    bpm: f64,
+    returns_settings: crate::project::Returns,
+}
+
+/// Linear de-click envelope for a voice of length `len`, position
+/// `pos_in_voice`. `fade_in` ramps 0→1 over the first `fade` samples
+/// (skipped for percussive one-shots to keep their attack); the tail always
+/// ramps 1→0 over the last `fade` samples.
+fn declick_env(pos_in_voice: usize, len: usize, fade: usize, fade_in: bool) -> f32 {
+    if len == 0 { return 0.0; }
+    let fade = fade.min(len / 2).max(1);
+    if fade_in && pos_in_voice < fade {
+        pos_in_voice as f32 / fade as f32
+    } else if pos_in_voice + fade >= len {
+        (len - pos_in_voice.min(len)) as f32 / fade as f32
+    } else {
+        1.0
+    }
 }
 
 impl Mixer {
@@ -749,6 +906,8 @@ impl Mixer {
             sample_rate,
             scratch_l: vec![0.0; MAX_BLOCK],
             scratch_r: vec![0.0; MAX_BLOCK],
+            bpm: 120.,
+            returns_settings: crate::project::Returns::default(),
         }
     }
 
@@ -766,6 +925,9 @@ impl Mixer {
     /// are no-ops here.
     pub fn handle_event(&mut self, ev: AudioEvent) {
         match ev {
+            AudioEvent::PublishU32 { target, value } => { target.store(value, std::sync::atomic::Ordering::Release); },
+            AudioEvent::PublishU8 { target, value } => { target.store(value, std::sync::atomic::Ordering::Release); },
+            AudioEvent::Applied { revision, ack } => { ack.store(revision, std::sync::atomic::Ordering::Release); },
             AudioEvent::NoteOn { strip, pitch, velocity } => {
                 if strip == STRIP_UTILITY {
                     if let Some(s) = self.utility.as_mut() {
@@ -779,7 +941,7 @@ impl Mixer {
                             p.queue_note_on(pitch, velocity);
                         } else if st.synth.is_none() && st.pads.contains_key(&pitch) {
                             // Sampler strips: a matching pad plays as a one-shot.
-                            st.sample_voices.push((pitch, 0, velocity as f32 / 127.0));
+                            st.trigger_sample(pitch, velocity as f32 / 127.0);
                         } else if let Some(s) = st.synth.as_mut() {
                             s.note_on(st.gm_channel, pitch as i32, velocity as i32);
                         }
@@ -857,12 +1019,21 @@ impl Mixer {
                 rv.muted = returns.reverb.muted;
                 if let ReturnFx::Reverb(f) = &mut rv.fx {
                     f.set(returns.reverb.room_size, returns.reverb.damping, returns.reverb.width);
+                    f.tone.set(returns.reverb.low_cut_hz, returns.reverb.high_cut_hz);
+                    f.predelay.set(returns.reverb.predelay_ms);
                 }
                 let dl = &mut self.returns[1];
                 dl.gain = returns.delay.gain.clamp(0.0, 1.25);
                 dl.muted = returns.delay.muted;
                 if let ReturnFx::Delay(d) = &mut dl.fx {
-                    d.set(returns.delay.time_ms, returns.delay.feedback);
+                    d.configure(&returns.delay, self.bpm);
+                }
+                self.returns_settings = returns;
+            }
+            AudioEvent::SetTempo { bpm } => {
+                self.bpm = bpm.clamp(20., 300.);
+                if let ReturnFx::Delay(d) = &mut self.returns[1].fx {
+                    d.configure(&self.returns_settings.delay, self.bpm);
                 }
             }
             AudioEvent::RawCC { strip, cc, value } => {
@@ -882,10 +1053,11 @@ impl Mixer {
             AudioEvent::TriggerSample { strip, pitch, gain } => {
                 if let Some(st) = self.strip_mut(strip) {
                     if st.pads.contains_key(&pitch) {
-                        st.sample_voices.push((pitch, 0, gain));
+                        st.trigger_sample(pitch, gain);
                     }
                 }
             }
+            AudioEvent::PreparedAudioClips { clips } => { self.audio_clips = clips; }
             AudioEvent::SetAudioClips { clips } => {
                 self.audio_clips.clear();
                 for (id, l, r) in clips {
@@ -901,13 +1073,17 @@ impl Mixer {
                 let end   = (start + len).min(l.len());
                 if start < end {
                     if let Some(st) = self.strip_mut(strip) {
-                        st.clip_voices.push((l, r, start, end, gain));
+                        st.clip_voices.push((l, r, start, end, gain, start));
                     }
                 }
             }
             AudioEvent::StopAudioClips => {
+                // Ramp clip voices out (~3 ms) via declick_env rather than a hard cut.
+                let fade = ((self.sample_rate as f32 * 0.003) as usize).max(1);
                 for st in &mut self.strips {
-                    st.clip_voices.clear();
+                    for v in &mut st.clip_voices {
+                        v.3 = (v.2 + fade).min(v.3); // end = min(end, pos + fade)
+                    }
                 }
             }
             AudioEvent::SetStrips { mut strips } => {
@@ -919,6 +1095,7 @@ impl Mixer {
                     st.synth_msg(0xB0, 120, 0); // All Sound Off
                     st.synth_msg(0xB0, 123, 0); // All Notes Off
                     st.sample_voices.clear();
+                    for pad in st.pads.values_mut() { for layer in &mut pad.layers { layer.next = 0; } }
                 }
                 for p in self.clap.values_mut() {
                     p.queue_all_notes_off();
@@ -939,7 +1116,8 @@ impl Mixer {
                 }
             }
             // Relay/engine-handled or legacy variants: no-ops here.
-            AudioEvent::RemoveClapInstance { .. }
+            AudioEvent::Scheduled(_)
+            | AudioEvent::RemoveClapInstance { .. }
             | AudioEvent::LoadClapInstances { .. }
             | AudioEvent::CollectClapState { .. }
             | AudioEvent::LoadStrips { .. }
@@ -958,6 +1136,7 @@ impl Mixer {
         out_l[..frames].fill(0.0);
         out_r[..frames].fill(0.0);
 
+        let fade = ((self.sample_rate as f32 * 0.003) as usize).max(1);
         let Mixer { strips, utility, returns, clap, master_meter, scratch_l, scratch_r, .. } = self;
 
         for rb in returns.iter_mut() {
@@ -982,37 +1161,41 @@ impl Mixer {
             }
 
             // Sampler one-shots (advance even while muted, so unmute stays in sync).
-            st.sample_voices.retain_mut(|(pitch, pos, vel)| {
-                let Some((l, r, g)) = st.pads.get(pitch) else { return false };
+            st.sample_voices.retain_mut(|voice| {
+                let Some(pad) = st.pads.get(&voice.pitch) else { return false };
+                let take = match voice.layer {
+                    None => &pad.fallback,
+                    Some(layer) => &pad.layers[layer].takes[voice.take],
+                };
+                let (l, r) = (&take.left, &take.right);
                 let len = l.len();
-                if *pos >= len {
-                    return false;
-                }
-                let gain = *g * *vel;
+                if voice.position >= len { return false; }
+                let gain = take.gain * voice.gain;
                 for i in 0..frames {
-                    let k = *pos + i;
-                    if k >= len {
-                        break;
-                    }
-                    sl[i] += l[k] * gain;
-                    sr[i] += r[k] * gain;
+                    let k = voice.position + i;
+                    if k >= len { break; }
+                    let env = declick_env(k, len, fade, false);
+                    sl[i] += l[k] * gain * env;
+                    sr[i] += r[k] * gain * env;
                 }
-                *pos += frames;
-                *pos < len
+                voice.position += frames;
+                voice.position < len
             });
 
             // Audio-clip voices (same advance-while-muted behavior).
-            st.clip_voices.retain_mut(|(l, r, pos, end, gain)| {
+            st.clip_voices.retain_mut(|(l, r, pos, end, gain, start)| {
                 if *pos >= *end {
                     return false;
                 }
+                let vlen = end.saturating_sub(*start);
                 for i in 0..frames {
                     let k = *pos + i;
                     if k >= *end {
                         break;
                     }
-                    sl[i] += l[k] * *gain;
-                    sr[i] += r[k] * *gain;
+                    let env = declick_env(k - *start, vlen, fade, true);
+                    sl[i] += l[k] * *gain * env;
+                    sr[i] += r[k] * *gain * env;
                 }
                 *pos += frames;
                 *pos < *end
@@ -1114,14 +1297,21 @@ pub fn build_strips(
     main_sf2: &std::path::Path,
     sample_rate: u32,
 ) -> (Vec<Strip>, Vec<Arc<StripMeter>>) {
-    use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
+    let (strips, meters, _) = build_strips_report(specs, main_sf2, sample_rate);
+    (strips, meters)
+}
 
+/// Build on a worker and report assets that could not be loaded.
+pub fn build_strips_report(specs: &[StripSpec], main_sf2: &std::path::Path, sample_rate: u32)
+    -> (Vec<Strip>, Vec<Arc<StripMeter>>, Vec<String>) {
+    use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
+    let mut errors = Vec::new();
     let settings = SynthesizerSettings::new(sample_rate as i32);
     let mut fonts: std::collections::HashMap<String, Option<Arc<SoundFont>>> =
         std::collections::HashMap::new();
     let main_key = main_sf2.to_string_lossy().to_string();
 
-    let mut load_font = |path: &str,
+    let load_font = |path: &str,
                          fonts: &mut std::collections::HashMap<String, Option<Arc<SoundFont>>>|
      -> Option<Arc<SoundFont>> {
         fonts
@@ -1147,6 +1337,10 @@ pub fn build_strips(
                     .as_deref()
                     .and_then(|p| load_font(p, &mut fonts))
                     .or_else(|| main_font.clone());
+                if let Some(path) = font {
+                    if fonts.get(path).is_some_and(|f| f.is_none()) { errors.push(format!("soundfont could not be loaded: {path}")); }
+                }
+                if sf.is_none() { errors.push(format!("soundfont could not be loaded: {}", main_sf2.display())); }
                 if let Some(sf) = sf {
                     if let Ok(mut synth) = Synthesizer::new(&sf, &settings) {
                         let ch = if drum { 9 } else { 0 };
@@ -1159,12 +1353,20 @@ pub fn build_strips(
                 }
             }
             StripKind::Sampler { pads } => {
-                for (pitch, path, gain) in pads {
-                    match super::load_wav_stereo(std::path::Path::new(path), sample_rate) {
-                        Ok((l, r)) => {
-                            strip.pads.insert(*pitch, (Arc::new(l), Arc::new(r), *gain));
+                for pad in pads {
+                    match super::load_wav_stereo(std::path::Path::new(&pad.path), sample_rate) {
+                        Ok((left, right)) => {
+                            let mut loaded = SamplerPadAudio::new(Arc::new(left), Arc::new(right), pad.gain);
+                            for variant in &pad.variants {
+                                match super::load_wav_stereo(std::path::Path::new(&variant.path), sample_rate) {
+                                    Ok((left, right)) => loaded.add_take(variant.min_velocity, variant.max_velocity,
+                                        Arc::new(left), Arc::new(right), pad.gain * variant.gain),
+                                    Err(e) => errors.push(format!("sampler variant {}: {e}", variant.path)),
+                                }
+                            }
+                            strip.pads.insert(pad.pitch, loaded);
                         }
-                        Err(e) => eprintln!("strip sampler pad {path}: {e}"),
+                        Err(e) => errors.push(format!("sampler pad {}: {e}", pad.path)),
                     }
                 }
             }
@@ -1188,16 +1390,35 @@ pub fn build_strips(
             s.process_midi_message(ch, 0xB0, 74, cc(spec.effects.cutoff));
             s.process_midi_message(ch, 0xB0, 71, cc(spec.effects.resonance));
             s.process_midi_message(ch, 0xB0, 1,  cc(spec.effects.lfo_depth));
+            // Microtonal detune: a constant pitch bend held for the strip's life,
+            // so every note on this voice sounds `tuning_cents` off 12-TET.
+            if spec.tuning_cents != 0.0 {
+                let bend = bend14_from_cents(spec.tuning_cents);
+                s.process_midi_message(ch, 0xE0, bend & 0x7F, (bend >> 7) & 0x7F);
+            }
         }
         meters.push(Arc::clone(&strip.meter));
         strips.push(strip);
     }
-    (strips, meters)
+    (strips, meters, errors)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cents_to_bend_maps_center_and_semitones() {
+        // 14-bit pitch bend: 8192 is center (no detune). Default synth bend
+        // range is ±2 semitones (±200 cents), so ±100 cents == ±half the range.
+        assert_eq!(bend14_from_cents(0.0), 8192);
+        assert_eq!(bend14_from_cents(100.0), 12288); // +1 semitone
+        assert_eq!(bend14_from_cents(-100.0), 4096); // -1 semitone
+        assert_eq!(bend14_from_cents(50.0), 10240); // +quarter tone (off 12-TET)
+        // Beyond the bend range clamps into the valid 14-bit span.
+        assert_eq!(bend14_from_cents(250.0), 16383);
+        assert_eq!(bend14_from_cents(-250.0), 0);
+    }
 
     #[test]
     fn insert_chain_default_is_transparent() {
@@ -1233,7 +1454,7 @@ mod tests {
         // 4-sample constant 0.5 mono pad at pitch 60.
         let buf = Arc::new(vec![0.5f32; 4]);
         let mut s = Strip::new(48_000);
-        s.pads.insert(60u8, (Arc::clone(&buf), buf, 1.0f32));
+        s.pads.insert(60u8, SamplerPadAudio::new(Arc::clone(&buf), buf, 1.0f32));
         s.gain = gain;
         s.pan = pan;
         s
@@ -1290,9 +1511,34 @@ mod tests {
         m.handle_event(AudioEvent::TriggerAudioClip {
             strip: 0, clip_id: 7, offset_sec: 0.0, len_sec: 0.5, gain: 2.0,
         });
+        // Render past the ~3 ms de-click fade-in (48k → ~144 samples) and
+        // check the steady-state mid-voice level: 0.25 * gain 2.0 = 0.5.
+        let (mut l, mut r) = (vec![0f32; 512], vec![0f32; 512]);
+        m.render_block(&mut l, &mut r);
+        assert!((l[400] - 0.5).abs() < 1e-6, "0.25 * clip gain 2.0, got {}", l[400]);
+        // The first sample is ramped in (de-click), not full scale.
+        assert!(l[0].abs() < 0.5, "clip fades in, got {}", l[0]);
+    }
+
+    #[test]
+    fn declick_fades_clip_edges_but_keeps_sample_attack() {
+        // Sample one-shot: attack preserved (no fade-in) — sample 0 is full.
+        let mut m = mixer_with(vec![strip_with_pad(1.0, 0.0)]);
+        m.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 60, gain: 1.0 });
         let (mut l, mut r) = (vec![0f32; 8], vec![0f32; 8]);
         m.render_block(&mut l, &mut r);
-        assert!((l[0] - 0.5).abs() < 1e-6, "0.25 * clip gain 2.0, got {}", l[0]);
+        assert!((l[0] - 0.5).abs() < 1e-6, "sample attack kept, got {}", l[0]);
+        // StopAudioClips ramps a clip out instead of cutting hard.
+        let buf = Arc::new(vec![0.5f32; 48_000]);
+        m.handle_event(AudioEvent::SetAudioClips { clips: vec![(1, Arc::clone(&buf), buf)] });
+        m.handle_event(AudioEvent::TriggerAudioClip { strip: 0, clip_id: 1, offset_sec: 0.0, len_sec: 1.0, gain: 1.0 });
+        let (mut l, mut r) = (vec![0f32; 512], vec![0f32; 512]);
+        m.render_block(&mut l, &mut r);   // get past fade-in
+        m.handle_event(AudioEvent::StopAudioClips);
+        let (mut l2, mut r2) = (vec![0f32; 512], vec![0f32; 512]);
+        m.render_block(&mut l2, &mut r2);
+        assert!(l2[0].abs() > 1e-6, "stop ramps out (not an instant zero), got {}", l2[0]);
+        assert!(l2[300].abs() < 1e-6, "ramp completes within the fade window");
     }
 
     #[test]
@@ -1455,6 +1701,63 @@ mod tests {
         assert!(out_r[2 * n].abs() < out_l[n].abs(), "echoes decay");
     }
 
+    #[test]
+    fn spatial_echo_defaults_keep_legacy_samples() {
+        let mut legacy=PingPongDelay::new(8000);
+        let mut modern=PingPongDelay::new(8000);
+        legacy.set(123,0.47);
+        let config=crate::project::DelayReturn { time_ms:123, feedback:0.47, ..Default::default() };
+        modern.configure(&config,91.);
+        for i in 0..10000 {
+            let x=if i%911==0 {0.7} else {0.};
+            assert_eq!(legacy.process(x,x*0.3),modern.process(x,x*0.3));
+        }
+    }
+
+    #[test]
+    fn stereo_echo_width_tone_and_tempo_are_audible() {
+        use crate::project::{DelayReturn,EchoMode,EchoDivision};
+        let mut d=PingPongDelay::new(8000);
+        let mut config=DelayReturn { time_ms:10,mode:EchoMode::Stereo,feedback:0.,..Default::default() };
+        d.configure(&config,120.);
+        let mut out=(0.,0.);
+        for i in 0..=80 {out=d.process(if i==0 {1.} else {0.},if i==0 {0.25} else {0.});}
+        assert_eq!(out,(1.,0.25),"stereo mode preserves independent channels");
+        let mut mono=PingPongDelay::new(8000); config.width=0.; mono.configure(&config,120.);
+        for i in 0..=80 {out=mono.process(if i==0 {1.} else {0.},0.);assert_eq!(out.0,out.1);}
+        let mut plain=PingPongDelay::new(8000); config.width=1.; plain.configure(&config,120.);
+        let mut dark=PingPongDelay::new(8000); config.high_cut_hz=500.; dark.configure(&config,120.);
+        let (mut bright_energy,mut dark_energy)=(0.,0.);
+        for i in 0..2000 {let x=if i%2==0 {1.} else {-1.};let a=plain.process(x,0.);let b=dark.process(x,0.);if i>200 {bright_energy+=a.0*a.0;dark_energy+=b.0*b.0;}}
+        assert!(dark_energy<bright_energy*0.1,"tone filtering must change audio");
+        let (mut m,_)=mixer_with_returns(Vec::new());
+        let mut returns=crate::project::Returns::default(); returns.delay.sync=Some(EchoDivision::Quarter);
+        m.handle_event(AudioEvent::SetReturns {returns});
+        m.handle_event(AudioEvent::SetTempo {bpm:60.});
+        let ReturnFx::Delay(d)=&m.returns[1].fx else {panic!("echo")};
+        assert_eq!(d.delay_samples,m.sample_rate as usize);
+    }
+
+    #[test]
+    fn reverb_predelay_shifts_the_impulse_and_keeps_storage() {
+        let mut dry=Freeverb::new(8000); let mut spaced=Freeverb::new(8000);
+        spaced.predelay.set(25);
+        let mut expected=Vec::new(); let mut actual=Vec::new();
+        for i in 0..3000 {let x=if i==0 {1.} else {0.};expected.push(dry.process(x,0.));actual.push(spaced.process(x,0.));}
+        assert!(actual[..200].iter().all(|&(l,r)|l==0.&&r==0.));
+        assert_eq!(&actual[200..],&expected[..2800]);
+        let mut echo=PingPongDelay::new(8000);
+        let address=echo.buf_l.as_ptr();let size=echo.buf_l.len();
+        let config=crate::project::DelayReturn { time_ms:7,modulation_ms:20.,modulation_hz:8.,feedback:0.95,low_cut_hz:200.,high_cut_hz:3000.,..Default::default() };
+        echo.configure(&config,20.);
+        for i in 0..20000 {
+            if i%500==0 {echo.set(1+(i%12000) as u32,0.95);}
+            let (l,r)=echo.process(if i%97==0 {0.25} else {0.},0.);
+            assert!(l.is_finite()&&r.is_finite());
+        }
+        assert_eq!(echo.buf_l.as_ptr(),address);assert_eq!(echo.buf_l.len(),size);
+    }
+
     fn testplug(name: &str) -> Option<String> {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
             .join("../../target/debug")
@@ -1462,7 +1765,7 @@ mod tests {
         if p.exists() {
             Some(p.to_string_lossy().to_string())
         } else {
-            eprintln!("skip: {name} not built (cargo build --workspace)");
+            assert!(std::env::var_os("DAW_REQUIRE_TEST_ASSETS").is_none(), "required audio test assets missing"); eprintln!("skip: {name} not built (cargo build --workspace)");
             None
         }
     }
@@ -1537,5 +1840,56 @@ mod tests {
         assert!(m.read().1);
         m.reset_clip();
         assert!(!m.read().1);
+    }
+}
+
+#[cfg(test)]
+mod sampler_expression_tests {
+    use super::*;
+    fn buffer(v: f32) -> Arc<Vec<f32>> { Arc::new(vec![v; 512]) }
+    fn strip() -> Strip {
+        let mut s = Strip::new(44100);
+        let mut pad = SamplerPadAudio::new(buffer(0.05), buffer(0.05), 1.);
+        pad.add_take(1, 63, buffer(0.1), buffer(0.1), 1.);
+        pad.add_take(1, 63, buffer(0.2), buffer(0.2), 1.);
+        pad.add_take(80, 127, buffer(0.4), buffer(0.4), 1.);
+        s.pads.insert(36, pad);
+        s
+    }
+    fn mixer(s: Strip) -> Mixer {
+        let mut m = Mixer::new(44100, None, Default::default(), Default::default());
+        m.strips.push(s); m
+    }
+    #[test]
+    fn velocity_layers_rotate_across_different_velocities_and_use_fallback() {
+        let mut m = mixer(strip());
+        for (velocity, expected) in [(40, 0.1), (48, 0.2), (100, 0.4), (40, 0.1), (70, 0.05)] {
+            m.strips[0].sample_voices.clear();
+            m.handle_event(AudioEvent::NoteOn { strip: 0, pitch: 36, velocity });
+            let mut l = [0.;1]; let mut r = [0.;1]; m.render_block(&mut l, &mut r);
+            assert!((l[0] - expected * velocity as f32 / 127.).abs() < 1e-6, "velocity {velocity}: {}", l[0]);
+        }
+    }
+    #[test]
+    fn overlapping_takes_keep_their_sound_and_panic_resets_rotation() {
+        let mut m = mixer(strip());
+        m.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 36, gain: 40./127. });
+        m.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 36, gain: 40./127. });
+        let mut l=[0.;1];let mut r=[0.;1];m.render_block(&mut l,&mut r);
+        assert!((l[0] - 0.3*40./127.).abs()<1e-6);
+        m.handle_event(AudioEvent::Panic);
+        m.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 36, gain: 0. });
+        m.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 36, gain: 40./127. });
+        m.render_block(&mut l,&mut r);
+        assert!((l[0] - 0.1*40./127.).abs()<1e-6);
+    }
+    #[test]
+    fn dense_sampler_input_keeps_voice_storage_bounded() {
+        let mut s=strip();let capacity=s.sample_voices.capacity();
+        let before=SAMPLER_VOICE_STEALS.load(std::sync::atomic::Ordering::Relaxed);
+        for _ in 0..MAX_SAMPLE_VOICES+10 { s.trigger_sample(36, 0.5); }
+        assert_eq!(s.sample_voices.len(),MAX_SAMPLE_VOICES);
+        assert_eq!(s.sample_voices.capacity(),capacity);
+        assert!(SAMPLER_VOICE_STEALS.load(std::sync::atomic::Ordering::Relaxed)>=before+10);
     }
 }

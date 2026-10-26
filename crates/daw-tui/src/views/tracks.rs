@@ -239,6 +239,7 @@ fn add_track(app: &mut App, track_type: TrackType) {
                 bars:         4,
                 ticks_per_bar: 480,
                 notes:        vec![],
+                legato:       false,
             });
             app.project.patterns.push(pat);
             vec![format!("p{p_idx}")]
@@ -257,6 +258,7 @@ fn add_track(app: &mut App, track_type: TrackType) {
         effects: daw_core::EffectChain::default(),
         modulators: Vec::new(),
         clap_fx: Vec::new(),
+        tuning_cents: 0.0,
     });
 
     // Select the new track so the user lands on it immediately.

@@ -69,7 +69,7 @@ fn render_transport(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
         }
         DialogMode::ExportWav => {
             let line = Line::from(vec![
-                Span::styled("Export WAV to: ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
+                Span::styled("Export to (.wav / .mp3): ", Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD)),
                 Span::styled(format!("{}_", app.dialog_buf), Style::default().fg(Color::White)),
                 Span::styled("  [Enter] export  [Esc] cancel", Style::default().fg(Color::DarkGray)),
             ]);

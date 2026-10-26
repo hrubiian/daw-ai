@@ -58,3 +58,17 @@ Projects are `.daw.json` files. Fully human- and LLM-editable. See `docs/project
 | `+` / `-` | BPM up / down |
 | `Ctrl+S` | Save project |
 | `q` | Quit (auto-saves) |
+
+
+## Shared sessions and verification
+
+Use `target/debug/daw-mcp --list-sessions`, then explicitly select a running
+session with `--session <socket>`. Read the current revision before edits;
+validated batches are one shared undo step. A failed live connection must not
+silently fall back to file editing. File-based MCP remains available offline.
+See [Live collaboration](docs/live-collaboration.md) for the protocol and limits.
+
+Run `bash scripts/check.sh` for the workspace build, MCP wire checks, tests and
+Clippy. Set `DAW_REQUIRE_TEST_ASSETS=1` for soundfont-required checks. FFmpeg with
+libmp3lame is required for MP3 tests/export. Diagnostics do not establish musical
+quality; use the musician's own listening feedback and ratings.

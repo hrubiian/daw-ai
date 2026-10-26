@@ -2,6 +2,7 @@
 //! LLMs can't hear — this turns a WAV into peak/RMS/clipping, a per-bar
 //! loudness map, stereo width, and a 7-band spectral balance.
 
+#[derive(serde::Serialize)]
 pub struct AnalysisReport {
     pub duration_sec: f64,
     pub peak_db: f32,
@@ -20,60 +21,21 @@ fn db(x: f32) -> f32 {
 }
 
 const SPEC_FLOOR_DB: f32 = -90.0;
-const SPEC_BINS: usize = 64;
-const SPEC_F_LO: f32 = 20.0;
-const SPEC_F_HI: f32 = 16_000.0;
-const SPEC_WIN: usize = 2048;
+/// The 7 spectral bands (name, low Hz, high Hz), sub -> air.
+pub const BANDS: [(&str, f32, f32); 7] = [
+    ("sub", 20.0, 60.0),
+    ("bass", 60.0, 150.0),
+    ("low-mid", 150.0, 500.0),
+    ("mid", 500.0, 2_000.0),
+    ("high-mid", 2_000.0, 6_000.0),
+    ("presence", 6_000.0, 10_000.0),
+    ("air", 10_000.0, 16_000.0),
+];
 
-pub fn analyze(l: &[f32], r: &[f32], sample_rate: u32, bpm: f64) -> AnalysisReport {
-    let n = l.len().min(r.len()).max(1);
-    let mut peak = 0f32;
-    let mut sum_sq = 0f64;
-    let mut clipped = 0usize;
-    let mut dot = 0f64;
-    let mut l_sq = 0f64;
-    let mut r_sq = 0f64;
-    for i in 0..n.min(l.len()) {
-        let (a, b) = (l[i], r[i]);
-        peak = peak.max(a.abs()).max(b.abs());
-        sum_sq += (a as f64 * a as f64 + b as f64 * b as f64) / 2.0;
-        if a.abs() >= 0.999 || b.abs() >= 0.999 {
-            clipped += 1;
-        }
-        dot += a as f64 * b as f64;
-        l_sq += a as f64 * a as f64;
-        r_sq += b as f64 * b as f64;
-    }
-    let rms = (sum_sq / n as f64).sqrt() as f32;
-    let corr = if l_sq > 1e-12 && r_sq > 1e-12 {
-        (dot / (l_sq.sqrt() * r_sq.sqrt())) as f32
-    } else {
-        1.0
-    };
-
-    // Per-bar RMS (mono mix; 4/4 bars).
-    let spb = 240.0 / bpm.max(1.0);
-    let bar_len = (spb * sample_rate as f64) as usize;
-    let mut bar_rms_db = Vec::new();
-    if bar_len > 0 {
-        let bars = n.div_ceil(bar_len);
-        for bi in 0..bars {
-            let lo = bi * bar_len;
-            let hi = ((bi + 1) * bar_len).min(n);
-            let s: f64 = (lo..hi)
-                .map(|i| {
-                    let m = (l[i] + r[i]) / 2.0;
-                    m as f64 * m as f64
-                })
-                .sum();
-            bar_rms_db.push((bi as u32 + 1, db((s / (hi - lo).max(1) as f64).sqrt() as f32)));
-        }
-    }
-
-    // 7-band summary: average daw-core spectra over consecutive windows
-    // (spectrum() analyzes only its last 2048 samples and returns values
-    // normalized 0..1 against SPEC_FLOOR_DB — invert to dB after averaging).
-    let mono: Vec<f32> = (0..n).map(|i| (l[i] + r[i]) / 2.0).collect();
+/// Average per-window `daw_core::dsp::spectrum` of a mono signal into a 7-band
+/// dB balance (sub -> air). Shared by whole-mix [`analyze`] and per-track
+/// profiling in `mix_analysis`. Empty input yields the spectral floor.
+pub fn spectral_bands(mono: &[f32], sample_rate: u32) -> Vec<(&'static str, f32)> {
     let mut acc = vec![0f32; SPEC_BINS];
     let mut windows = 0usize;
     let mut pos = 0usize;
@@ -91,16 +53,7 @@ pub fn analyze(l: &[f32], r: &[f32], sample_rate: u32, bpm: f64) -> AnalysisRepo
             *a /= windows as f32;
         }
     }
-    const BANDS: [(&str, f32, f32); 7] = [
-        ("sub", 20.0, 60.0),
-        ("bass", 60.0, 150.0),
-        ("low-mid", 150.0, 500.0),
-        ("mid", 500.0, 2_000.0),
-        ("high-mid", 2_000.0, 6_000.0),
-        ("presence", 6_000.0, 10_000.0),
-        ("air", 10_000.0, 16_000.0),
-    ];
-    let bands = BANDS
+    BANDS
         .iter()
         .map(|(name, lo, hi)| {
             // spectrum buckets are log-spaced SPEC_F_LO..SPEC_F_HI.
@@ -121,7 +74,62 @@ pub fn analyze(l: &[f32], r: &[f32], sample_rate: u32, bpm: f64) -> AnalysisRepo
             };
             (*name, avg)
         })
-        .collect();
+        .collect()
+}
+const SPEC_BINS: usize = 64;
+const SPEC_F_LO: f32 = 20.0;
+const SPEC_F_HI: f32 = 16_000.0;
+const SPEC_WIN: usize = 2048;
+
+pub fn analyze(l: &[f32], r: &[f32], sample_rate: u32, bpm: f64) -> AnalysisReport {
+    let n = l.len().min(r.len());
+    let mut peak = 0f32;
+    let mut sum_sq = 0f64;
+    let mut clipped = 0usize;
+    let mut dot = 0f64;
+    let mut l_sq = 0f64;
+    let mut r_sq = 0f64;
+    for i in 0..n.min(l.len()) {
+        let (a, b) = (l[i], r[i]);
+        peak = peak.max(a.abs()).max(b.abs());
+        sum_sq += (a as f64 * a as f64 + b as f64 * b as f64) / 2.0;
+        if a.abs() >= 0.999 || b.abs() >= 0.999 {
+            clipped += 1;
+        }
+        dot += a as f64 * b as f64;
+        l_sq += a as f64 * a as f64;
+        r_sq += b as f64 * b as f64;
+    }
+    let rms = (sum_sq / n.max(1) as f64).sqrt() as f32;
+    let corr = if l_sq > 1e-12 && r_sq > 1e-12 {
+        (dot / (l_sq.sqrt() * r_sq.sqrt())) as f32
+    } else {
+        1.0
+    };
+
+    // Per-bar RMS (mono mix; 4/4 bars).
+    let bpm = bpm.max(1.0);
+    let samples_per_bar = daw_core::musical_time::seconds_per_bar(bpm) * sample_rate as f64;
+    let mut bar_rms_db = Vec::new();
+    if samples_per_bar >= 1.0 {
+        let bars = (n as f64 / samples_per_bar).ceil() as u32;
+        for bi in 0..bars {
+            let lo = daw_core::musical_time::bar_sample(bi, bpm, sample_rate) as usize;
+            let hi = (daw_core::musical_time::bar_sample(bi + 1, bpm, sample_rate) as usize).min(n);
+            // Subtracting two rounded range boundaries can leave one extra
+            // frame. It is rounding residue, not a meaningful additional bar.
+            if hi <= lo || (bi > 0 && n.saturating_sub(lo) <= 1) { break; }
+            let energy: f64 = (lo..hi).map(|i| {
+                let mono = (l[i] + r[i]) / 2.0;
+                (mono as f64).powi(2)
+            }).sum();
+            bar_rms_db.push((bi + 1, db((energy / (hi - lo) as f64).sqrt() as f32)));
+        }
+    }
+
+    // 7-band spectral balance (shared with per-track profiling).
+    let mono: Vec<f32> = (0..n).map(|i| (l[i] + r[i]) / 2.0).collect();
+    let bands = spectral_bands(&mono, sample_rate);
 
     AnalysisReport {
         duration_sec: n as f64 / sample_rate.max(1) as f64,
@@ -195,6 +203,16 @@ mod tests {
         (v.clone(), v)
     }
 
+    #[test]
+    fn fractional_bar_lengths_do_not_create_phantom_bars() {
+        let sr = 44100;
+        let frames = (daw_core::musical_time::bar_sample(12, 78., sr) - daw_core::musical_time::bar_sample(4, 78., sr)) as usize;
+        let signal = vec![0.1; frames];
+        assert_eq!(analyze(&signal, &signal, sr, 78.).bar_rms_db.len(), 8);
+        let empty = analyze(&[], &[], sr, 78.);
+        assert_eq!(empty.duration_sec, 0.);
+        assert!(empty.bar_rms_db.is_empty());
+    }
     #[test]
     fn sine_minus6_pins_levels_and_band() {
         let sr = 44_100;
