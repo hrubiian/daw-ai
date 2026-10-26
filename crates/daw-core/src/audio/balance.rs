@@ -130,7 +130,7 @@ mod tests {
     fn balance_shrinks_solo_spread_on_default_project() {
         let sf2 = std::path::Path::new("../../assets/GeneralUser.sf2");
         if !sf2.exists() {
-            eprintln!("skip: no soundfont");
+            assert!(std::env::var_os("DAW_REQUIRE_TEST_ASSETS").is_none(), "required audio test assets missing"); eprintln!("skip: no soundfont");
             return;
         }
         let mut p = Project::default_project();

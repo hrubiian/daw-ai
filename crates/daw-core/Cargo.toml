@@ -17,3 +17,5 @@ clack-host       = "0.1"
 clack-extensions = { version = "0.1", features = ["clack-host", "audio-ports", "params", "state", "note-ports"] }
 base64           = "0.22"
 rustfft        = "6"
+
+sha2 = "0.10"

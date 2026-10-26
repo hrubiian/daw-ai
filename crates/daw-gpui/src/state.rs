@@ -4,12 +4,13 @@ use daw_core::sequencer::{TICKS_PER_BAR, TICKS_PER_BEAT};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// Which editor occupies the bottom dock. Phase 1 only lays the tabs out;
-/// Phase 2/3/4 fill in the editors behind them.
+/// Workspace/editor tabs. Mixing uses the available workspace rather than the
+/// small pattern-editor dock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockTab {
     Sequencer,
     PianoRoll,
+    Mixing,
     Fx,
     Code,
 }
@@ -19,13 +20,15 @@ impl DockTab {
         match self {
             DockTab::Sequencer => "Sequencer",
             DockTab::PianoRoll => "Piano Roll",
+            DockTab::Mixing => "Mixing",
             DockTab::Fx => "FX",
             DockTab::Code => "Code",
         }
     }
-    pub const ALL: [DockTab; 4] = [
+    pub const ALL: [DockTab; 5] = [
         DockTab::Sequencer,
         DockTab::PianoRoll,
+        DockTab::Mixing,
         DockTab::Fx,
         DockTab::Code,
     ];
@@ -45,6 +48,8 @@ pub enum RenameTarget {
 pub struct HeadlessState {
     pub project: Project,
     pub project_path: Option<PathBuf>,
+    pub file_revision: Option<String>,
+    pub saved_hash: String,
     pub playhead: u32,
     /// Currently selected track id (drives header highlight + which dock content).
     pub selected_track: Option<String>,
@@ -52,6 +57,7 @@ pub struct HeadlessState {
     pub soloed: HashSet<String>,
     pub active_dock: DockTab,
     pub mixer_open: bool,
+    pub browser_open: bool,
     /// Pattern currently shown in the editor dock (defaults to the selected
     /// track's first pattern; changed by the pattern picker or a clip click).
     pub selected_pattern: Option<String>,
@@ -82,6 +88,9 @@ pub struct HeadlessState {
     pub arrange_zoom: f32,
     /// Horizontal scroll offset (px) of the arrange timeline; 0 = bar 1 at the left.
     pub arrange_scroll_x: f32,
+    /// Vertical scroll offset (px) of the track area; 0 = first track at the top.
+    /// Shared by the track-header column and the arrange lanes so they stay aligned.
+    pub arrange_scroll_y: f32,
     /// Which top menu dropdown is open (None = closed).
     pub open_menu: Option<TopMenu>,
     /// Instrument-browser search query (empty = normal category view).
@@ -103,6 +112,10 @@ pub struct HeadlessState {
 
 impl HeadlessState {
     pub fn from_project(project: Project, project_path: Option<PathBuf>) -> Self {
+        let file_revision = project_path.as_ref().and_then(|path| daw_core::project::format::load_versioned(path).ok().map(|(disk, revision)| {
+            if daw_core::project::format::project_revision(&disk).ok() == daw_core::project::format::project_revision(&project).ok() { revision } else { "stale-loaded-project".into() }
+        }));
+        let saved_hash = daw_core::project::format::project_revision(&project).unwrap_or_default();
         let selected_track = project.tracks.first().map(|t| t.id.clone());
         let selected_pattern = selected_track
             .as_ref()
@@ -111,11 +124,14 @@ impl HeadlessState {
         Self {
             project,
             project_path,
+            file_revision,
+            saved_hash,
             playhead: 0,
             selected_track,
             soloed: HashSet::new(),
             active_dock: DockTab::Sequencer,
             mixer_open: false,
+            browser_open: true,
             selected_pattern,
             browser_category: 0,
             jam_mode: false,
@@ -131,6 +147,7 @@ impl HeadlessState {
             arrange_full: false,
             arrange_zoom: 1.0,
             arrange_scroll_x: 0.0,
+            arrange_scroll_y: 0.0,
             open_menu: None,
             browser_search: String::new(),
             accent_idx: 0,

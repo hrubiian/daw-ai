@@ -20,6 +20,8 @@ use std::time::Duration;
 /// duration of the program. The channel/`Arc` fields are cheap to clone for the
 /// frontend's own bookkeeping.
 pub struct Host {
+    pub session: Option<crate::session::LiveSession>,
+    pub engine_error: Arc<Mutex<Option<String>>>,
     pub cmd_tx: Sender<SequencerCommand>,
     pub audio_ev_tx: Sender<AudioEvent>,
     pub playback_tick: Arc<AtomicU32>,
@@ -60,15 +62,17 @@ impl Host {
     /// `enable_input` opens the legacy in-engine input recorder (TUI `Ctrl+R`);
     /// the GPUI frontend passes `false` and uses the capture subsystem instead.
     pub fn start(project: &Project, sf2_path: PathBuf, enable_input: bool) -> Self {
+        let engine_error = Arc::new(Mutex::new(None));
         // Recording state — shared with the audio callback.
         let record_state = Arc::new(Mutex::new(RecordState::default()));
         let record_ctrl = RecordController::new(Arc::clone(&record_state));
 
         // Visualization buffer — written by the audio callback, read by the frontend.
-        let vis_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(Vec::with_capacity(4096)));
+        let vis_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(vec![0.0; 4096]));
 
         // Sample rate — stored by the relay thread after engine init.
         let sample_rate = Arc::new(AtomicU32::new(0));
+        let audio_clock = Arc::new(daw_core::audio::scheduling::AudioClock::default());
 
         // Mixer meters — strips replaced on each build; master lives forever.
         let strip_meters: Arc<Mutex<Vec<Arc<StripMeter>>>> = Arc::new(Mutex::new(Vec::new()));
@@ -91,8 +95,10 @@ impl Host {
             let strip_meters_relay = Arc::clone(&strip_meters);
             let master_meter_engine = Arc::clone(&master_meter);
             let return_meters_engine = [Arc::clone(&return_meters[0]), Arc::clone(&return_meters[1])];
+            let errors = engine_error.clone();
+            let clock = audio_clock.clone();
             thread::spawn(move || {
-                match daw_core::audio::AudioEngine::new(&sf2_clone, record_state, Some(vis_buf_audio), enable_input, master_meter_engine, return_meters_engine, clap_garbage_tx) {
+                match daw_core::audio::AudioEngine::new(&sf2_clone, record_state, Some(vis_buf_audio), enable_input, master_meter_engine, return_meters_engine, clap_garbage_tx, clock) {
                     Ok(mut engine) => {
                         let out_sr = engine.sample_rate;
                         sample_rate_clone.store(out_sr, Ordering::Relaxed);
@@ -101,6 +107,7 @@ impl Host {
                         // main thread): handles + (path, id) fingerprints.
                         let mut clap_handles: std::collections::HashMap<String, daw_core::audio::clap::ClapHandle> = Default::default();
                         let mut clap_fps: std::collections::HashMap<String, (String, String)> = Default::default();
+                        let mut clap_params: std::collections::HashMap<String, Vec<(u32, f64)>> = Default::default();
                         while let Ok(ev) = audio_ev_rx.recv() {
                             // Tear down any processors the RT thread retired.
                             for (uid, proc_) in clap_garbage_rx.try_iter() {
@@ -108,6 +115,13 @@ impl Host {
                                     h.deactivate(proc_);
                                 }
                             }
+                            let ev = match ev {
+                                AudioEvent::Scheduled(event) => {
+                                    engine.schedule_at = Some((event.frame, event.generation));
+                                    event.event
+                                }
+                                other => { engine.schedule_at = None; other }
+                            };
                             match ev {
                                 AudioEvent::LoadClipFromFile { path, volume } => {
                                     match daw_core::audio::load_wav_stereo(
@@ -119,13 +133,15 @@ impl Host {
                                             right: r,
                                             volume,
                                         }),
-                                        Err(e) => eprintln!("clip load error {path}: {e}"),
+                                        Err(e) => *errors.lock().unwrap() = Some(format!("clip load error {path}: {e}")),
                                     }
                                 }
                                 AudioEvent::LoadStrips { specs } => {
-                                    let (strips, meters) = daw_core::audio::mixer::build_strips(
+                                    *errors.lock().unwrap() = None;
+                                    let (strips, meters, failures) = daw_core::audio::mixer::build_strips_report(
                                         &specs, &sf2_clone, out_sr,
                                     );
+                                    if !failures.is_empty() { *errors.lock().unwrap() = Some(failures.join("; ")); }
                                     if let Ok(mut m) = strip_meters_relay.lock() {
                                         *m = meters;
                                     }
@@ -139,7 +155,7 @@ impl Host {
                                             out_sr,
                                         ) {
                                             Ok((l, r)) => loaded.push((id, Arc::new(l), Arc::new(r))),
-                                            Err(e) => eprintln!("audio clip load error {path}: {e}"),
+                                            Err(e) => *errors.lock().unwrap() = Some(format!("audio clip load error {path}: {e}")),
                                         }
                                     }
                                     engine.send(AudioEvent::SetAudioClips { clips: loaded });
@@ -158,11 +174,19 @@ impl Host {
                                         .collect();
                                     for uid in stale {
                                         clap_fps.remove(&uid);
+                                        clap_params.remove(&uid);
                                         engine.send(AudioEvent::RemoveClapInstance { uid });
                                     }
                                     // Build the new ones.
                                     for spec in specs {
                                         if clap_fps.contains_key(&spec.uid) {
+                                            let previous = clap_params.get(&spec.uid).map(Vec::as_slice).unwrap_or(&[]);
+                                            if let Some(handle) = clap_handles.get(&spec.uid) {
+                                                for (param_id, value) in daw_core::audio::clap::parameter_updates(previous, &spec.params, &handle.param_infos) {
+                                                    engine.send(AudioEvent::SetClapParam { uid: spec.uid.clone(), param_id, value });
+                                                }
+                                            }
+                                            clap_params.insert(spec.uid.clone(), spec.params.clone());
                                             continue;
                                         }
                                         match daw_core::audio::clap::ClapInstance::from_spec(&spec, out_sr) {
@@ -173,11 +197,12 @@ impl Host {
                                                     inst.handle.name.clone(),
                                                     inst.handle.param_infos.clone(),
                                                 ));
+                                                clap_params.insert(spec.uid.clone(), spec.params.clone());
                                                 clap_fps.insert(spec.uid.clone(), (spec.path.clone(), spec.id.clone()));
                                                 clap_handles.insert(spec.uid.clone(), inst.handle);
                                                 engine.send(AudioEvent::AddClapInstance { uid: spec.uid, processor });
                                             }
-                                            Err(e) => eprintln!("clap load {}: {e}", spec.uid),
+                                            Err(e) => { *errors.lock().unwrap() = Some(format!("plugin {}: {e}", spec.uid)); },
                                         }
                                     }
                                 }
@@ -193,6 +218,7 @@ impl Host {
                         }
                     }
                     Err(e) => {
+                        *errors.lock().unwrap() = Some(format!("audio engine init failed: {e}"));
                         eprintln!("audio engine init failed: {e}");
                         let _ = audio_ready_tx.send(());
                         while audio_ev_rx.recv().is_ok() {}
@@ -200,6 +226,7 @@ impl Host {
                 }
             });
         } else {
+            *engine_error.lock().unwrap() = Some(format!("soundfont missing: {}", sf2_path.display()));
             // No soundfont → no audio engine. This is the silent-Play trap when
             // launched from a desktop icon with the wrong working directory.
             eprintln!(
@@ -214,7 +241,8 @@ impl Host {
 
         // Sequencer.
         let (cmd_tx, cmd_rx) = unbounded::<SequencerCommand>();
-        let seq = Sequencer::new(cmd_rx, audio_ev_tx.clone());
+        let mut seq = Sequencer::new(cmd_rx, audio_ev_tx.clone());
+        seq.audio_clock = Some(audio_clock);
         let playback_tick: Arc<AtomicU32> = Arc::clone(&seq.playback_tick);
         let transport_state = Arc::clone(&seq.transport_state);
         let take_gate = Arc::clone(&seq.take_gate);
@@ -236,6 +264,8 @@ impl Host {
         let _ = audio_ready_rx.recv_timeout(Duration::from_secs(5));
 
         Host {
+            session: None,
+            engine_error,
             cmd_tx,
             audio_ev_tx,
             playback_tick,
@@ -304,5 +334,32 @@ impl Host {
             }
             None => false,
         }
+    }
+}
+
+#[cfg(feature = "test-support")]
+impl Host {
+    /// Device-free host for frontend integration tests. Receivers let tests
+    /// inspect commands while keeping the simulated engine connected.
+    pub fn headless() -> (Self, Receiver<SequencerCommand>, Receiver<AudioEvent>) {
+        let (cmd_tx, commands) = unbounded();
+        let (audio_ev_tx, audio) = unbounded();
+        let (midi_tx, midi_ev_rx) = unbounded();
+        let (_, clap_meta_rx) = unbounded();
+        (Self {
+            session: None,
+            engine_error: Default::default(),
+            cmd_tx, audio_ev_tx,
+            playback_tick: Default::default(),
+            vis_buf: Arc::new(Mutex::new(vec![0.; 512])),
+            record_ctrl: RecordController::new(Default::default()),
+            midi_ev_rx, midi_channel: Default::default(), midi_device: None,
+            midi_map: Arc::new(MidiMap::default()), midi_tx, _midi_handle: None,
+            sample_rate: Arc::new(AtomicU32::new(44100)),
+            transport_state: Default::default(), roll_start_tick: Default::default(),
+            capture: None, strip_meters: Default::default(),
+            master_meter: Default::default(), return_meters: Default::default(),
+            clap_meta_rx, take_gate: Default::default(),
+        }, commands, audio)
     }
 }

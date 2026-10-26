@@ -98,7 +98,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
 
     // Live play mode: piano keys play notes (and step-record on Piano Roll tab).
     // 'l' or Esc exits; all other non-piano keys fall through to normal handling.
-    if app.live_play {
+    if app.live_play && !key.modifiers.contains(KeyModifiers::CONTROL) {
         match key.code {
             KeyCode::Char('l') | KeyCode::Esc => {
                 app.live_play = false;
@@ -117,6 +117,28 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
 
     match key.code {
+        KeyCode::Char('u') if ctrl => {
+            if let Some(session) = &app.session {
+                app.jam_status = match session.reconcile(&mut app.project) {
+                    Ok(Some(path)) => format!("session refreshed; local copy: {}", path.display()),
+                    Ok(None) => "session synchronized".into(),
+                    Err(e) => format!("sync failed: {e}"),
+                };
+                app.active_track = app.active_track.min(app.project.tracks.len().saturating_sub(1));
+            }
+            return;
+        }
+        KeyCode::Char('z' | 'y') if ctrl => {
+            if let Some(session) = &app.session {
+                let redo = key.code == KeyCode::Char('y') || key.modifiers.contains(KeyModifiers::SHIFT);
+                app.jam_status = match session.history(redo, &mut app.project) {
+                    Ok(()) => if redo { "shared redo" } else { "shared undo" }.into(),
+                    Err(e) => e.to_string(),
+                };
+                app.active_track = app.active_track.min(app.project.tracks.len().saturating_sub(1));
+            }
+            return;
+        }
         // Quit — Ctrl+Q
         KeyCode::Char('q') if ctrl => {
             app.should_quit = true;
@@ -152,6 +174,11 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         }
         KeyCode::Char('s') if ctrl => { app.save_or_prompt(); return; }
         KeyCode::Char('e') if ctrl => {
+            if let Some(control) = &app.export_control {
+                control.cancel();
+                app.dialog_status = "Export cancellation requested".into();
+                return;
+            }
             app.dialog_buf  = app.project_path.as_ref()
                 .and_then(|p| p.file_stem())
                 .and_then(|s| s.to_str())

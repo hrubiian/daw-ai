@@ -19,3 +19,18 @@ daw-io              = { path = "crates/daw-io" }
 daw-gpui            = { path = "crates/daw-gpui" }
 anyhow              = "1"
 crossbeam-channel   = "0.5"
+
+# Keep GPUI development/test builds practical on smaller workstations.
+[profile.dev]
+debug = 1
+incremental = false
+
+[profile.dev.package."*"]
+debug = 0
+
+[profile.test]
+debug = 1
+incremental = false
+
+[profile.test.package."*"]
+debug = 0

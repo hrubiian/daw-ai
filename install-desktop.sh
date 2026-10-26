@@ -12,7 +12,7 @@ cd "$(dirname "$0")"
 REPO="$(pwd)"
 
 echo "Building release binary…"
-cargo build --release
+cargo build --release --locked
 BIN="$REPO/target/release/daw-ai"
 [ -x "$BIN" ] || { echo "error: build did not produce $BIN" >&2; exit 1; }
 

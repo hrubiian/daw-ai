@@ -7,29 +7,43 @@ use std::path::PathBuf;
 
 pub struct ProjectStore {
     pub path: PathBuf,
+    pub live_socket: Option<PathBuf>,
+    revision: std::sync::Mutex<Option<format::Revision>>,
 }
 
 impl ProjectStore {
     pub fn new(path: PathBuf) -> Self {
-        Self { path }
+        Self { path, live_socket: None, revision: std::sync::Mutex::new(None) }
     }
 
+    pub fn live(socket: PathBuf) -> Result<Self, String> {
+        let mut store = Self::new(std::env::current_dir().map_err(|e| e.to_string())?.join("live.daw.json"));
+        store.live_socket = Some(socket);
+        let state = store.inspect_live()?;
+        if let Some(base) = state.project_directory { store.path = base.join("live.daw.json"); }
+        Ok(store)
+    }
+    pub fn inspect_live(&self) -> Result<daw_core::session::Response, String> {
+        self.live_request(daw_core::session::Request { version: 1, operation_id: daw_io::session::operation_id(), expected_revision: None, command: daw_core::session::Command::Inspect })
+    }
+    pub fn live_request(&self, request: daw_core::session::Request) -> Result<daw_core::session::Response, String> {
+        let socket = self.live_socket.as_ref().ok_or("not connected to a live session")?;
+        daw_io::session::call(socket, &request).map_err(|e| format!("live session unavailable (no file fallback): {e}"))
+    }
     pub fn load(&self) -> Result<Project, String> {
-        if !self.path.exists() {
-            return Ok(Project::default_project());
-        }
-        format::load(&self.path).map_err(|e| format!("cannot load {}: {e}", self.path.display()))
+        if self.live_socket.is_some() { return Ok(self.inspect_live()?.project); }
+        let mut revision = self.revision.lock().map_err(|e| e.to_string())?;
+        if !self.path.exists() { *revision = None; return Ok(Project::default_project()); }
+        let (p, r) = format::load_versioned(&self.path).map_err(|e| e.to_string())?;
+        *revision = Some(r);
+        Ok(p)
     }
 
-    /// Validate by JSON round-trip, then write `<path>.tmp` and rename.
     pub fn save(&self, project: &Project) -> Result<(), String> {
-        let json = serde_json::to_string_pretty(project).map_err(|e| e.to_string())?;
-        let _: Project = serde_json::from_str(&json)
-            .map_err(|e| format!("project failed validation, not saved: {e}"))?;
-        let tmp = self.path.with_extension("tmp");
-        std::fs::write(&tmp, &json).map_err(|e| format!("write {}: {e}", tmp.display()))?;
-        std::fs::rename(&tmp, &self.path)
-            .map_err(|e| format!("rename to {}: {e}", self.path.display()))?;
+        if self.live_socket.is_some() { return Err("live writes require a revision-checked mutation".into()); }
+        let mut revision = self.revision.lock().map_err(|e| e.to_string())?;
+        let next = format::save_if_unchanged(project, &self.path, revision.as_deref()).map_err(|e| e.to_string())?;
+        *revision = Some(next);
         Ok(())
     }
 
@@ -39,9 +53,21 @@ impl ProjectStore {
         &self,
         op: impl FnOnce(&mut Project) -> Result<String, String>,
     ) -> Result<String, String> {
-        let mut p = self.load()?;
+        if self.live_socket.is_some() {
+            let snapshot = self.inspect_live()?;
+            let mut p = snapshot.project;
+            let msg = op(&mut p)?;
+            let response = self.live_request(daw_core::session::Request { version: 1, operation_id: daw_io::session::operation_id(), expected_revision: Some(snapshot.revision), command: daw_core::session::Command::Batch { label: "agent edit".into(), edits: vec![daw_core::session::Edit::Replace { project: p }] } })?;
+            if let Some(e) = response.error { return Err(format!("{}: {}", e.code, e.message)); }
+            return Ok(format!("{msg} · revision {} · engine {}", response.revision, response.engine_status));
+        }
+        let (mut p, expected) = if self.path.exists() {
+            let (p, r) = format::load_versioned(&self.path).map_err(|e| e.to_string())?;
+            (p, Some(r))
+        } else { (Project::default_project(), None) };
         let msg = op(&mut p)?;
-        self.save(&p)?;
+        let next = format::save_if_unchanged(&p, &self.path, expected.as_deref()).map_err(|e| e.to_string())?;
+        *self.revision.lock().map_err(|e| e.to_string())? = Some(next);
         Ok(msg)
     }
 }
@@ -55,12 +81,13 @@ pub fn summary(p: &Project) -> String {
     let lr = &p.loop_region;
     let _ = writeln!(
         s,
-        "{} — bpm {} · {} {} · swing {:.2} · loop bars {}..{} ({}{}{})",
+        "{} — bpm {} · {} {} · swing {:.2} · timing {:.2} · loop bars {}..{} ({}{}{})",
         m.name,
         m.bpm,
         m.key,
         m.scale,
         m.swing,
+        m.timing,
         lr.start_bar,
         lr.end_bar,
         if lr.enabled { "on" } else { "off" },
@@ -107,13 +134,18 @@ pub fn summary(p: &Project) -> String {
         );
         let _ = writeln!(
             s,
-            "    patterns {:?} | clips {:?}",
+            "    patterns {:?} | clips [{}]",
             t.patterns,
             p.arrangement
                 .iter()
                 .filter(|a| a.track == t.id)
-                .map(|a| (a.bar, a.pattern.clone(), a.len_bars))
+                .map(|a| {
+                    let off = if a.offset_ticks != 0 { format!("+{}t", a.offset_ticks) } else { String::new() };
+                    let len = a.len_bars.map(|n| format!("×{n}")).unwrap_or_default();
+                    format!("{}@{}{}{}", a.pattern, a.bar, off, len)
+                })
                 .collect::<Vec<_>>()
+                .join(", ")
         );
     }
     let _ = writeln!(s, "patterns:");

@@ -7,7 +7,7 @@
 //! teardown — never dropped on the RT thread.
 //! See `docs/superpowers/specs/2026-06-11-clap-hosting-design.md`.
 
-use clack_extensions::params::{ParamInfoBuffer, PluginParams};
+use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
 use clack_extensions::state::PluginState;
 use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_host::events::Match;
@@ -18,6 +18,10 @@ use std::path::PathBuf;
 
 /// Max frames per process call — matches the mixer's block cap.
 const CLAP_MAX_FRAMES: u32 = 8192;
+
+pub static DROPPED_CLAP_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+pub static CLAP_PROCESS_ERRORS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
+const MAX_INPUT_EVENTS: u32 = 512;
 
 // ── Host handler boilerplate ──────────────────────────────────────────────────
 
@@ -149,6 +153,8 @@ pub struct ClapParamInfo {
     pub min: f64,
     pub max: f64,
     pub default: f64,
+    pub stepped: bool,
+    pub readonly: bool,
 }
 
 // ── Spec for building instances (sequencer → relay / exporter) ───────────────
@@ -206,14 +212,12 @@ pub struct ClapHandle {
 pub struct ClapProcessor {
     started: clack_host::process::StartedPluginAudioProcessor<DawClapHost>,
     events_in: EventBuffer,
-    events_out: EventBuffer,
     ports_in: AudioPorts,
     ports_out: AudioPorts,
     buf_in: [Vec<f32>; 2],
     buf_out: [Vec<f32>; 2],
-    /// Held note keys, so panic / teardown can release them.
-    held: Vec<u8>,
     steady: u64,
+    pub process_failed: bool,
 }
 
 impl std::fmt::Debug for ClapProcessor {
@@ -287,6 +291,8 @@ impl ClapInstance {
                         min: info.min_value,
                         max: info.max_value,
                         default: info.default_value,
+                        stepped: info.flags.contains(ParamInfoFlags::IS_STEPPED),
+                        readonly: info.flags.contains(ParamInfoFlags::IS_READONLY),
                     });
                 }
             }
@@ -297,14 +303,13 @@ impl ClapInstance {
             handle: ClapHandle { instance, name, param_infos },
             processor: Some(ClapProcessor {
                 started,
-                events_in: EventBuffer::new(),
-                events_out: EventBuffer::new(),
+                events_in: EventBuffer::with_capacity(MAX_INPUT_EVENTS as usize),
                 ports_in: AudioPorts::with_capacity(2, 1),
                 ports_out: AudioPorts::with_capacity(2, 1),
                 buf_in: [vec![0.0; frames], vec![0.0; frames]],
                 buf_out: [vec![0.0; frames], vec![0.0; frames]],
-                held: Vec::new(),
                 steady: 0,
+                process_failed: false,
             }),
         })
     }
@@ -360,28 +365,51 @@ impl ClapHandle {
     }
 }
 
+/// Compute saved-project parameter changes for an already running plugin.
+/// Removing a saved override restores the plugin's declared default (undo).
+pub fn parameter_updates(previous: &[(u32, f64)], next: &[(u32, f64)], infos: &[ClapParamInfo]) -> Vec<(u32, f64)> {
+    let mut updates: Vec<_> = next.iter().copied()
+        .filter(|(id, value)| previous.iter().find(|(old_id, _)| old_id == id).map(|(_, old)| old) != Some(value))
+        .collect();
+    for (id, _) in previous {
+        if !next.iter().any(|(new_id, _)| new_id == id) {
+            if let Some(info) = infos.iter().find(|info| info.id == *id) { updates.push((*id, info.default)); }
+        }
+    }
+    updates
+}
+
 impl ClapProcessor {
+    fn reserve_event(&self) -> bool {
+        if self.events_in.len() < MAX_INPUT_EVENTS { return true; }
+        DROPPED_CLAP_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        false
+    }
     pub fn queue_note_on(&mut self, key: u8, velocity: u8) {
+        if key > 127 || !self.reserve_event() { return; }
         self.events_in.push(&NoteOnEvent::new(
             0,
             Pckn::new(0u16, 0u16, key as u16, Match::All),
             velocity as f64 / 127.0,
         ));
-        self.held.push(key);
     }
 
     pub fn queue_note_off(&mut self, key: u8) {
+        if key > 127 { return; }
+        if !self.reserve_event() { self.queue_all_notes_off(); return; }
         self.events_in.push(&NoteOffEvent::new(
             0,
             Pckn::new(0u16, 0u16, key as u16, Match::All),
             0.0,
         ));
-        self.held.retain(|&k| k != key);
     }
 
     /// Release everything (transport panic / strip mute).
     pub fn queue_all_notes_off(&mut self) {
-        for key in std::mem::take(&mut self.held) {
+        // Emergency release takes priority over queued notes/parameters. Using
+        // all MIDI keys also covers releases already queued before this panic.
+        self.events_in.clear();
+        for key in 0..128u16 {
             self.events_in.push(&NoteOffEvent::new(
                 0,
                 Pckn::new(0u16, 0u16, key as u16, Match::All),
@@ -391,6 +419,7 @@ impl ClapProcessor {
     }
 
     pub fn queue_param(&mut self, param_id: u32, value: f64) {
+        if !self.reserve_event() { return; }
         self.events_in.push(&ParamValueEvent::new(
             0,
             ClapId::new(param_id),
@@ -411,7 +440,9 @@ impl ClapProcessor {
 
         {
             let input_events = InputEvents::from_buffer(&self.events_in);
-            let mut output_events = OutputEvents::from_buffer(&mut self.events_out);
+            // Plugin output events were previously collected then discarded.
+            // A void sink preserves that behavior without callback allocations.
+            let mut output_events = OutputEvents::void();
 
             let input_audio = self.ports_in.with_input_buffers([AudioPortBuffer {
                 latency: 0,
@@ -428,20 +459,22 @@ impl ClapProcessor {
                 ),
             }]);
 
-            if let Err(e) = self.started.process(
+            if self.started.process(
                 &input_audio,
                 &mut output_audio,
                 &input_events,
                 &mut output_events,
                 Some(self.steady),
                 None,
-            ) {
-                eprintln!("clap process error: {e}");
+            ).is_err() {
+                self.process_failed = true;
+                CLAP_PROCESS_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                self.buf_out[0][..frames].fill(0.0);
+                self.buf_out[1][..frames].fill(0.0);
             }
         }
 
         self.events_in.clear();
-        self.events_out.clear();
         self.steady = self.steady.wrapping_add(frames as u64);
         l[..frames].copy_from_slice(&self.buf_out[0][..frames]);
         r[..frames].copy_from_slice(&self.buf_out[1][..frames]);
@@ -459,9 +492,33 @@ mod tests {
         if p.exists() {
             Some(p)
         } else {
-            eprintln!("skip: {name} not built (cargo build --workspace)");
+            assert!(std::env::var_os("DAW_REQUIRE_TEST_ASSETS").is_none(), "required audio test assets missing"); eprintln!("skip: {name} not built (cargo build --workspace)");
             None
         }
+    }
+
+    #[test]
+    fn event_overload_is_bounded_and_note_off_still_releases() {
+        let Some(path) = testplug("libdaw_clap_testplug_tone.so") else { return; };
+        let mut instance = ClapInstance::load(path.to_str().unwrap(), "test.tone", 48000, 256).unwrap();
+        let processor = instance.processor.as_mut().unwrap();
+        let (mut left, mut right) = ([0.; 64], [0.; 64]);
+        processor.queue_note_on(60, 100);
+        processor.process(&mut left, &mut right);
+        assert!(left.iter().any(|sample| *sample != 0.));
+        for _ in 0..MAX_INPUT_EVENTS { processor.queue_param(999, 0.); }
+        assert_eq!(processor.events_in.len(), MAX_INPUT_EVENTS);
+        let before = DROPPED_CLAP_EVENTS.load(std::sync::atomic::Ordering::Relaxed);
+        processor.queue_note_off(60);
+        assert_eq!(processor.events_in.len(), 128, "overload prioritizes bounded all-notes-off");
+        assert!(DROPPED_CLAP_EVENTS.load(std::sync::atomic::Ordering::Relaxed) > before);
+        processor.process(&mut left, &mut right);
+        assert!(left.iter().all(|sample| *sample == 0.));
+        processor.queue_note_on(64, 100);
+        processor.queue_note_off(64);
+        processor.queue_all_notes_off();
+        assert_eq!(processor.events_in.len(), 128);
+        instance.shutdown();
     }
 
     #[test]
@@ -508,6 +565,9 @@ mod tests {
             .expect("Gain param listed")
             .clone();
         assert_eq!(gi.default, 1.0);
+        assert_eq!(parameter_updates(&[(gi.id, 2.0)], &[], &[gi.clone()]), vec![(gi.id, 1.0)]);
+        assert!(parameter_updates(&[(gi.id, 2.0)], &[(gi.id, 2.0)], &[gi.clone()]).is_empty());
+        assert_eq!(parameter_updates(&[(gi.id, 1.0)], &[(gi.id, 2.0)], &[gi.clone()]), vec![(gi.id, 2.0)]);
 
         let proc_ = inst.processor.as_mut().unwrap();
         let (mut l, mut r) = (vec![0.5f32; 64], vec![0.5f32; 64]);

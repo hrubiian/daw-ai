@@ -2,7 +2,10 @@ use anyhow::Result;
 use daw_core::project::{format as project_fmt, Project};
 use daw_io::Host;
 use daw_tui::app::App;
-use std::{path::{Path, PathBuf}, sync::Arc};
+use std::{
+    path::{Path, PathBuf},
+    sync::Arc,
+};
 
 /// Make relative asset paths (`assets/GeneralUser.sf2`, `assets/samples/…`)
 /// resolve regardless of how the app was launched. A desktop-icon launch starts
@@ -26,18 +29,54 @@ fn ensure_asset_cwd() {
     }
 }
 
-fn main() -> Result<()> {
-    // 1. Parse args: `--gui` selects the GPUI frontend; the first non-flag arg is the
-    //    project file. `cargo run` opens the TUI; `cargo run -- --gui song.daw.json`
-    //    opens the GPUI window.
-    let mut gui = false;
-    let mut project_path: Option<PathBuf> = None;
-    for arg in std::env::args().skip(1) {
+#[derive(Default)]
+struct LaunchOptions {
+    gui: bool,
+    project: Option<PathBuf>,
+    mp3: Option<PathBuf>,
+}
+
+fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions> {
+    let mut options = LaunchOptions::default();
+    let mut args = args.into_iter();
+    while let Some(arg) = args.next() {
         match arg.as_str() {
-            "--gui" => gui = true,
-            other => project_path = Some(PathBuf::from(other)),
+            "--gui" => options.gui = true,
+            "--export-mp3" => {
+                anyhow::ensure!(options.mp3.is_none(), "specify --export-mp3 only once");
+                let path = args
+                    .next()
+                    .filter(|a| !a.starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("--export-mp3 requires an output filename"))?;
+                options.mp3 = Some(PathBuf::from(path));
+            }
+            flag if flag.starts_with("--") => anyhow::bail!("unknown option: {flag}"),
+            _ => {
+                anyhow::ensure!(options.project.is_none(), "specify only one project file");
+                options.project = Some(PathBuf::from(arg));
+            }
         }
     }
+    anyhow::ensure!(
+        options.mp3.is_none() || options.project.is_some(),
+        "MP3 export requires a project file"
+    );
+    anyhow::ensure!(
+        !(options.gui && options.mp3.is_some()),
+        "use --export-mp3 without --gui, or choose File > Export MP3 in the app"
+    );
+    Ok(options)
+}
+
+fn main() -> Result<()> {
+    let options = parse_args(std::env::args().skip(1))?;
+    let gui = options.gui;
+    let project_path = options
+        .project
+        .map(|p| project_fmt::absolute(&p))
+        .transpose()?;
+    // Resolve both paths before locating the soundfont changes the working directory.
+    let mp3_output = options.mp3.map(|p| project_fmt::absolute(&p)).transpose()?;
 
     // Load the project relative to the launch directory (a relative path arg must
     // still resolve), then anchor the working directory to the asset root so the
@@ -53,7 +92,27 @@ fn main() -> Result<()> {
     let sf2_str = sf2_path.to_string_lossy().into_owned();
     // The legacy in-engine input recorder is TUI-only; the GPUI frontend uses
     // the dedicated capture subsystem (no second stream grabbing input devices).
-    let host = Host::start(&project, sf2_path, !gui);
+    let runtime_project = project_fmt::resolve_assets(
+        &project,
+        project_path
+            .as_deref()
+            .and_then(Path::parent)
+            .unwrap_or(Path::new(".")),
+        &std::env::current_dir()?,
+    );
+    if let Some(output) = mp3_output {
+        daw_core::audio::export_mp3(&runtime_project, &sf2_path, &output)?;
+        println!("Exported MP3: {}", output.display());
+        return Ok(());
+    }
+    let mut host = Host::start(&runtime_project, sf2_path, !gui);
+    match daw_io::session::LiveSession::start(project.clone(), project_path.as_deref(), &host) {
+        Ok(session) => host.session = Some(session),
+        Err(e) => {
+            *host.engine_error.lock().unwrap() = Some(format!("live session unavailable: {e}"));
+            eprintln!("live session unavailable: {e}");
+        }
+    }
 
     // 3. Dispatch to a frontend.
     if gui {
@@ -75,7 +134,45 @@ fn main() -> Result<()> {
         Arc::clone(&host.playback_tick),
         Arc::clone(&host.vis_buf),
     );
+    app.session = host.session.clone();
     app.refresh_all_waveforms();
     daw_tui::run(app)?;
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    fn args(values: &[&str]) -> Result<LaunchOptions> {
+        parse_args(values.iter().map(|v| (*v).to_owned()))
+    }
+
+    #[test]
+    fn mp3_export_accepts_paths_with_spaces_in_either_order() {
+        for values in [
+            ["song title.daw.json", "--export-mp3", "output title.mp3"],
+            ["--export-mp3", "output title.mp3", "song title.daw.json"],
+        ] {
+            let options = args(&values).unwrap();
+            assert_eq!(options.project, Some(PathBuf::from("song title.daw.json")));
+            assert_eq!(options.mp3, Some(PathBuf::from("output title.mp3")));
+            assert!(!options.gui);
+        }
+    }
+
+    #[test]
+    fn incomplete_or_ambiguous_exports_fail_before_starting_audio() {
+        for values in [
+            vec!["--export-mp3"],
+            vec!["--export-mp3", "--gui", "song.json"],
+            vec!["--export-mp3", "out.mp3"],
+            vec!["--gui", "song.json", "--export-mp3", "out.mp3"],
+            vec!["song.json", "other.json"],
+            vec!["--unknown"],
+        ] {
+            assert!(args(&values).is_err(), "{values:?}");
+        }
+        assert!(args(&[]).is_ok());
+        assert!(args(&["--gui", "song.json"]).unwrap().gui);
+    }
 }

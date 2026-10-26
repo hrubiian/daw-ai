@@ -6,6 +6,7 @@ license = "MIT OR Apache-2.0"
 publish = false
 
 [dependencies]
+daw-io = { path = "../daw-io" }
 daw-core = { path = "../daw-core" }
 rmcp = { version = "1.7", features = ["server", "transport-io"] }
 tokio = { version = "1", features = ["macros", "rt-multi-thread"] }
