@@ -95,7 +95,6 @@ and verified one slice at a time.
 - [MP3 export](docs/mp3-export.md)
 - [Listening and analysis tools](docs/analysis-and-ci.md)
 - [Musical collaboration workflow](docs/music-collaboration.md)
-- [Reusable composer skill](skills/bonobo-composer/SKILL.md)
 - [CLAUDE.md](CLAUDE.md) — working on the codebase (with an AI or without)
 
 ## Roadmap

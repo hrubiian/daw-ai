@@ -1,4 +1,0 @@
-interface:
-  display_name: "Bonobo-informed Composer"
-  short_description: "Compose organic electronica from studied references"
-  default_prompt: "Use $bonobo-composer to study my references, compose an original piece, render it, and compare the results honestly."

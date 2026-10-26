@@ -22,3 +22,7 @@ recordings/
 # Local agent permissions and nested development checkouts.
 /.claude/settings.local.json
 /.claude/worktrees/
+
+# Personal/generated agent skills and packaged skills stay local.
+skills/
+*.skill
