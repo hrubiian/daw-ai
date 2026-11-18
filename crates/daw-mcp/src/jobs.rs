@@ -102,11 +102,18 @@ impl Jobs {
             }
         }
         let hash = format::project_revision(&project).map_err(|e| e.to_string())?;
-        self.active
-            .fetch_update(Ordering::SeqCst, Ordering::SeqCst, |n| {
-                (n < 2).then_some(n + 1)
-            })
-            .map_err(|_| "render queue busy: at most two jobs may run")?;
+        // Reserve one of two render slots (compare-and-swap; no `fetch_update`,
+        // which newer Rust deprecates under a name older Rust lacks).
+        let mut running = self.active.load(Ordering::SeqCst);
+        loop {
+            if running >= 2 {
+                return Err("render queue busy: at most two jobs may run".into());
+            }
+            match self.active.compare_exchange_weak(running, running + 1, Ordering::SeqCst, Ordering::SeqCst) {
+                Ok(_) => break,
+                Err(current) => running = current,
+            }
+        }
         let id = daw_io::session::operation_id();
         let control = Arc::new(RenderControl::new(Duration::from_secs(300)));
         let report = JobReport {
@@ -369,6 +376,21 @@ impl Jobs {
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn a_third_concurrent_render_is_refused_without_taking_a_slot() {
+        let jobs: &'static Jobs = Box::leak(Box::new(Jobs {
+            jobs: Mutex::new(BTreeMap::new()),
+            active: AtomicUsize::new(2),
+        }));
+        let base = std::env::temp_dir().join(format!("daw_jobs_busy_{}", std::process::id()));
+        let err = jobs
+            .submit(Project::default_project(), None, base, PathBuf::from("missing.sf2"), None)
+            .unwrap_err();
+        assert!(err.contains("render queue busy"), "{err}");
+        assert_eq!(jobs.active.load(Ordering::SeqCst), 2, "a refused job must not reserve a slot");
+        assert!(jobs.jobs.lock().unwrap().is_empty());
+    }
+
     #[test]
     fn cancellation_is_not_a_failed_render() {
         let mut project = Project::default_project();
