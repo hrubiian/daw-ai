@@ -1535,7 +1535,7 @@ checksum = "be1e0bca6c3637f992fc1cc7cbc52a78c1ef6db076dbf1059c4323d6a2048376"
 
 [[package]]
 name = "daw-ai"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1547,7 +1547,7 @@ dependencies = [
 
 [[package]]
 name = "daw-clap-testplug-gain"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clack-extensions",
  "clack-plugin",
@@ -1555,7 +1555,7 @@ dependencies = [
 
 [[package]]
 name = "daw-clap-testplug-tone"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "clack-extensions",
  "clack-plugin",
@@ -1563,7 +1563,7 @@ dependencies = [
 
 [[package]]
 name = "daw-core"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1582,7 +1582,7 @@ dependencies = [
 
 [[package]]
 name = "daw-gpui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1595,7 +1595,7 @@ dependencies = [
 
 [[package]]
 name = "daw-io"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",
@@ -1609,7 +1609,7 @@ dependencies = [
 
 [[package]]
 name = "daw-mcp"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "base64",
@@ -1625,7 +1625,7 @@ dependencies = [
 
 [[package]]
 name = "daw-tui"
-version = "0.1.0"
+version = "0.2.0"
 dependencies = [
  "anyhow",
  "crossbeam-channel",

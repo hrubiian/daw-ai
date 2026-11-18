@@ -110,7 +110,7 @@ impl HostHandlers for DawClapHost {
 }
 
 fn host_info() -> HostInfo {
-    HostInfo::new("daw-ai", "daw-ai", "https://github.com/daw-ai/daw-ai", "0.1.0")
+    HostInfo::new("daw-ai", "daw-ai", "https://github.com/hrubiian/daw-ai", env!("CARGO_PKG_VERSION"))
         .expect("static host info")
 }
 
