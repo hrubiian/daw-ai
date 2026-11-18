@@ -116,7 +116,7 @@ pub fn track_profiles(project: &Project, sf2: &Path) -> anyhow::Result<Vec<Track
         if frames == 0 {
             continue;
         }
-        let mono: Vec<f32> = samples.chunks_exact(2).map(|c| (c[0] + c[1]) * 0.5).collect();
+        let mono: Vec<f32> = samples.as_chunks::<2>().0.iter().map(|c| (c[0] + c[1]) * 0.5).collect();
         let rms = (mono.iter().map(|&m| (m * m) as f64).sum::<f64>() / frames as f64).sqrt() as f32;
         let bands = crate::analysis::spectral_bands(&mono, sr);
         out.push(TrackProfile { name: t.name.clone(), rms_db: db(rms), bands });

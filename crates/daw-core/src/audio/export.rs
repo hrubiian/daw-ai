@@ -512,7 +512,7 @@ mod tests {
             ]
         })).unwrap());
         let (audio, _) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
-        let onsets: Vec<_> = audio.chunks_exact(2).enumerate()
+        let onsets: Vec<_> = audio.as_chunks::<2>().0.iter().enumerate()
             .filter(|(_, frame)| frame[0].abs() > 0.00001)
             .map(|(index, _)| index).collect();
         assert_eq!(onsets, vec![184, 368, 1286], "hits must not snap to 1024-frame boundaries");
@@ -526,7 +526,7 @@ mod tests {
         }).collect();
         assert_ne!(expected, vec![18375, 36750, 55125], "fixture must exercise timing offsets");
         let (audio, _) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
-        let onsets: Vec<_> = audio.chunks_exact(2).enumerate()
+        let onsets: Vec<_> = audio.as_chunks::<2>().0.iter().enumerate()
             .filter(|(_, frame)| frame[0].abs() > 0.00001).map(|(index, _)| index).collect();
         assert_eq!(onsets, expected, "export must use live timing humanization");
         std::fs::remove_file(path).unwrap();

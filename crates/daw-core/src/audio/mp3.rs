@@ -207,8 +207,10 @@ mod tests {
         assert!(decoded.status.success());
         let values: Vec<f32> = decoded
             .stdout
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         assert_eq!(
             values.len(),
@@ -224,7 +226,7 @@ mod tests {
             (energy(&values) / energy(&audio) - 1.).abs() < 0.1,
             "quiet source gain is preserved"
         );
-        let lr_difference: f32 = values.chunks_exact(2).map(|f| (f[0] - f[1]).abs()).sum();
+        let lr_difference: f32 = values.as_chunks::<2>().0.iter().map(|f| (f[0] - f[1]).abs()).sum();
         assert!(lr_difference > 1000., "stereo channels remain distinct");
 
         // A louder mix must receive the documented encoding headroom.
@@ -239,8 +241,10 @@ mod tests {
         assert!(decoded.status.success());
         let values: Vec<f32> = decoded
             .stdout
-            .chunks_exact(4)
-            .map(|b| f32::from_le_bytes(b.try_into().unwrap()))
+            .as_chunks::<4>()
+            .0
+            .iter()
+            .map(|b| f32::from_le_bytes(*b))
             .collect();
         let expected_energy = energy(&loud) * (PEAK_CEILING as f64).powi(2);
         assert!((energy(&values) / expected_energy - 1.).abs() < 0.1);
