@@ -41,7 +41,6 @@ impl ScheduledEvent {
                     | AudioEvent::NoteOff { .. }
                     | AudioEvent::TriggerSample { .. }
                     | AudioEvent::TriggerAudioClip { .. }
-                    | AudioEvent::PlayClip
                     | AudioEvent::PublishU32 { .. }
                     | AudioEvent::PublishU8 { .. }
             )

@@ -248,11 +248,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                         let cur = match *cell { 0 => 0, 1 => default_vel, v => v };
                         *cell = if up {
                             if cur == 0 { default_vel } else { cur.saturating_add(8).min(127) }
-                        } else if cur <= 8 {
-                            0
-                        } else {
-                            cur - 8
-                        };
+                        } else { cur.saturating_sub(8) };
                     }
                 }
             }
@@ -347,7 +343,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 if added > 0 {
                     sp.steps = new_steps;
                     for row in &mut sp.rows {
-                        row.steps.extend(std::iter::repeat(0).take(added));
+                        row.steps.extend(std::iter::repeat_n(0, added));
                     }
                     app.send(SequencerCommand::UpdateLive(app.project.clone()));
                 }

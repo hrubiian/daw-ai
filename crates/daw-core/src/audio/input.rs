@@ -164,8 +164,11 @@ impl RecordingSession {
 // ── Capture shared state + take writer ───────────────────────────────────────
 
 /// Lock-free state shared between the capture callback, the writer thread,
-/// and the UI. Everything here is written from the RT callback with atomics.
+/// and the UI. Counters come from the RT callback; session completion is
+/// published by the writer after all take results have been sent.
 pub struct CaptureShared {
+    /// True until the writer has finalized all takes after StopSession.
+    pub session_active: AtomicBool,
     /// Total frames the callback has seen since the stream opened.
     pub frames_seen: AtomicU64,
     /// Peak of the selected channels over the last buffer (f32 bits).
@@ -179,6 +182,7 @@ pub struct CaptureShared {
 impl CaptureShared {
     pub fn new() -> Self {
         CaptureShared {
+            session_active: AtomicBool::new(false),
             frames_seen: AtomicU64::new(0),
             peak: AtomicU32::new(0f32.to_bits()),
             clipped: AtomicBool::new(false),
@@ -194,6 +198,10 @@ impl Default for CaptureShared {
 }
 
 pub enum WriterCmd {
+    Plugin(Box<super::live_plugin::LivePluginProcessor>),
+    /// Prepared off the capture callback; independent state for stereo channels.
+    Guitar(Option<Box<[super::amp::GuitarRig; 2]>>),
+    GuitarSettings(super::amp::AmpSettings),
     /// Begin a recording session: takes are written as `<base>-p<N>.wav`,
     /// one per take-gate open window.
     StartSession { base: PathBuf },
@@ -215,6 +223,12 @@ pub struct TakeResult {
 /// An open take file: WAV writer, destination path, frames written so far.
 type OpenTake = (hound::WavWriter<std::io::BufWriter<std::fs::File>>, PathBuf, u64);
 
+enum CaptureDsp {
+    Dry,
+    Guitar(Box<[super::amp::GuitarRig; 2]>),
+    Plugin(Box<super::live_plugin::LivePluginProcessor>),
+}
+
 /// Drain up to `buf.len()` samples (whole frames only) from the ring, append
 /// the kept span of the active take to its WAV. Returns false when the ring
 /// was empty.
@@ -226,6 +240,7 @@ fn drain_ring(
     buf: &mut [f32],
     in_channels: u16,
     selection: InputChannels,
+    dsp: &mut CaptureDsp,
 ) -> bool {
     let ch = in_channels.max(1) as usize;
     let avail = consumer.occupied_len() / ch * ch;
@@ -236,9 +251,15 @@ fn drain_ring(
     let got = consumer.pop_slice(&mut buf[..n]);
     let frames = got / ch;
     if let Some((wav, _, written)) = take.as_mut() {
-        for s in extract_channels(&buf[..frames * ch], in_channels, selection) {
-            let _ = wav.write_sample(s);
+        let mut samples = extract_channels(&buf[..frames * ch], in_channels, selection);
+        match dsp {
+            CaptureDsp::Dry => {},
+            CaptureDsp::Guitar(rigs) => {
+                for (i, s) in samples.iter_mut().enumerate() { *s = rigs[i % selection.out_channels() as usize].process(*s); }
+            }
+            CaptureDsp::Plugin(plugin) => plugin.process(&mut samples),
         }
+        for sample in samples { let _ = wav.write_sample(sample); }
         *written += frames as u64;
     }
     *frames_consumed += frames as u64;
@@ -287,6 +308,7 @@ pub fn run_writer(
     let mut take: Option<OpenTake> = None;
     let mut buf = vec![0f32; 4096 * ch];
     let mut session: Option<PathBuf> = None;
+    let mut dsp = CaptureDsp::Dry;
     let mut pass: u32 = 0;
     let mut take_tick: u32 = 0;
     // Sentinel: the first iteration always reconciles against the live gate,
@@ -301,24 +323,34 @@ pub fn run_writer(
     };
 
     loop {
-        match ctrl_rx.try_recv() {
-            Ok(WriterCmd::StartSession { base }) => {
-                // Defensive: close a stale take before starting a session.
-                finalize_take(take.take(), &shared, sample_rate, take_tick, &out_tx);
-                session = Some(base);
-                pass = 0;
+        while let Ok(cmd) = ctrl_rx.try_recv() {
+            match cmd {
+                WriterCmd::Guitar(next) => dsp = match next { Some(rigs) => CaptureDsp::Guitar(rigs), None => CaptureDsp::Dry },
+                WriterCmd::Plugin(plugin) => dsp = CaptureDsp::Plugin(plugin),
+                WriterCmd::GuitarSettings(settings) => {
+                    if let CaptureDsp::Guitar(rigs) = &mut dsp { for rig in rigs.iter_mut() { rig.set(settings); } }
+                }
+                WriterCmd::StartSession { base } => {
+                    // Defensive: close a stale take before starting a session.
+                    finalize_take(take.take(), &shared, sample_rate, take_tick, &out_tx);
+                    session = Some(base);
+                    shared.session_active.store(true, Ordering::Release);
+                    pass = 0;
+                    break; // Reconcile the gate before a queued Stop/Shutdown.
+                }
+                WriterCmd::StopSession => {
+                    while drain_ring(&mut consumer, &mut frames_consumed, &mut take, &mut buf, in_channels, selection, &mut dsp) {}
+                    finalize_take(take.take(), &shared, sample_rate, take_tick, &out_tx);
+                    session = None;
+                    shared.session_active.store(false, Ordering::Release);
+                }
+                WriterCmd::Shutdown => {
+                    while drain_ring(&mut consumer, &mut frames_consumed, &mut take, &mut buf, in_channels, selection, &mut dsp) {}
+                    finalize_take(take.take(), &shared, sample_rate, take_tick, &out_tx);
+                    shared.session_active.store(false, Ordering::Release);
+                    return;
+                }
             }
-            Ok(WriterCmd::StopSession) => {
-                while drain_ring(&mut consumer, &mut frames_consumed, &mut take, &mut buf, in_channels, selection) {}
-                finalize_take(take.take(), &shared, sample_rate, take_tick, &out_tx);
-                session = None;
-            }
-            Ok(WriterCmd::Shutdown) => {
-                while drain_ring(&mut consumer, &mut frames_consumed, &mut take, &mut buf, in_channels, selection) {}
-                finalize_take(take.take(), &shared, sample_rate, take_tick, &out_tx);
-                return;
-            }
-            Err(_) => {}
         }
 
         // Gate transitions: a close finalizes the pass's WAV; an open (while
@@ -326,8 +358,8 @@ pub fn run_writer(
         let gate = take_gate.load(Ordering::Acquire);
         if gate != last_gate {
             last_gate = gate;
-            if gate % 2 == 0 {
-                while drain_ring(&mut consumer, &mut frames_consumed, &mut take, &mut buf, in_channels, selection) {}
+            if gate.is_multiple_of(2) {
+                while drain_ring(&mut consumer, &mut frames_consumed, &mut take, &mut buf, in_channels, selection, &mut dsp) {}
                 finalize_take(take.take(), &shared, sample_rate, take_tick, &out_tx);
             } else if let Some(base) = &session {
                 finalize_take(take.take(), &shared, sample_rate, take_tick, &out_tx);
@@ -341,7 +373,7 @@ pub fn run_writer(
             }
         }
 
-        if !drain_ring(&mut consumer, &mut frames_consumed, &mut take, &mut buf, in_channels, selection) {
+        if !drain_ring(&mut consumer, &mut frames_consumed, &mut take, &mut buf, in_channels, selection, &mut dsp) {
             std::thread::sleep(std::time::Duration::from_millis(2));
         }
     }
@@ -393,7 +425,7 @@ pub fn list_input_devices() -> Vec<InputDeviceInfo> {
 /// An open input stream + its writer thread. Dropping it closes the stream
 /// and joins the writer (finalizing any open take).
 pub struct CaptureStream {
-    _stream: cpal::Stream,
+    _stream: Option<cpal::Stream>,
     pub shared: Arc<CaptureShared>,
     /// Resolved device name (may differ from the requested one on fallback).
     pub device_name: String,
@@ -403,6 +435,7 @@ pub struct CaptureStream {
     ctrl_tx: Sender<WriterCmd>,
     pub take_rx: Receiver<TakeResult>,
     writer_handle: Option<std::thread::JoinHandle<()>>,
+    plugin: Option<super::live_plugin::LivePlugin>,
 }
 
 /// Build the input stream for native sample type `T`, converting to f32 in
@@ -471,28 +504,48 @@ where
 }
 
 impl CaptureStream {
-    /// Open `device_name` (fallback: default input device) with its default
-    /// config. `transport_state` is the sequencer's shared atomic; the take
-    /// start latches on the first buffer after it reads `TRANSPORT_ROLLING`.
+    /// Open the named input, or the system default when no name is supplied.
+    /// Unavailable explicit devices/channels are reported instead of substituted.
+    /// The shared take gate controls which input frames reach the writer.
     pub fn open(
         device_name: Option<&str>,
         selection: InputChannels,
         take_gate: Arc<AtomicU32>,
         roll_start_tick: Arc<AtomicU32>,
     ) -> Result<CaptureStream> {
+        Self::open_routed(device_name, None, selection, take_gate, roll_start_tick)
+    }
+
+    /// Route a capture stream through the sound server to the chosen interface.
+    pub fn open_routed(
+        device_name: Option<&str>,
+        server_source: Option<&str>,
+        selection: InputChannels,
+        take_gate: Arc<AtomicU32>,
+        roll_start_tick: Arc<AtomicU32>,
+    ) -> Result<CaptureStream> {
+        super::monitor::with_target(server_source, || Self::open_device(
+            if server_source.is_some() { None } else { device_name }, selection, take_gate, roll_start_tick))
+    }
+
+    fn open_device(
+        device_name: Option<&str>, selection: InputChannels,
+        take_gate: Arc<AtomicU32>, roll_start_tick: Arc<AtomicU32>,
+    ) -> Result<CaptureStream> {
         let host = cpal::default_host();
         let device = match device_name {
-            Some(want) => host
-                .input_devices()
-                .ok()
-                .and_then(|mut it| it.find(|d| d.name().map(|n| n == want).unwrap_or(false))),
-            None => None,
-        }
-        .or_else(|| host.default_input_device())
-        .ok_or_else(|| anyhow::anyhow!("no input device available"))?;
+            Some(want) => host.input_devices()?.find(|d| d.name().is_ok_and(|n| n == want))
+                .ok_or_else(|| anyhow::anyhow!("input device '{want}' is unavailable"))?,
+            None => host.default_input_device().ok_or_else(|| anyhow::anyhow!("no input device available"))?,
+        };
 
         let resolved = device.name().unwrap_or_default();
-        let config = device.default_input_config()?;
+        let mut config = device.default_input_config()?;
+        let last_channel = match selection { InputChannels::Mono(c) => c, InputChannels::Stereo(l, r) => l.max(r) };
+        if last_channel >= config.channels() {
+            config = super::monitor::input_config_at(&device, config.sample_rate().0, last_channel)?;
+        }
+        anyhow::ensure!(last_channel < config.channels(), "input channel {} is unavailable", u32::from(last_channel) + 1);
         let channels = config.channels();
         let sample_rate = config.sample_rate().0;
         let selection = selection.clamped(channels);
@@ -529,7 +582,7 @@ impl CaptureStream {
         });
 
         Ok(CaptureStream {
-            _stream: stream,
+            _stream: Some(stream),
             shared,
             device_name: resolved,
             channels,
@@ -538,12 +591,50 @@ impl CaptureStream {
             ctrl_tx,
             take_rx,
             writer_handle: Some(writer_handle),
+            plugin: None,
         })
+    }
+
+    /// Load on the caller/main thread, process on the writer, and return the
+    /// processor to its controller after writer shutdown. Never print dry on failure.
+    pub fn set_plugin(&mut self, slot: &crate::project::ClapSlot) -> Result<()> {
+        anyhow::ensure!(self.selection.out_channels() == 1, "AmpForge recording needs a mono input; select Mono in the track input picker");
+        let (owner, processor) = super::live_plugin::LivePlugin::load(slot, self.sample_rate).map_err(anyhow::Error::msg)?;
+        if let Err(error) = self.ctrl_tx.send(WriterCmd::Plugin(Box::new(processor))) {
+            drop(error); // Return the processor before dropping its controller.
+            drop(owner);
+            anyhow::bail!("recording writer disconnected");
+        }
+        self.plugin = Some(owner);
+        Ok(())
+    }
+
+    pub fn pump_plugin(&mut self, bpm: f64) {
+        if let Some(plugin) = &mut self.plugin { plugin.set_tempo(bpm); let _ = plugin.pump(); }
+    }
+
+    /// Print the same amp/cabinet DSP used by monitoring into the take WAV.
+    /// Preparing rigs and IR buffers never runs on the capture callback.
+    pub fn set_guitar(&mut self, settings: Option<super::amp::AmpSettings>, ir: &[f32]) {
+        let rigs = settings.map(|settings| Box::new(std::array::from_fn(|_| {
+            let mut rig = super::amp::GuitarRig::new(self.sample_rate);
+            rig.set(settings);
+            rig.set_ir(ir);
+            rig
+        })));
+        let _ = self.ctrl_tx.send(WriterCmd::Guitar(rigs));
+        self.plugin = None; // Writer returned any external processor before controller teardown.
+    }
+
+    /// Update controls without clearing filter, gate, or pedal histories.
+    pub fn set_guitar_settings(&self, settings: super::amp::AmpSettings) {
+        let _ = self.ctrl_tx.send(WriterCmd::GuitarSettings(settings));
     }
 
     /// Begin a recording session; takes split per take-gate open window,
     /// written as `<base>-p<N>.wav`.
     pub fn begin_session(&self, base: PathBuf) {
+        self.shared.session_active.store(true, Ordering::Release);
         let _ = self.ctrl_tx.send(WriterCmd::StartSession { base });
     }
 
@@ -567,6 +658,9 @@ impl CaptureStream {
 
 impl Drop for CaptureStream {
     fn drop(&mut self) {
+        // Stop producing before draining/joining. In particular a costly
+        // external amp must not chase a continuously refilled input ring.
+        self._stream.take();
         let _ = self.ctrl_tx.send(WriterCmd::Shutdown);
         if let Some(h) = self.writer_handle.take() {
             let _ = h.join();
@@ -577,6 +671,58 @@ impl Drop for CaptureStream {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    #[ignore = "requires the installed AmpForge CLAP; no audio hardware is opened"]
+    fn ampforge_rearming_starts_a_fresh_processor() {
+        let path = std::path::PathBuf::from(std::env::var_os("HOME").unwrap())
+            .join(".clap/AmpForge/ampforge_main.clap");
+        let slot = crate::project::ClapSlot {
+            uid: "guitar-ampforge".into(), path: path.to_string_lossy().into_owned(),
+            id: super::super::live_plugin::AMPFORGE_ID.into(), state: None,
+            params: [("22".into(), 18.), ("26".into(), -12.)].into_iter().collect(),
+        };
+        let (mut producer, consumer) = HeapRb::<f32>::new(8192).split();
+        let shared = Arc::new(CaptureShared::new());
+        let gate = Arc::new(AtomicU32::new(0));
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
+        let (take_tx, take_rx) = crossbeam_channel::unbounded();
+        let worker_shared = shared.clone(); let worker_gate = gate.clone();
+        let writer = std::thread::spawn(move || run_writer(consumer, worker_shared, 1, InputChannels::Mono(0),
+            44_100, worker_gate, Arc::new(AtomicU32::new(0)), ctrl_rx, take_tx));
+        let mut capture = CaptureStream {
+            _stream: None, shared, device_name: "synthetic input".into(), channels: 1,
+            sample_rate: 44_100, selection: InputChannels::Mono(0), ctrl_tx, take_rx,
+            writer_handle: Some(writer), plugin: None,
+        };
+        let input: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.11).sin() * 0.06).collect();
+        let dir = std::env::temp_dir().join(format!("daw-ampforge-rearm-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let mut takes = Vec::new();
+        for pass in 0..2 {
+            capture.set_plugin(&slot).unwrap();
+            let base = dir.join(format!("take-{pass}"));
+            capture.begin_session(base.clone());
+            gate.store(pass * 2 + 1, Ordering::Release);
+            let file = PathBuf::from(format!("{}-p1.wav", base.display()));
+            let deadline = std::time::Instant::now() + std::time::Duration::from_secs(5);
+            while !file.exists() {
+                assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            assert_eq!(producer.push_slice(&input), input.len());
+            while producer.occupied_len() > 0 {
+                assert!(std::time::Instant::now() < deadline); std::thread::sleep(std::time::Duration::from_millis(2));
+            }
+            gate.store(pass * 2 + 2, Ordering::Release);
+            capture.end_session();
+            let take = capture.take_rx.recv_timeout(std::time::Duration::from_secs(5)).unwrap();
+            takes.push(hound::WavReader::open(take.path).unwrap().samples::<f32>().map(Result::unwrap).collect::<Vec<_>>());
+        }
+        drop(capture);
+        assert_eq!(takes[0].len(), input.len());
+        assert_eq!(takes[0], takes[1], "a new take must not inherit frozen delay/filter history from the previous take");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
 
     #[test]
     fn extract_mono_channel_from_4ch() {
@@ -758,6 +904,64 @@ mod tests {
         let expected: Vec<f32> = (0..100).map(|i| i as f32).collect();
         assert_eq!(samples, expected);
         std::fs::remove_dir_all(std::path::Path::new(&result.path).parent().unwrap()).ok();
+    }
+
+    #[test]
+    fn writer_prints_amp_and_ir_with_independent_stereo_state() {
+        use super::super::amp::{AmpSettings, Cabinet, GuitarRig};
+        let settings = AmpSettings { gain: 0.8, gate: 0.0, cabinet: Cabinet::Ir, ..Default::default() };
+        let ir = [0.8, 0.2, -0.1];
+        let make_rig = || {
+            let mut rig = GuitarRig::new(48_000);
+            rig.set(settings);
+            rig.set_ir(&ir);
+            rig
+        };
+        let mut left = make_rig();
+        let mut right = make_rig();
+        let mut raw = Vec::new();
+        let mut dry = Vec::new();
+        let mut expected = Vec::new();
+        for i in 0..1024 {
+            let l = (i as f32 * 0.07).sin() * 0.08;
+            let r = (i as f32 * 0.13).sin() * 0.15;
+            raw.extend_from_slice(&[-0.9, r, 0.9, l]);
+            dry.extend_from_slice(&[l, r]);
+            expected.extend_from_slice(&[left.process(l), right.process(r)]);
+        }
+        let (mut prod, cons) = HeapRb::<f32>::new(8192).split();
+        assert_eq!(prod.push_slice(&raw), raw.len());
+        let dir = std::env::temp_dir().join(format!("daw_writer_rig_{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let gate = Arc::new(AtomicU32::new(1));
+        let g = gate.clone();
+        let (ctrl_tx, ctrl_rx) = crossbeam_channel::unbounded();
+        let (take_tx, take_rx) = crossbeam_channel::unbounded();
+        ctrl_tx.send(WriterCmd::Guitar(Some(Box::new([make_rig(), make_rig()])))).unwrap();
+        ctrl_tx.send(WriterCmd::StartSession { base: dir.join("take") }).unwrap();
+        let shared = Arc::new(CaptureShared::new());
+        let consumed = shared.clone();
+        let writer = std::thread::spawn(move || run_writer(cons, shared, 4, InputChannels::Stereo(3, 1),
+            48_000, g, Arc::new(AtomicU32::new(960)), ctrl_rx, take_tx));
+        // Wait for consumption, not scheduling time, before closing the gate.
+        let deadline = std::time::Instant::now() + std::time::Duration::from_secs(2);
+        while prod.occupied_len() > 0 {
+            assert!(std::time::Instant::now() < deadline, "writer did not consume input");
+            std::thread::sleep(std::time::Duration::from_millis(1));
+        }
+        gate.store(2, Ordering::Release);
+        let take = take_rx.recv_timeout(std::time::Duration::from_secs(2)).unwrap();
+        ctrl_tx.send(WriterCmd::Shutdown).unwrap();
+        writer.join().unwrap();
+        let mut wav = hound::WavReader::open(&take.path).unwrap();
+        assert_eq!(wav.spec().channels, 2);
+        assert_eq!(wav.spec().sample_rate, 48_000);
+        let samples: Vec<f32> = wav.samples::<f32>().map(Result::unwrap).collect();
+        assert_eq!(samples, expected, "the WAV must contain the amp and cabinet, with separate L/R histories");
+        assert!(samples.iter().zip(dry).any(|(wet, dry)| (wet - dry).abs() > 0.05));
+        assert_eq!(take.start_tick, 960);
+        assert_eq!(consumed.dropped_frames.load(Ordering::Relaxed), 0);
+        std::fs::remove_dir_all(dir).unwrap();
     }
 
     #[test]

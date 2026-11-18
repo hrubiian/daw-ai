@@ -5,10 +5,20 @@
 //! creating thread) and a `Send` `ClapProcessor` that the mixer drives on
 //! the RT thread. Processors are returned to their creating thread for
 //! teardown — never dropped on the RT thread.
-//! See `docs/superpowers/specs/2026-06-11-clap-hosting-design.md`.
 
 use clack_extensions::params::{ParamInfoBuffer, ParamInfoFlags, PluginParams};
-use clack_extensions::state::PluginState;
+use clack_extensions::state::{PluginState, HostState, HostStateImpl};
+use clack_extensions::audio_ports::{PluginAudioPorts, AudioPortInfoBuffer};
+use clack_extensions::gui::{PluginGui, HostGui, HostGuiImpl, GuiConfiguration, GuiApiType, GuiSize};
+use clack_extensions::timer::{HostTimer, HostTimerImpl, PluginTimer, TimerId};
+use clack_extensions::params::{HostParams, HostParamsImplShared, HostParamsImplMainThread, ParamRescanFlags, ParamClearFlags};
+use std::sync::atomic::{AtomicBool, AtomicU8, Ordering};
+use std::sync::Arc;
+use clack_host::events::{UnknownEvent, EventHeader};
+use clack_host::events::io::{OutputEventBuffer, TryPushError};
+use clack_host::events::spaces::CoreEventSpace;
+use clack_host::events::event_types::{TransportEvent, TransportFlags};
+use std::time::{Instant, Duration};
 use clack_host::events::event_types::{NoteOffEvent, NoteOnEvent, ParamValueEvent};
 use clack_host::events::Match;
 use clack_host::utils::Cookie;
@@ -25,13 +35,30 @@ const MAX_INPUT_EVENTS: u32 = 512;
 
 // ── Host handler boilerplate ──────────────────────────────────────────────────
 
-pub struct DawClapShared;
+#[derive(Default)]
+pub struct DawClapShared {
+    allow_gui: bool,
+    callback: AtomicBool,
+    gui_action: AtomicU8,
+    dirty: Arc<AtomicBool>,
+}
 impl<'a> SharedHandler<'a> for DawClapShared {
     fn request_restart(&self) {
         eprintln!("clap: plugin requested restart (ignored this slice)");
     }
     fn request_process(&self) {}
-    fn request_callback(&self) {}
+    fn request_callback(&self) { self.callback.store(true, Ordering::Release); }
+}
+
+impl HostGuiImpl for DawClapShared {
+    fn resize_hints_changed(&self) {}
+    fn request_resize(&self, _size: GuiSize) -> Result<(), HostError> { Ok(()) }
+    fn request_show(&self) -> Result<(), HostError> { self.gui_action.store(1, Ordering::Release); Ok(()) }
+    fn request_hide(&self) -> Result<(), HostError> { self.gui_action.store(2, Ordering::Release); Ok(()) }
+    fn closed(&self, destroyed: bool) { self.gui_action.store(if destroyed { 3 } else { 2 }, Ordering::Release); }
+}
+impl HostParamsImplShared for DawClapShared {
+    fn request_flush(&self) { self.dirty.store(true, Ordering::Release); }
 }
 
 #[derive(Default)]
@@ -39,6 +66,9 @@ pub struct DawClapMainThread<'a> {
     plugin: Option<InitializedPluginHandle<'a>>,
     params: Option<PluginParams>,
     state: Option<PluginState>,
+    timers: Vec<(TimerId, Duration, Instant)>,
+    next_timer: u32,
+    dirty: bool,
 }
 impl<'a> MainThreadHandler<'a> for DawClapMainThread<'a> {
     fn initialized(&mut self, instance: InitializedPluginHandle<'a>) {
@@ -48,11 +78,35 @@ impl<'a> MainThreadHandler<'a> for DawClapMainThread<'a> {
     }
 }
 
+impl HostTimerImpl for DawClapMainThread<'_> {
+    fn register_timer(&mut self, period_ms: u32) -> Result<TimerId, HostError> {
+        self.next_timer = self.next_timer.wrapping_add(1);
+        let id = TimerId(self.next_timer);
+        self.timers.push((id, Duration::from_millis(period_ms.max(10) as u64), Instant::now()));
+        Ok(id)
+    }
+    fn unregister_timer(&mut self, id: TimerId) -> Result<(), HostError> {
+        self.timers.retain(|t| t.0 != id); Ok(())
+    }
+}
+impl HostParamsImplMainThread for DawClapMainThread<'_> {
+    fn rescan(&mut self, _flags: ParamRescanFlags) { self.dirty = true; }
+    fn clear(&mut self, _id: ClapId, _flags: ParamClearFlags) {}
+}
+impl HostStateImpl for DawClapMainThread<'_> {
+    fn mark_dirty(&mut self) { self.dirty = true; }
+}
+
 pub struct DawClapHost;
 impl HostHandlers for DawClapHost {
     type Shared<'a> = DawClapShared;
     type MainThread<'a> = DawClapMainThread<'a>;
     type AudioProcessor<'a> = ();
+    fn declare_extensions(builder: &mut HostExtensions<Self>, shared: &Self::Shared<'_>) {
+        builder.register::<HostParams>().register::<HostState>();
+        // Only the live guitar frontend currently services native UI/timers.
+        if shared.allow_gui { builder.register::<HostGui>().register::<HostTimer>(); }
+    }
 }
 
 fn host_info() -> HostInfo {
@@ -89,6 +143,21 @@ pub fn standard_paths() -> Vec<PathBuf> {
 
 pub fn discover() -> Vec<ClapPluginDesc> {
     discover_in(&standard_paths())
+}
+
+/// True if `path` resolves (symlinks followed) to a file inside one of
+/// `roots`. Project files are shareable and LLM-editable, so a slot's `path`
+/// is untrusted input: loading it unchecked would `dlopen` (and run the
+/// constructors of) any shared library named in a downloaded song.
+pub fn is_trusted_plugin_path(path: &str, roots: &[PathBuf]) -> bool {
+    let Ok(real) = std::fs::canonicalize(path) else { return false };
+    if !real.is_file() {
+        return false;
+    }
+    roots
+        .iter()
+        .filter_map(|r| std::fs::canonicalize(r).ok())
+        .any(|root| real.starts_with(root))
 }
 
 /// Scan directories recursively for `.clap`/`.so` bundles and enumerate
@@ -170,6 +239,41 @@ pub struct ClapSlotSpec {
     pub params: Vec<(u32, f64)>,
 }
 
+/// The opaque chunk of an FXP "FPCh" preset file (the layout Surge XT's
+/// `.fxp` patches use): `CcnK` at 0, `FPCh` at 8, big-endian chunk size at
+/// 56, chunk data from 60. Loading that chunk as plugin state loads the patch.
+pub fn fxp_chunk(bytes: &[u8]) -> Result<&[u8], String> {
+    if bytes.len() < 60 || &bytes[0..4] != b"CcnK" {
+        return Err("not an FXP preset file".into());
+    }
+    if &bytes[8..12] != b"FPCh" {
+        return Err("FXP preset has no opaque chunk (only FPCh presets are supported)".into());
+    }
+    let size = u32::from_be_bytes([bytes[56], bytes[57], bytes[58], bytes[59]]) as usize;
+    bytes.get(60..60usize.saturating_add(size)).ok_or_else(|| "FXP chunk size runs past the end of the file".into())
+}
+
+/// What identifies a running plugin instance for reuse across live edits:
+/// its bundle, plugin id and saved state. Param overrides are left out
+/// (they're applied to a running instance as parameter changes); a new
+/// state (e.g. a loaded patch) requires rebuilding the instance.
+#[derive(Clone, PartialEq, Eq, Debug)]
+pub struct SlotFingerprint {
+    pub path: String,
+    pub id: String,
+    pub state_digest: Option<u64>,
+}
+
+pub fn slot_fingerprint(spec: &ClapSlotSpec) -> SlotFingerprint {
+    use std::hash::{Hash, Hasher};
+    let state_digest = spec.state.as_ref().map(|blob| {
+        let mut h = std::collections::hash_map::DefaultHasher::new();
+        blob.hash(&mut h);
+        h.finish()
+    });
+    SlotFingerprint { path: spec.path.clone(), id: spec.id.clone(), state_digest }
+}
+
 /// All CLAP slots in a project, decoded and ready to instantiate.
 pub fn slot_specs(project: &crate::project::Project) -> Vec<ClapSlotSpec> {
     use base64::Engine as _;
@@ -206,6 +310,7 @@ pub struct ClapHandle {
     instance: PluginInstance<DawClapHost>,
     pub name: String,
     pub param_infos: Vec<ClapParamInfo>,
+    gui_created: bool,
 }
 
 /// RT half: drives audio. `Send`; owned by the Mixer while live.
@@ -217,6 +322,11 @@ pub struct ClapProcessor {
     buf_in: [Vec<f32>; 2],
     buf_out: [Vec<f32>; 2],
     steady: u64,
+    input_channels: usize,
+    output_channels: usize,
+    dirty: Arc<AtomicBool>,
+    tempo: Option<f64>,
+    sample_rate: f64,
     pub process_failed: bool,
 }
 
@@ -242,6 +352,10 @@ impl ClapInstance {
         sample_rate: u32,
         max_frames: u32,
     ) -> Result<Self, String> {
+        Self::load_with_editor(path, plugin_id, sample_rate, max_frames, false)
+    }
+
+    fn load_with_editor(path: &str, plugin_id: &str, sample_rate: u32, max_frames: u32, allow_gui: bool) -> Result<Self, String> {
         // SAFETY: see scan_bundle — dylib loading is inherent to hosting.
         let entry =
             unsafe { PluginEntry::load(path) }.map_err(|e| format!("load {path}: {e}"))?;
@@ -256,13 +370,31 @@ impl ClapInstance {
             .unwrap_or_else(|| plugin_id.to_string());
         let id_c = CString::new(plugin_id).map_err(|_| "bad plugin id".to_string())?;
         let mut instance = PluginInstance::<DawClapHost>::new(
-            |_| DawClapShared,
+            |_| DawClapShared { allow_gui, ..Default::default() },
             |_| DawClapMainThread::default(),
             &entry,
             &id_c,
             &host_info(),
         )
         .map_err(|e| format!("instantiate {plugin_id}: {e}"))?;
+
+        let (input_channels, output_channels) = {
+            let mut plugin = instance.plugin_handle();
+            if let Some(ports) = plugin.get_extension::<PluginAudioPorts>() {
+                let mut channels = |input| -> Result<usize, String> {
+                    let count = ports.count(&mut plugin, input);
+                    if count == 0 { return Ok(0); }
+                    // Route the main bus, preserving the existing host's
+                    // behavior for instruments with optional auxiliary outputs.
+                    let mut buffer = AudioPortInfoBuffer::new();
+                    let n = ports.get(&mut plugin, 0, input, &mut buffer).ok_or("missing CLAP audio port")?.channel_count as usize;
+                    if !(1..=2).contains(&n) { return Err(format!("unsupported CLAP channel count: {n}")); }
+                    Ok(n)
+                };
+                (channels(true)?, channels(false)?)
+            } else { (2, 2) }
+        };
+        if output_channels == 0 { return Err("CLAP plugin has no audio output".into()); }
 
         let config = PluginAudioConfiguration {
             sample_rate: sample_rate as f64,
@@ -298,9 +430,10 @@ impl ClapInstance {
             }
         }
 
+        let dirty = instance.access_shared_handler(|s| Arc::clone(&s.dirty));
         let frames = max_frames.min(CLAP_MAX_FRAMES) as usize;
         Ok(ClapInstance {
-            handle: ClapHandle { instance, name, param_infos },
+            handle: ClapHandle { instance, name, param_infos, gui_created: false },
             processor: Some(ClapProcessor {
                 started,
                 events_in: EventBuffer::with_capacity(MAX_INPUT_EVENTS as usize),
@@ -309,17 +442,39 @@ impl ClapInstance {
                 buf_in: [vec![0.0; frames], vec![0.0; frames]],
                 buf_out: [vec![0.0; frames], vec![0.0; frames]],
                 steady: 0,
+                input_channels,
+                output_channels,
+                dirty,
+                tempo: None,
+                sample_rate: sample_rate as f64,
                 process_failed: false,
             }),
         })
     }
 
     /// Build from a slot spec: load, then apply state + param overrides.
+    /// The spec comes from a project file, so its path must lie inside the
+    /// standard CLAP search paths (`$CLAP_PATH`, `~/.clap`, `/usr/lib/clap`…).
     pub fn from_spec(spec: &ClapSlotSpec, sample_rate: u32) -> Result<Self, String> {
-        let mut inst = Self::load(&spec.path, &spec.id, sample_rate, CLAP_MAX_FRAMES)?;
+        Self::from_spec_with_editor(spec, sample_rate, false)
+    }
+
+    pub fn from_live_spec(spec: &ClapSlotSpec, sample_rate: u32) -> Result<Self, String> {
+        Self::from_spec_with_editor(spec, sample_rate, true)
+    }
+
+    fn from_spec_with_editor(spec: &ClapSlotSpec, sample_rate: u32, allow_gui: bool) -> Result<Self, String> {
+        if !is_trusted_plugin_path(&spec.path, &standard_paths()) {
+            return Err(format!(
+                "refusing to load {}: not inside a CLAP search path ($CLAP_PATH, ~/.clap, /usr/lib/clap, /usr/local/lib/clap)",
+                spec.path
+            ));
+        }
+        let mut inst = Self::load_with_editor(&spec.path, &spec.id, sample_rate, CLAP_MAX_FRAMES, allow_gui)?;
         if let Some(blob) = &spec.state {
             if let Err(e) = inst.handle.load_state(blob) {
-                eprintln!("clap {}: state load failed: {e}", spec.uid);
+                inst.shutdown();
+                return Err(format!("clap {}: state load failed: {e}", spec.uid));
             }
         }
         if let Some(p) = inst.processor.as_mut() {
@@ -339,6 +494,63 @@ impl ClapInstance {
 }
 
 impl ClapHandle {
+    /// Service main-thread callbacks and GUI timers from the frontend's pump.
+    pub fn pump(&mut self) -> bool {
+        if self.instance.access_shared_handler(|s| s.callback.swap(false, Ordering::AcqRel)) {
+            self.instance.call_on_main_thread_callback();
+        }
+        let due = self.instance.access_handler_mut(|mt| {
+            let now = Instant::now();
+            mt.timers.iter_mut().filter_map(|(id, period, last)| {
+                if now.duration_since(*last) >= *period { *last = now; Some(*id) } else { None }
+            }).collect::<Vec<_>>()
+        });
+        let mut plugin = self.instance.plugin_handle();
+        if let Some(timer) = plugin.get_extension::<PluginTimer>() {
+            for id in due { timer.on_timer(&mut plugin, id); }
+        }
+        let action = self.instance.access_shared_handler(|s| s.gui_action.swap(0, Ordering::AcqRel));
+        match action {
+            1 => { let _ = self.show_editor(); },
+            2 => self.hide_editor(),
+            3 => self.close_editor(),
+            _ => {}
+        }
+        let dirty = self.instance.access_shared_handler(|s| s.dirty.swap(false, Ordering::AcqRel));
+        self.instance.access_handler_mut(|mt| std::mem::take(&mut mt.dirty)) || dirty
+    }
+
+    pub fn show_editor(&mut self) -> Result<(), String> {
+        let mut plugin = self.instance.plugin_handle();
+        let gui = plugin.get_extension::<PluginGui>().ok_or("plugin has no native editor")?;
+        if !self.gui_created {
+            let api_type = if cfg!(target_os = "windows") { GuiApiType::WIN32 }
+                else if cfg!(target_os = "macos") { GuiApiType::COCOA } else { GuiApiType::X11 };
+            let config = GuiConfiguration { api_type, is_floating: true };
+            if !gui.is_api_supported(&mut plugin, config) { return Err("plugin does not support a floating editor on this desktop".into()); }
+            gui.create(&mut plugin, config).map_err(|e| e.to_string())?;
+            self.gui_created = true;
+            let title = CString::new(format!("daw-ai · {}", self.name)).map_err(|e| e.to_string())?;
+            gui.suggest_title(&mut plugin, &title);
+        }
+        gui.show(&mut plugin).map_err(|e| e.to_string())
+    }
+
+    pub fn hide_editor(&mut self) {
+        if self.gui_created {
+            let mut plugin = self.instance.plugin_handle();
+            if let Some(gui) = plugin.get_extension::<PluginGui>() { let _ = gui.hide(&mut plugin); }
+        }
+    }
+
+    pub fn close_editor(&mut self) {
+        if self.gui_created {
+            let mut plugin = self.instance.plugin_handle();
+            if let Some(gui) = plugin.get_extension::<PluginGui>() { gui.destroy(&mut plugin); }
+            self.gui_created = false;
+        }
+    }
+
     pub fn collect_state(&mut self) -> Option<Vec<u8>> {
         let state = self.instance.access_handler(|mt: &DawClapMainThread| mt.state)?;
         let mut out = Vec::new();
@@ -358,8 +570,35 @@ impl ClapHandle {
             .map_err(|e| e.to_string())
     }
 
+    /// The plugin's current value of parameter `id`.
+    pub fn param_value(&mut self, id: u32) -> Option<f64> {
+        let params = self.instance.access_handler(|mt: &DawClapMainThread| mt.params)?;
+        let mut handle = self.instance.plugin_handle();
+        params.get_value(&mut handle, ClapId::new(id))
+    }
+
+    /// The plugin's own display text for `value` of parameter `id`
+    /// (e.g. "800 Hz"), or `None` when it can't format it.
+    pub fn value_to_text(&mut self, id: u32, value: f64) -> Option<String> {
+        let params = self.instance.access_handler(|mt: &DawClapMainThread| mt.params)?;
+        let mut handle = self.instance.plugin_handle();
+        let mut buf = [0u8; 256];
+        let text = params.value_to_text(&mut handle, ClapId::new(id), value, &mut buf).ok()?;
+        Some(String::from_utf8_lossy(text).trim().to_string())
+    }
+
+    /// Parse display text (e.g. "800 Hz") into a value of parameter `id`,
+    /// as the plugin itself does; `None` when it rejects the text.
+    pub fn text_to_value(&mut self, id: u32, text: &str) -> Option<f64> {
+        let params = self.instance.access_handler(|mt: &DawClapMainThread| mt.params)?;
+        let text = CString::new(text).ok()?;
+        let mut handle = self.instance.plugin_handle();
+        params.text_to_value(&mut handle, ClapId::new(id), &text)
+    }
+
     /// Tear down a returned processor (stop → deactivate).
     pub fn deactivate(&mut self, processor: ClapProcessor) {
+        self.close_editor();
         let stopped = processor.started.stop_processing();
         self.instance.deactivate(stopped);
     }
@@ -379,7 +618,22 @@ pub fn parameter_updates(previous: &[(u32, f64)], next: &[(u32, f64)], infos: &[
     updates
 }
 
+// Notice native-editor parameter changes without allocating an event list on
+// the audio thread. The frontend snapshots state/values on its own thread.
+struct ParameterNotice<'a>(&'a AtomicBool);
+impl OutputEventBuffer for ParameterNotice<'_> {
+    fn try_push(&mut self, event: &UnknownEvent) -> Result<(), TryPushError> {
+        if let Some(CoreEventSpace::ParamValue(_)) = event.as_core_event() {
+            self.0.store(true, Ordering::Release);
+        }
+        Ok(())
+    }
+}
+
 impl ClapProcessor {
+    pub fn set_tempo(&mut self, bpm: f64) {
+        self.tempo = bpm.is_finite().then_some(bpm.clamp(20., 300.));
+    }
     fn reserve_event(&self) -> bool {
         if self.events_in.len() < MAX_INPUT_EVENTS { return true; }
         DROPPED_CLAP_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -412,7 +666,7 @@ impl ClapProcessor {
         for key in 0..128u16 {
             self.events_in.push(&NoteOffEvent::new(
                 0,
-                Pckn::new(0u16, 0u16, key as u16, Match::All),
+                Pckn::new(0u16, 0u16, key, Match::All),
                 0.0,
             ));
         }
@@ -435,37 +689,53 @@ impl ClapProcessor {
         let frames = l.len().min(r.len()).min(self.buf_in[0].len());
         self.buf_in[0][..frames].copy_from_slice(&l[..frames]);
         self.buf_in[1][..frames].copy_from_slice(&r[..frames]);
+        if self.input_channels == 1 {
+            for i in 0..frames { self.buf_in[0][i] = 0.5 * (l[i] + r[i]); }
+        }
         self.buf_out[0][..frames].fill(0.0);
         self.buf_out[1][..frames].fill(0.0);
 
         {
             let input_events = InputEvents::from_buffer(&self.events_in);
-            // Plugin output events were previously collected then discarded.
-            // A void sink preserves that behavior without callback allocations.
-            let mut output_events = OutputEvents::void();
+            let mut notice = ParameterNotice(&self.dirty);
+            let mut output_events = OutputEvents::from_buffer(&mut notice);
 
             let input_audio = self.ports_in.with_input_buffers([AudioPortBuffer {
                 latency: 0,
                 channels: AudioPortBufferType::f32_input_only(
                     self.buf_in
-                        .iter_mut()
+                        .iter_mut().take(self.input_channels)
                         .map(|b| InputChannel::variable(&mut b[..frames])),
                 ),
-            }]);
+            }].into_iter().take(usize::from(self.input_channels > 0)));
             let mut output_audio = self.ports_out.with_output_buffers([AudioPortBuffer {
                 latency: 0,
                 channels: AudioPortBufferType::f32_output_only(
-                    self.buf_out.iter_mut().map(|b| &mut b[..frames]),
+                    self.buf_out.iter_mut().take(self.output_channels).map(|b| &mut b[..frames]),
                 ),
             }]);
 
+            let transport = self.tempo.map(|tempo| {
+                let seconds = self.steady as f64 / self.sample_rate;
+                let beats = seconds * tempo / 60.;
+                TransportEvent {
+                    header: EventHeader::default(),
+                    flags: TransportFlags::HAS_TEMPO | TransportFlags::HAS_TIME_SIGNATURE
+                        | TransportFlags::HAS_BEATS_TIMELINE | TransportFlags::HAS_SECONDS_TIMELINE,
+                    tempo, tempo_inc: 0., song_pos_beats: beats.into(), song_pos_seconds: seconds.into(),
+                    loop_start_beats: Default::default(), loop_end_beats: Default::default(),
+                    loop_start_seconds: Default::default(), loop_end_seconds: Default::default(),
+                    bar_start: ((beats / 4.).floor() * 4.).into(), bar_number: (beats / 4.) as i32,
+                    time_signature_numerator: 4, time_signature_denominator: 4,
+                }
+            });
             if self.started.process(
                 &input_audio,
                 &mut output_audio,
                 &input_events,
                 &mut output_events,
                 Some(self.steady),
-                None,
+                transport.as_ref(),
             ).is_err() {
                 self.process_failed = true;
                 CLAP_PROCESS_ERRORS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -477,13 +747,45 @@ impl ClapProcessor {
         self.events_in.clear();
         self.steady = self.steady.wrapping_add(frames as u64);
         l[..frames].copy_from_slice(&self.buf_out[0][..frames]);
-        r[..frames].copy_from_slice(&self.buf_out[1][..frames]);
+        r[..frames].copy_from_slice(&self.buf_out[if self.output_channels == 1 { 0 } else { 1 }][..frames]);
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn fingerprint_changes_with_state_not_params() {
+        let spec = |state: Option<Vec<u8>>, params: Vec<(u32, f64)>| ClapSlotSpec {
+            uid: "c1".into(), path: "/p.clap".into(), id: "x".into(), state, params,
+        };
+        assert_eq!(
+            slot_fingerprint(&spec(Some(vec![1]), vec![])),
+            slot_fingerprint(&spec(Some(vec![1]), vec![(3, 0.5)])),
+            "param overrides alone don't rebuild the plugin"
+        );
+        assert_ne!(slot_fingerprint(&spec(Some(vec![1]), vec![])), slot_fingerprint(&spec(Some(vec![2]), vec![])));
+        assert_ne!(slot_fingerprint(&spec(None, vec![])), slot_fingerprint(&spec(Some(vec![]), vec![])));
+    }
+
+    #[test]
+    fn fxp_chunk_extracts_opaque_chunk() {
+        let fxp = |magic: &[u8; 4], size: u32, data: &[u8]| {
+            let mut b = b"CcnK".to_vec();
+            b.extend_from_slice(&[0; 4]);
+            b.extend_from_slice(magic);
+            b.resize(56, 0);
+            b.extend_from_slice(&size.to_be_bytes());
+            b.extend_from_slice(data);
+            b
+        };
+        let b = fxp(b"FPCh", 5, b"hello");
+        assert_eq!(fxp_chunk(&b), Ok(&b"hello"[..]));
+        assert!(fxp_chunk(b"CcnK").is_err(), "truncated header");
+        assert!(fxp_chunk(&fxp(b"FxCk", 5, b"hello")).is_err(), "parameter preset, not a chunk");
+        assert!(fxp_chunk(&fxp(b"FPCh", 9, b"hello")).is_err(), "size past the end");
+    }
 
     fn testplug(name: &str) -> Option<std::path::PathBuf> {
         let p = std::path::Path::new(env!("CARGO_MANIFEST_DIR"))
@@ -539,6 +841,35 @@ mod tests {
     }
 
     #[test]
+    fn untrusted_plugin_paths_are_rejected() {
+        let dir = std::env::temp_dir().join(format!("daw_clap_trust_{}", std::process::id()));
+        let root = dir.join("plugins");
+        std::fs::create_dir_all(&root).unwrap();
+        let inside = root.join("ok.clap");
+        let outside = dir.join("evil.so");
+        std::fs::write(&inside, b"").unwrap();
+        std::fs::write(&outside, b"").unwrap();
+        let roots = vec![root.clone()];
+        assert!(is_trusted_plugin_path(inside.to_str().unwrap(), &roots));
+        assert!(!is_trusted_plugin_path(outside.to_str().unwrap(), &roots));
+        // `..` escapes are resolved before the prefix check.
+        let escape = root.join("../evil.so");
+        assert!(!is_trusted_plugin_path(escape.to_str().unwrap(), &roots));
+        assert!(!is_trusted_plugin_path("/nonexistent/x.clap", &roots));
+        // from_spec refuses before any dlopen.
+        let spec = ClapSlotSpec {
+            uid: "c1".into(),
+            path: outside.to_string_lossy().into_owned(),
+            id: "x".into(),
+            state: None,
+            params: vec![],
+        };
+        let err = ClapInstance::from_spec(&spec, 48_000).err().expect("refused");
+        assert!(err.contains("refusing"), "{err}");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn discovers_test_plugins() {
         let Some(p) = testplug("libdaw_clap_testplug_gain.so") else { return };
         let dir = p.parent().unwrap();
@@ -550,6 +881,18 @@ mod tests {
             let tone = found.iter().find(|d| d.id == "test.tone").expect("test.tone found");
             assert!(tone.is_instrument);
         }
+    }
+
+    #[test]
+    fn handle_reads_param_value() {
+        let Some(p) = testplug("libdaw_clap_testplug_gain.so") else { return };
+        let mut inst = ClapInstance::load(p.to_str().unwrap(), "test.gain", 48_000, 256).expect("load test.gain");
+        let id = inst.handle.param_infos.iter().find(|i| i.name == "Gain").expect("Gain").id;
+        assert_eq!(inst.handle.param_value(id), Some(1.0));
+        assert_eq!(inst.handle.value_to_text(id, 1.5).as_deref(), Some("1.50"));
+        assert_eq!(inst.handle.text_to_value(id, "0.25"), Some(0.25));
+        assert_eq!(inst.handle.text_to_value(id, "loud"), None, "unparseable text");
+        inst.shutdown();
     }
 
     #[test]
@@ -565,9 +908,9 @@ mod tests {
             .expect("Gain param listed")
             .clone();
         assert_eq!(gi.default, 1.0);
-        assert_eq!(parameter_updates(&[(gi.id, 2.0)], &[], &[gi.clone()]), vec![(gi.id, 1.0)]);
-        assert!(parameter_updates(&[(gi.id, 2.0)], &[(gi.id, 2.0)], &[gi.clone()]).is_empty());
-        assert_eq!(parameter_updates(&[(gi.id, 1.0)], &[(gi.id, 2.0)], &[gi.clone()]), vec![(gi.id, 2.0)]);
+        assert_eq!(parameter_updates(&[(gi.id, 2.0)], &[], std::slice::from_ref(&gi)), vec![(gi.id, 1.0)]);
+        assert!(parameter_updates(&[(gi.id, 2.0)], &[(gi.id, 2.0)], std::slice::from_ref(&gi)).is_empty());
+        assert_eq!(parameter_updates(&[(gi.id, 1.0)], &[(gi.id, 2.0)], std::slice::from_ref(&gi)), vec![(gi.id, 2.0)]);
 
         let proc_ = inst.processor.as_mut().unwrap();
         let (mut l, mut r) = (vec![0.5f32; 64], vec![0.5f32; 64]);

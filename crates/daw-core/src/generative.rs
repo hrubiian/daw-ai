@@ -28,7 +28,7 @@ pub fn euclidean(pulses: usize, steps: usize, rotation: usize) -> Vec<u8> {
         }
     }
 
-    if rotation % steps != 0 {
+    if !rotation.is_multiple_of(steps) {
         out.rotate_left(rotation % steps);
     }
     out

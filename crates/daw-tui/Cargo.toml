@@ -12,3 +12,6 @@ crossterm           = { version = "0.28", features = ["event-stream"] }
 anyhow              = "1"
 crossbeam-channel   = "0.5"
 rustfft             = "6"
+
+[lints]
+workspace = true

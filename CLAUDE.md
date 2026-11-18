@@ -4,13 +4,20 @@ An LLM-native DAW built in Rust (formerly daw-cli). Open-source, keyboard-driven
 
 ## Architecture
 
-Cargo workspace: `crates/daw-core` (audio + sequencer + project format, no TUI deps) and `crates/daw-tui` (ratatui frontend).
+Cargo workspace:
+
+- `crates/daw-core` — audio engine, mixer, sequencer, project format, analysis (no UI or device-I/O deps)
+- `crates/daw-io` — host glue: audio/MIDI devices, capture, guitar monitor, user config
+- `crates/daw-gpui` — desktop GUI (gpui)
+- `crates/daw-tui` — terminal UI (ratatui)
+- `crates/daw-mcp` — stdio MCP server for agents
+- `crates/daw-clap-testplug-*` — CLAP plugins used only as test fixtures
 
 **Do not add TUI or I/O dependencies to `daw-core`.** The compiler enforces this.
 
 ## Running
 
-Download `assets/GeneralUser.sf2` (free GM soundfont) before first run.
+Run `./fetch-assets.sh` (or put any GM soundfont at `assets/GeneralUser.sf2`) before first run.
 
 ```bash
 cargo run                          # new project (TUI)
@@ -30,10 +37,32 @@ project file (granular edit tools + `listen` rendering/analysis). `.mcp.json`
 registers it for Claude Code sessions in this repo; combine with the GUI's
 JAM mode for live round-trips.
 
+Beyond `listen`, the server exposes perceptual "ears" and Music-CI tools —
+`analyze_mix`, `analyze_arrangement`, `analyze_groove`, `diff_project`,
+`snapshot`/`check`. See `docs/analysis-and-ci.md` for which tool to reach for.
+
+Sound design from words runs on Surge XT (free CLAP synth, `surge-xt` deb):
+`find_patches` → `load_patch` → `describe_sound` → `shape_sound` →
+`audition_sound`, plus `print_sound` and `sound_history`/`revert_sound`
+(see "Designing sounds" in `docs/analysis-and-ci.md`).
+
+## Shared sessions and verification
+
+Use `target/debug/daw-mcp --list-sessions`, then explicitly select a running
+session with `--session <socket>`. Read the current revision before edits;
+validated batches are one shared undo step. A failed live connection must not
+silently fall back to file editing. File-based MCP remains available offline.
+See [Live collaboration](docs/live-collaboration.md) for the protocol and limits.
+
+Set `DAW_REQUIRE_TEST_ASSETS=1` for soundfont-required checks. FFmpeg with
+libmp3lame is required for MP3 tests/export. Diagnostics do not establish musical
+quality; use the musician's own listening feedback and ratings.
+
 ## Testing
 
 ```bash
 cargo test --workspace            # unit tests
+bash scripts/check.sh             # build, MCP protocol check, tests, clippy (as CI)
 cargo test -p daw-core smoke_plays_note -- --ignored --nocapture  # audio smoke test (needs speakers)
 ```
 
@@ -58,17 +87,3 @@ Projects are `.daw.json` files. Fully human- and LLM-editable. See `docs/project
 | `+` / `-` | BPM up / down |
 | `Ctrl+S` | Save project |
 | `q` | Quit (auto-saves) |
-
-
-## Shared sessions and verification
-
-Use `target/debug/daw-mcp --list-sessions`, then explicitly select a running
-session with `--session <socket>`. Read the current revision before edits;
-validated batches are one shared undo step. A failed live connection must not
-silently fall back to file editing. File-based MCP remains available offline.
-See [Live collaboration](docs/live-collaboration.md) for the protocol and limits.
-
-Run `bash scripts/check.sh` for the workspace build, MCP wire checks, tests and
-Clippy. Set `DAW_REQUIRE_TEST_ASSETS=1` for soundfont-required checks. FFmpeg with
-libmp3lame is required for MP3 tests/export. Diagnostics do not establish musical
-quality; use the musician's own listening feedback and ratings.

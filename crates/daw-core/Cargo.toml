@@ -14,8 +14,11 @@ rustysynth     = "1"
 anyhow         = "1"
 hound          = "3"
 clack-host       = "0.1"
-clack-extensions = { version = "0.1", features = ["clack-host", "audio-ports", "params", "state", "note-ports"] }
+clack-extensions = { version = "0.1", features = ["clack-host", "audio-ports", "params", "state", "note-ports", "gui", "timer"] }
 base64           = "0.22"
 rustfft        = "6"
 
 sha2 = "0.10"
+
+[lints]
+workspace = true

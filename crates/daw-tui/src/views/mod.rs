@@ -104,6 +104,9 @@ fn render_transport(frame: &mut Frame, app: &App, area: ratatui::layout::Rect) {
     if app.is_recording {
         spans.push(Span::styled("  [REC]", Style::default().fg(Color::Red).add_modifier(Modifier::BOLD)));
     }
+    if !app.rec_status.is_empty() {
+        spans.push(Span::styled(format!("  {}", app.rec_status), Style::default().fg(Color::Red)));
+    }
     if app.live_play {
         spans.push(Span::styled("  [LIVE]", Style::default().fg(Color::Green).add_modifier(Modifier::BOLD)));
     }

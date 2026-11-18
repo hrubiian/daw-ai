@@ -5,12 +5,14 @@ mod arrangement;
 mod browser;
 mod editors;
 mod effects;
+mod guitar;
+mod inputs;
 mod mixing;
 mod menus;
 mod window_frame;
 mod layout;
 
-use crate::state::{DockTab, HeadlessState, RenameTarget};
+use crate::state::{AudioDragKind, DockTab, HeadlessState, RenameTarget};
 use daw_core::project::Project;
 use daw_core::sequencer::SequencerCommand;
 use daw_io::Host;
@@ -107,6 +109,34 @@ pub struct DawView {
     waveform_failed: std::collections::HashSet<PathBuf>,
     close_confirmation: bool,
     close_after_save: bool,
+    /// What the unsaved-changes dialog guards: closing, New or Load.
+    confirm_then: ConfirmThen,
+    /// Engine failure last drawn beside the status line.
+    engine_error_shown: Option<String>,
+    /// External file state already reported by JAM (conflict or parse error),
+    /// so a broken or conflicting file is announced once, not every tick.
+    jam_reported: Option<(Option<std::time::SystemTime>, JamIssue)>,
+    /// Track an audio take was started on; the finished take lands there
+    /// even if another track was selected while it recorded.
+    rec_track: Option<String>,
+    armed_track: Option<String>,
+    armed_input: Option<daw_core::project::TrackInput>,
+    capture_guitar: bool,
+    audio_take_active: bool,
+    audio_take_finishing: bool,
+    input_track: Option<String>,
+    /// Whether the playhead was inside the visible timeline last frame
+    /// (page-follow only when playback carries it out of view).
+    playhead_was_visible: bool,
+    /// Latency text last drawn on the Amp button (repaint only when it changes).
+    amp_readout_shown: Option<String>,
+    ampforge_save_at: Option<std::time::Instant>,
+    /// Set by the cabinet-IR file dialog; drained in pump().
+    ir_pick: std::sync::Arc<std::sync::Mutex<Option<(bool, std::path::PathBuf)>>>,
+    cabinet_export_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
+    guitar_window: Option<gpui::WindowHandle<guitar::GuitarWindow>>,
+    /// Cached unsaved-changes flag for the title pill: (when computed, value).
+    dirty_shown: std::cell::Cell<(Option<std::time::Instant>, bool)>,
     piano_scroll: gpui::ScrollHandle,
     mix_scroll: gpui::ScrollHandle,
     mix_vertical_scroll: gpui::ScrollHandle,
@@ -155,6 +185,23 @@ impl DawView {
             waveform_failed: Default::default(),
             close_confirmation: false,
             close_after_save: false,
+            confirm_then: ConfirmThen::Close,
+            engine_error_shown: None,
+            jam_reported: None,
+            rec_track: None,
+            armed_track: None,
+            armed_input: None,
+            capture_guitar: false,
+            audio_take_active: false,
+            audio_take_finishing: false,
+            input_track: None,
+            playhead_was_visible: true,
+            ir_pick: Default::default(),
+            cabinet_export_result: Default::default(),
+            guitar_window: None,
+            amp_readout_shown: None,
+            ampforge_save_at: None,
+            dirty_shown: Default::default(),
             piano_scroll: gpui::ScrollHandle::new(),
             mix_scroll: gpui::ScrollHandle::new(),
             mix_vertical_scroll: gpui::ScrollHandle::new(),
@@ -184,10 +231,7 @@ impl DawView {
     fn send_command(&self, command: SequencerCommand) -> Result<(), String> {
         if let Some(session) = &self.host.session {
             if daw_io::session::is_project_edit(&command) {
-                session.submit(&self.st.project).map_err(|e| {
-                    let text = e.to_string();
-                    *self.host.engine_error.lock().unwrap() = Some(text.clone()); text
-                })?;
+                session.submit(&self.st.project).map_err(|e| e.to_string())?;
                 // Solo is a local audition mask, separate from the saved mute.
                 if !matches!(command, SequencerCommand::SetTrackMute { .. }) { return Ok(()); }
             }
@@ -199,14 +243,11 @@ impl DawView {
         if let Some(session) = &self.host.session {
             match session.reconcile(&mut self.st.project) {
                 Ok(backup) => {
-                    self.st.selected_track = self.st.project.tracks.first().map(|t| t.id.clone());
+                    self.st.reconcile_selection();
+                    self.sync_midi_strip();
                     self.st.peaks_cache.clear();
                     self.st.peaks_dur_cache.clear();
                     self.waveform_failed.clear();
-                    // Clear a frontend conflict diagnostic, preserving engine failures.
-                    if let Ok(mut error) = self.host.engine_error.lock() {
-                        if error.as_ref().is_some_and(|e| e.contains("revision_conflict")) { *error = None; }
-                    }
                     self.st.set_status(backup.map(|p| format!("session refreshed; local copy: {}", p.display())).unwrap_or_else(|| "session synchronized".into()));
                 }
                 Err(e) => self.st.set_status(format!("sync failed; local work retained: {e}")),
@@ -285,10 +326,17 @@ impl DawView {
     /// Send the whole project to the engine as a cycle-quantized live edit.
     fn push_live(&self) {
         if let Some(session) = &self.host.session {
-            if let Err(e) = session.submit(&self.st.project) { *self.host.engine_error.lock().unwrap() = Some(e.to_string()); }
-            return;
+            // A rejected submit leaves the local project differing from the
+            // session; the session poll in `pump` reports it every 50 ms.
+            let _ = session.submit(&self.st.project);
+        } else {
+            let _ = self.send_command(SequencerCommand::UpdateLive(self.st.project.clone()));
         }
-        let _ = self.send_command(SequencerCommand::UpdateLive(self.st.project.clone()));
+        // A structural edit rebuilds the strips from the saved mute flags;
+        // re-apply the local solo mask so a lit S keeps meaning what it shows.
+        if !self.st.soloed.is_empty() {
+            for t in &self.st.project.tracks { self.push_mute(&t.id); }
+        }
     }
 
     /// The single funnel for project mutations: record an undo snapshot,
@@ -303,12 +351,16 @@ impl DawView {
     fn undo(&mut self) {
         if let Some(session) = &self.host.session {
             let result = session.history(false, &mut self.st.project);
+            self.st.reconcile_selection();
+            self.sync_midi_strip();
             self.st.set_status(match result { Ok(()) => "undo: shared session".into(), Err(e) => e.to_string() });
             return;
         }
         match self.undo.undo(self.st.project.clone()) {
             Some((label, snap)) => {
                 self.st.project = snap;
+                self.st.reconcile_selection();
+                self.sync_midi_strip();
                 self.push_live();
                 self.st.set_status(format!("undid: {label}"));
             }
@@ -319,12 +371,16 @@ impl DawView {
     fn redo(&mut self) {
         if let Some(session) = &self.host.session {
             let result = session.history(true, &mut self.st.project);
+            self.st.reconcile_selection();
+            self.sync_midi_strip();
             self.st.set_status(match result { Ok(()) => "redo: shared session".into(), Err(e) => e.to_string() });
             return;
         }
         match self.undo.redo(self.st.project.clone()) {
             Some((label, snap)) => {
                 self.st.project = snap;
+                self.st.reconcile_selection();
+                self.sync_midi_strip();
                 self.push_live();
                 self.st.set_status(format!("redid: {label}"));
             }
@@ -374,8 +430,10 @@ impl DawView {
     }
 
     fn remove_track(&mut self, id: &str) {
-        self.undo.record("remove track", &self.st.project);
+        let before = self.st.project.clone();
         if self.st.project.remove_track(id) {
+            self.undo.record("remove track", &before);
+            self.st.soloed.remove(id);
             // Fix selection if we removed the selected track.
             if self.st.selected_track.as_deref() == Some(id) {
                 let first = self.st.project.tracks.first().map(|t| t.id.clone());
@@ -557,6 +615,9 @@ impl DawView {
             self.st.set_status("select a track first".to_string());
             return;
         };
+        if !self.st.confirm_clap_instrument(&tid, &desc_path, &desc_id, std::time::Instant::now()) {
+            return;
+        }
         self.undo.record("clap instrument", &self.st.project);
         if self
             .st
@@ -748,21 +809,81 @@ impl DawView {
         });
     }
 
+    /// `is_dirty` for the title pill, refreshed at most four times a second.
+    /// The exact check serializes and hashes the whole project, which is too
+    /// much to do on every painted frame of a large song.
+    fn is_dirty_for_display(&self) -> bool {
+        let (at, dirty) = self.dirty_shown.get();
+        if at.is_some_and(|t| t.elapsed() < std::time::Duration::from_millis(250)) { return dirty; }
+        let dirty = self.is_dirty();
+        self.dirty_shown.set((Some(std::time::Instant::now()), dirty));
+        dirty
+    }
+
     fn is_dirty(&self) -> bool {
         daw_core::project::format::project_revision(&self.st.project).map_or(true, |hash| hash != self.st.saved_hash)
     }
 
     fn confirm_close(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let _ = self.save_ampforge_state();
         if self.st.renaming.is_some() { self.commit_rename(); }
         if self.midi_recording || self.audio_rec.phase != daw_core::audio::input::RecordPhase::Idle {
             self.stop();
         }
         if !self.is_dirty() { return true; }
+        self.confirm_then = ConfirmThen::Close;
         self.close_confirmation = true;
         self.st.open_menu = None;
         self.root_focus.focus(window);
         cx.notify();
         false
+    }
+
+    /// New / Open replace the whole project: ask first when there is unsaved work.
+    pub(crate) fn request_replace(&mut self, then: ConfirmThen, window: &mut Window) {
+        if self.st.renaming.is_some() { self.commit_rename(); }
+        if !self.is_dirty() {
+            self.replace_project(then);
+            return;
+        }
+        self.confirm_then = then;
+        self.close_confirmation = true;
+        self.root_focus.focus(window);
+    }
+
+    /// Carry out a confirmed New / Open.
+    pub(crate) fn replace_project(&mut self, then: ConfirmThen) {
+        match then {
+            ConfirmThen::New => self.new_project(),
+            ConfirmThen::Open => self.open_dialog(),
+            ConfirmThen::Close => {}
+        }
+    }
+
+    fn new_project(&mut self) {
+        if self.playing || self.midi_recording { self.stop(); }
+        self.undo.record("new project", &self.st.project);
+        self.st.project = daw_core::project::Project::default_project();
+        self.st.project_path = None;
+        self.st.file_revision = None;
+        // An untouched new project is not "unsaved work".
+        self.st.saved_hash = daw_core::project::format::project_revision(&self.st.project).unwrap_or_default();
+        self.st.project_mtime = None;
+        self.st.soloed.clear();
+        self.st.track_heights.clear();
+        self.st.selected_return = None;
+        self.st.arrange_scroll_x = 0.;
+        self.st.arrange_scroll_y = 0.;
+        self.st.peaks_cache.clear();
+        self.st.peaks_dur_cache.clear();
+        self.waveform_failed.clear();
+        self.jam_reported = None;
+        if let Some(id) = self.st.project.tracks.first().map(|t| t.id.clone()) {
+            self.st.select_track(&id);
+        }
+        self.sync_midi_strip();
+        self.push_live();
+        self.st.set_status("new project — Save As to name it");
     }
 
     fn save_project(&mut self) {
@@ -918,9 +1039,10 @@ impl DawView {
     fn load_project(&mut self, path: std::path::PathBuf) {
         match daw_core::project::format::load(&path) {
             Ok(project) => {
-                // Undoable like JAM reload: Ctrl+Z returns to the prior
-                // in-memory project after opening a file.
-                self.undo.record("load project", &self.st.project);
+                // A loaded file is a new document with its own history. Keeping
+                // the old steps let Ctrl+Z put the previous song under the new
+                // file's path, where Ctrl+S would overwrite the wrong file.
+                self.undo = daw_core::undo::UndoStack::new();
                 if let Some(session) = &self.host.session {
                     if let Err(e) = session.import(&project, &path) { self.st.set_status(e.to_string()); return; }
                     if let Err(e) = session.transport(daw_core::session::Command::Stop) { self.st.set_status(e.to_string()); return; }
@@ -928,7 +1050,16 @@ impl DawView {
                     let _ = self.send_command(SequencerCommand::LoadProject(project.clone()));
                 }
                 self.playing = false;
-                self.st = HeadlessState::from_project(project, Some(path.clone()));
+                // Keep the musician's workspace (layout, zoom, JAM, accent).
+                let old = std::mem::replace(&mut self.st, HeadlessState::from_project(project, Some(path.clone())));
+                self.st.browser_w = old.browser_w; self.st.mixer_w = old.mixer_w; self.st.dock_h = old.dock_h;
+                self.st.browser_open = old.browser_open; self.st.mixer_open = old.mixer_open;
+                self.st.arrange_zoom = old.arrange_zoom; self.st.arrange_full = old.arrange_full;
+                self.st.accent_idx = old.accent_idx; self.st.jam_mode = old.jam_mode;
+                self.st.active_dock = old.active_dock; self.st.browser_category = old.browser_category;
+                self.st.clap_plugins = old.clap_plugins;
+                self.jam_reported = None;
+                self.sync_midi_strip();
                 self.waveform_failed.clear();
                 self.st.set_status(format!("loaded {}", path.display()));
             }
@@ -942,25 +1073,33 @@ impl DawView {
     /// stays responsive without forcing a redraw. Returns `true` when something
     /// changed that the view should be repainted to reflect.
     fn pump(&mut self) -> bool {
-        let mut changed = false;
+        let mut changed = self.pump_ampforge();
         if let Some(session) = &self.host.session {
             if self.last_session_poll.elapsed() >= std::time::Duration::from_millis(50) {
             self.last_session_poll = std::time::Instant::now();
             match session.sync(&mut self.st.project) {
                 Ok(updated) => {
                     changed |= updated;
-                    if updated { self.st.selected_track = self.st.project.tracks.first().map(|t| t.id.clone()); }
+                    // An agent's edit must not yank the musician's selection
+                    // back to the first track; only repair what vanished.
+                    if updated { self.st.reconcile_selection(); self.sync_midi_strip(); }
                 }
-                Err(e) => { let text = e.to_string(); changed |= self.st.status != text; self.st.set_status(text); }
+                Err(e) => {
+                    let text = format!("{e} — press Sync session to accept the shared version");
+                    changed |= self.st.status != text; self.st.set_status(text);
+                }
             }
             }
             let playing = session.playing();
             changed |= self.playing != playing;
             self.playing = playing;
         }
-        if let Some(error) = self.host.engine_error.lock().ok().and_then(|e| e.clone()) {
-            changed |= self.st.status != error;
-            self.st.set_status(error);
+        // Engine failures are shown beside the status line (see `render`),
+        // not written over it, so later feedback (saved, exported…) stays visible.
+        let engine_error = self.host.engine_error.lock().ok().and_then(|e| e.clone());
+        if engine_error != self.engine_error_shown {
+            self.engine_error_shown = engine_error;
+            changed = true;
         }
 
         if let Some((devices, ports)) = self.input_scan.lock().ok().and_then(|mut slot| slot.take()) {
@@ -1013,16 +1152,18 @@ impl DawView {
                 .and_then(|tid| self.st.project.tracks.iter().find(|t| &t.id == tid))
                 .map(|t| t.track_type == daw_core::project::TrackType::Audio)
                 .unwrap_or(false);
-            self.undo.record("import sample", &self.st.project);
-            let tid = if is_audio {
-                self.st.selected_track.clone().unwrap()
-            } else {
-                let id = self.st.project.add_track(daw_core::project::TrackType::Audio);
-                self.st.selected_track = Some(id.clone());
-                id
-            };
             match daw_core::audio::wav_duration_sec(&path) {
                 Ok(dur) => {
+                    // Only now touch the project: an unreadable file must not
+                    // leave an empty track and an undo step behind.
+                    self.undo.record("import sample", &self.st.project);
+                    let tid = if is_audio {
+                        self.st.selected_track.clone().unwrap()
+                    } else {
+                        let id = self.st.project.add_track(daw_core::project::TrackType::Audio);
+                        self.st.select_track(&id);
+                        id
+                    };
                     let start = self.st.playhead_seconds();
                     self.st.project.add_audio_clip(&tid, &path_str, start, dur);
                     self.push_live();
@@ -1177,19 +1318,37 @@ impl DawView {
                     let first_observation = self.st.project_mtime.is_none();
                     if first_observation { self.st.project_mtime = mtime; }
                     if !first_observation {
-                        if daw_core::project::format::project_revision(&self.st.project).ok().as_deref() != Some(self.st.saved_hash.as_str()) {
-                            self.st.set_status("JAM conflict: external edit detected; save local work to a new file before loading it");
-                            return true;
-                        }
-                        if let Ok((p, revision)) = daw_core::project::format::load_versioned(&path) {
-                            self.st.project_mtime = mtime;
-                            self.st.file_revision = Some(revision);
-                            self.st.saved_hash = daw_core::project::format::project_revision(&p).unwrap_or_default();
-                            // External edits (LLM/scripts) are undoable in-app.
-                            self.undo.record("JAM reload", &self.st.project);
-                            self.st.project = p;
-                            self.push_live();
-                            self.st.set_status(format!("JAM reloaded {}", path.display()));
+                        let dirty = daw_core::project::format::project_revision(&self.st.project).ok().as_deref() != Some(self.st.saved_hash.as_str());
+                        if dirty {
+                            // Report once per external write and keep polling the
+                            // rest of the app (export results, recording).
+                            if self.jam_reported != Some((mtime, JamIssue::Conflict)) {
+                                self.jam_reported = Some((mtime, JamIssue::Conflict));
+                                self.st.set_status("JAM conflict: the file changed on disk while you have unsaved edits — Save As to keep yours, or undo them to load the new version");
+                                changed = true;
+                            }
+                        } else if self.jam_reported != Some((mtime, JamIssue::Unreadable)) {
+                            match daw_core::project::format::load_versioned(&path) {
+                                Ok((p, revision)) => {
+                                    self.st.project_mtime = mtime;
+                                    self.jam_reported = None;
+                                    self.st.file_revision = Some(revision);
+                                    self.st.saved_hash = daw_core::project::format::project_revision(&p).unwrap_or_default();
+                                    // External edits (LLM/scripts) are undoable in-app.
+                                    self.undo.record("JAM reload", &self.st.project);
+                                    self.st.project = p;
+                                    self.st.reconcile_selection();
+                                    self.sync_midi_strip();
+                                    self.push_live();
+                                    self.st.set_status(format!("JAM reloaded {}", path.display()));
+                                }
+                                // A half-written or invalid file: say why once and
+                                // keep the sounding project; the next write retries.
+                                Err(e) => {
+                                    self.jam_reported = Some((mtime, JamIssue::Unreadable));
+                                    self.st.set_status(format!("JAM: file not loaded, keeping current project — {e}"));
+                                }
+                            }
                             changed = true;
                         }
                     }
@@ -1208,6 +1367,19 @@ impl DawView {
 
         // 4. Audio recording: roll-tick latch, finished takes, live meter.
         changed |= self.poll_recording();
+
+        // 5. Guitar amp: a picked cabinet IR; live latency readout while on.
+        changed |= self.poll_cabinet_ir();
+        if let Some(message) = self.cabinet_export_result.lock().ok().and_then(|mut slot| slot.take()) {
+            self.st.set_status(message);
+            changed = true;
+        }
+        if let Some(readout) = self.monitor_readout() {
+            if self.amp_readout_shown.as_deref() != Some(readout.as_str()) || self.st.open_menu.is_some() {
+                self.amp_readout_shown = Some(readout);
+                changed = true;
+            }
+        } else if self.amp_readout_shown.take().is_some() { changed = true; }
 
         changed
     }
@@ -1247,6 +1419,14 @@ fn waveform_columns(peaks: &[f32], start_frac: f64, end_frac: f64, cols: usize) 
     }).collect()
 }
 
+/// Why JAM did not load an external write of the project file.
+#[derive(Clone, Copy, PartialEq, Eq)]
+enum JamIssue { Conflict, Unreadable }
+
+/// The action waiting behind the unsaved-changes dialog.
+#[derive(Clone, Copy, PartialEq, Eq, Debug)]
+pub(crate) enum ConfirmThen { Close, New, Open }
+
 /// Top menu-bar dropdown identity.
 #[derive(Clone, Copy, PartialEq, Eq)]
 pub enum TopMenu { File, Settings }
@@ -1266,11 +1446,27 @@ struct ResizeDrag(Splitter);
 /// Mark rects (x, y, w, h in px) previewing `pattern` inside a clip that is
 /// `clip_w`×`clip_h` px and covers `span_ticks` of timeline; the pattern
 /// loops at its natural period. Capped at 256 marks.
+#[cfg(test)]
 fn clip_preview_marks(
     pattern: &daw_core::project::Pattern,
     clip_w: f32,
     clip_h: f32,
     span_ticks: u32,
+) -> Vec<(f32, f32, f32, f32)> {
+    clip_preview_marks_in(pattern, clip_w, clip_h, span_ticks, 0.0, clip_w)
+}
+
+/// As `clip_preview_marks`, keeping only marks that overlap the clip-local
+/// x-range `[vis_lo, vis_hi]` (the part of the clip on screen). A song-long
+/// clip then draws the notes in view instead of spending its 256-mark budget
+/// on bars scrolled far off screen.
+fn clip_preview_marks_in(
+    pattern: &daw_core::project::Pattern,
+    clip_w: f32,
+    clip_h: f32,
+    span_ticks: u32,
+    vis_lo: f32,
+    vis_hi: f32,
 ) -> Vec<(f32, f32, f32, f32)> {
     use daw_core::project::Pattern;
     const CAP: usize = 256;
@@ -1299,6 +1495,7 @@ fn clip_preview_marks(
                         continue;
                     }
                     let w = (n.duration as f32 * ppt).max(1.5).min(clip_w - x);
+                    if x + w < vis_lo || x > vis_hi { continue; }
                     let y = 1.0 + usable * (1.0 - (n.pitch as f32 - lo) / range);
                     out.push((x, y, w, mark_h));
                 }
@@ -1323,6 +1520,7 @@ fn clip_preview_marks(
                             continue;
                         }
                         let w = (15.0 * ppt).clamp(2.0, 6.0).min(clip_w - x);
+                        if x + w < vis_lo || x > vis_hi { continue; }
                         let y = 1.0 + ri as f32 * row_h;
                         out.push((x, y, w, mark_h));
                     }
@@ -1451,6 +1649,20 @@ impl Render for DawView {
         let timeline_width = self.timeline_width(window);
         self.st.arrange_scroll_x = self.st.arrange_scroll_x.clamp(0.,
             (self.st.project.song_bars() as f32 * self.bar_w() - timeline_width).max(0.));
+        // Page-follow: when playback carries the playhead out of the visible
+        // timeline, bring it back one bar from the left edge. A playhead the
+        // musician scrolled away from is left alone until it re-enters view.
+        {
+            let bw = self.bar_w();
+            let x = self.st.playhead() as f32 / daw_core::sequencer::TICKS_PER_BAR as f32 * bw;
+            let max_x = (self.st.project.song_bars() as f32 * bw - timeline_width).max(0.);
+            let mut visible = x >= self.st.arrange_scroll_x && x <= self.st.arrange_scroll_x + timeline_width;
+            if self.playing && !visible && self.playhead_was_visible {
+                self.st.arrange_scroll_x = (x - bw).clamp(0., max_x);
+                visible = true;
+            }
+            self.playhead_was_visible = visible;
+        }
         // Re-clamp vertical track scroll so a window resize, dock drag, or removed
         // track can never leave the view scrolled past the last track.
         let max_scroll_y = self.tracks_max_scroll_y(window_frame::content_height(window));
@@ -1465,12 +1677,16 @@ impl Render for DawView {
         let bar = tick / daw_core::sequencer::TICKS_PER_BAR + 1;
         let beat = (tick % daw_core::sequencer::TICKS_PER_BAR) / daw_core::sequencer::TICKS_PER_BEAT + 1;
         let live_status = self.host.session.as_ref().map(|s| s.status_line());
-        let status_text = if self.st.status.is_empty() && live_status.is_some() {
-            live_status.unwrap()
-        } else if self.st.status.is_empty() {
-            "Select a clip to edit · Wheel: timeline scroll · Ctrl+wheel: zoom · Shift+wheel: tracks".to_string()
+        let engine_error = self.engine_error_shown.clone();
+        let status_text = if self.st.status.is_empty() {
+            live_status.unwrap_or_else(|| "Select a clip to edit · Wheel: timeline scroll · Ctrl+wheel: zoom · Shift+wheel: tracks".to_string())
         } else {
             live_status.map(|s| format!("{} · {s}", self.st.status)).unwrap_or_else(|| self.st.status.clone())
+        };
+        // The live status line already carries the engine failure.
+        let status_text = match engine_error {
+            Some(error) if self.host.session.is_none() => format!("⚠ {error} · {status_text}"),
+            _ => status_text,
         };
 
         let transport = div()
@@ -1518,7 +1734,9 @@ impl Render for DawView {
             .child({
                 use daw_core::audio::input::RecordPhase;
                 let audio_sel = self.selected_track_is_audio();
-                let (label, bg, fg) = if audio_sel {
+                let (label, bg, fg) = if self.audio_take_active && self.audio_rec.phase != RecordPhase::AwaitingRoll {
+                    ("⏺ REC", RECORD, BG)
+                } else if audio_sel {
                     match self.audio_rec.phase {
                         RecordPhase::Idle => ("⏺ Rec", PANEL_ALT, TEXT),
                         RecordPhase::Armed => ("⏺ Armed", METER_WARN, BG),
@@ -1538,6 +1756,8 @@ impl Render for DawView {
                     }))
             })
             .children(self.input_meter())
+            .child(self.amp_pill(cx))
+            .child(self.amp_setup_button(cx))
             .child(
                 div()
                     .flex()
@@ -1569,7 +1789,7 @@ impl Render for DawView {
                     .gap_2()
                     .child(div().text_color(rgb(TEXT_DIM)).child(format!("{bar}.{beat}  ·  tick {tick}")))
                     .child(self.viz_meter())
-                    .child(pill(format!("{}{}", self.project_name(), if self.is_dirty() { " · unsaved" } else { "" }), PANEL_ALT, TEXT))
+                    .child(pill(format!("{}{}", self.project_name(), if self.is_dirty_for_display() { " · unsaved" } else { "" }), PANEL_ALT, TEXT))
                     .child(pill(if self.st.jam_mode { "JAM ●" } else { "JAM" }, PANEL_ALT,
                                 if self.st.jam_mode { accent } else { TEXT }).id("jam").cursor_pointer()
                         .on_click(cx.listener(|this, _e, _w, cx| { this.st.toggle_jam(); cx.notify(); })))
@@ -1720,6 +1940,7 @@ impl Render for DawView {
         let overlay = self.menu_overlay(cx);
         let fx_overlay = self.audio_effects_overlay(cx);
         let close_overlay = self.close_overlay(cx);
+        let input_overlay = self.track_input_overlay(cx);
 
         let content = div()
             .size_full()
@@ -1732,10 +1953,16 @@ impl Render for DawView {
                 this.root_focus.focus(w);
             }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                if this.input_track.is_some() {
+                    if ev.keystroke.key == "escape" { this.input_track = None; cx.notify(); }
+                    cx.stop_propagation();
+                    return;
+                }
                 if this.close_confirmation {
                     if ev.keystroke.key == "escape" {
                         this.close_confirmation = false;
                         this.close_after_save = false;
+                        this.confirm_then = ConfirmThen::Close;
                         cx.notify();
                     }
                     cx.stop_propagation();
@@ -1760,10 +1987,13 @@ impl Render for DawView {
                 let m = &ev.keystroke.modifiers;
                 if ev.keystroke.key == "space" && !m.control { this.toggle_play(); cx.notify(); return; }
                 if m.control && ev.keystroke.key == "s" { this.save_project(); cx.notify(); return; }
+                if ev.keystroke.key == "home" && !m.control { this.seek_to_bar(0); cx.notify(); return; }
                 if !m.control {
                     return;
                 }
                 match ev.keystroke.key.as_str() {
+                    "n" => { this.request_replace(ConfirmThen::New, w); cx.notify(); }
+                    "o" => { this.request_replace(ConfirmThen::Open, w); cx.notify(); }
                     "z" if m.shift => { this.redo(); cx.notify(); }
                     "z" => { this.undo(); cx.notify(); }
                     "y" => { this.redo(); cx.notify(); }
@@ -1778,6 +2008,7 @@ impl Render for DawView {
             .child(main_row)
             .children(fx_overlay)
             .children(overlay)
+            .children(input_overlay)
             .children(close_overlay);
         window_frame::frame(content, window, cx.listener(|this, _, w, cx| {
             if this.confirm_close(w, cx) { w.remove_window(); }
@@ -1861,7 +2092,19 @@ pub fn run(host: Host, project: Project, path: Option<PathBuf>, sf2_path: String
                                 last_tick = tick;
                                 repaint = true;
                             }
-                            let close = v.close_after_save && !v.is_dirty();
+                            // "Save & …" finished: close, or carry out New / Open.
+                            let mut close = false;
+                            if v.close_after_save && !v.is_dirty() {
+                                v.close_after_save = false;
+                                match std::mem::replace(&mut v.confirm_then, ConfirmThen::Close) {
+                                    ConfirmThen::Close => close = true,
+                                    then => {
+                                        v.close_confirmation = false;
+                                        v.replace_project(then);
+                                        repaint = true;
+                                    }
+                                }
+                            }
                             if v.playing || repaint {
                                 cx.notify();
                             }
@@ -2143,6 +2386,112 @@ mod tests {
             let daw_core::project::Pattern::PianoRoll(pattern) = pattern else { panic!("piano pattern") };
             assert!(pattern.notes.is_empty(), "remove the original tick 62 rather than create a snapped duplicate");
         });
+    }
+
+    #[gpui::test]
+    fn new_asks_before_discarding_unsaved_work_and_load_starts_fresh_history(cx: &mut gpui::TestAppContext) {
+        let (host, _commands, _audio) = Host::headless();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut v = DawView::new(host, Project::default_project(), None, String::new(), cx);
+            v.sf2_missing = false;
+            v.root_focus.focus(window);
+            v
+        });
+        // Clean project: New proceeds at once and is not itself "unsaved".
+        cx.update(|window, cx| view.update(cx, |v, _| {
+            v.request_replace(ConfirmThen::New, window);
+            assert!(!v.close_confirmation);
+            assert!(!v.is_dirty(), "an untouched new project has nothing to save");
+        }));
+        // Dirty project: New waits behind the dialog; Escape keeps the work.
+        cx.update(|window, cx| view.update(cx, |v, _| {
+            v.st.project.project.bpm = 97.;
+            v.request_replace(ConfirmThen::New, window);
+            assert!(v.close_confirmation);
+            assert_eq!(v.confirm_then, ConfirmThen::New);
+            assert_eq!(v.st.project.project.bpm, 97.);
+        }));
+        cx.run_until_parked();
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |v, _| {
+            assert!(!v.close_confirmation);
+            assert_eq!(v.confirm_then, ConfirmThen::Close);
+            assert_eq!(v.st.project.project.bpm, 97.);
+        });
+        // Opening a file drops the previous song's undo steps, so Ctrl+Z can
+        // never put the old song under the new file's path.
+        let dir = std::env::temp_dir().join(format!("daw-gui-load-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("other.daw.json");
+        let mut other = Project::default_project();
+        other.project.bpm = 141.;
+        daw_core::project::format::save_if_unchanged(&other, &path, None).unwrap();
+        view.update(cx, |v, _| {
+            v.st.browser_w = 333.;
+            v.undo.record("edit", &v.st.project.clone());
+            v.load_project(path.clone());
+            assert_eq!(v.st.project.project.bpm, 141.);
+            assert!(!v.undo.can_undo());
+            assert_eq!(v.st.browser_w, 333., "layout survives opening a file");
+            v.undo();
+            assert_eq!(v.st.project.project.bpm, 141.);
+        });
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A song the size of a transcribed cover: six tracks, each one 100-bar
+    /// piano-roll clip of ~700 notes.
+    fn heavy_project() -> Project {
+        let mut p = Project::default_project();
+        p.tracks.clear(); p.patterns.clear(); p.arrangement.clear();
+        for t in 0..6 {
+            let id = p.add_track(daw_core::project::TrackType::Melodic);
+            let pid = format!("long{t}");
+            let notes = (0..700u32).map(|i| daw_core::project::Note {
+                pitch: 48 + ((i * 7 + t * 5) % 30) as u8, tick: i * 68, duration: 50, vel: 90,
+            }).collect();
+            p.patterns.retain(|pat| !p.tracks.iter().any(|tr| tr.id == id && tr.patterns.contains(&pat.id().to_string())));
+            p.patterns.push(daw_core::project::Pattern::PianoRoll(daw_core::project::PianoRollPattern {
+                id: pid.clone(), name: format!("Long {t}"), bars: 100, ticks_per_bar: 480, legato: false, notes,
+            }));
+            let track = p.tracks.iter_mut().find(|tr| tr.id == id).unwrap();
+            track.patterns = vec![pid.clone()];
+            p.arrangement.push(daw_core::project::ArrangementSlot { track: id, pattern: pid, bar: 0, len_bars: Some(100), offset_ticks: 0 });
+        }
+        p.validate().unwrap();
+        p
+    }
+
+    /// Frame cost on a large song. Run with:
+    /// `cargo test -p daw-gpui --release frame_cost -- --ignored --nocapture`
+    #[gpui::test]
+    #[ignore = "benchmark: prints milliseconds per frame"]
+    fn frame_cost_on_a_large_song(cx: &mut gpui::TestAppContext) {
+        let (host, _commands, _audio) = Host::headless();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut v = DawView::new(host, heavy_project(), None, String::new(), cx);
+            v.sf2_missing = false;
+            v
+        });
+        cx.simulate_resize(size(px(1280.), px(800.)));
+        cx.run_until_parked();
+        for tab in [DockTab::Sequencer, DockTab::PianoRoll, DockTab::Mixing] {
+            view.update(cx, |v, cx| {
+                v.st.active_dock = tab;
+                let first = v.st.project.tracks[0].id.clone();
+                v.st.select_track(&first);
+                v.playing = true;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let frames = 60;
+            let started = std::time::Instant::now();
+            for i in 0..frames {
+                view.update(cx, |v, cx| { v.pump(); v.st.set_playhead(i * 40); cx.notify(); });
+                cx.run_until_parked();
+            }
+            println!("{:?}: {:.2} ms/frame while playing", tab, started.elapsed().as_secs_f64() * 1000. / frames as f64);
+        }
     }
 
     #[gpui::test]

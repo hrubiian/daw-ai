@@ -13,7 +13,7 @@ pub enum MidiEvent {
 }
 
 /// Keeps the midir connection alive. Drop to disconnect.
-pub struct MidiHandle(midir::MidiInputConnection<()>);
+pub struct MidiHandle(#[allow(dead_code, reason = "held only to keep the port open")] midir::MidiInputConnection<()>);
 
 /// Names of available MIDI input ports (empty if none / MIDI unavailable).
 pub fn list_midi_ports() -> Vec<String> {
@@ -29,7 +29,7 @@ pub fn list_midi_ports() -> Vec<String> {
 ///   - `Option<MidiHandle>` — keep alive for the duration of the program
 ///   - `Option<String>`     — device name for display
 ///   - `Sender<MidiEvent>`  — persistent sender; kept by Host so reconnects can
-///                            feed the same receiver channel.
+///     feed the same receiver channel.
 pub fn connect_midi(
     audio_tx: Sender<AudioEvent>,
     channel:  Arc<AtomicU8>,
@@ -121,15 +121,14 @@ pub fn connect_midi_port(
                         // All CCs also go to TUI for monitor display and button dispatch
                         let _ = midi_tx.try_send(MidiEvent::ControlChange { cc, value });
                     }
-                    0xE0 => {
-                        if midi_map.pitch_bend && msg.len() >= 3 {
+                    0xE0
+                        if midi_map.pitch_bend && msg.len() >= 3 => {
                             let _ = audio_tx.try_send(AudioEvent::PitchBend {
                                 strip: ch,
                                 lsb: msg[1],
                                 msb: msg[2],
                             });
                         }
-                    }
                     _ => {}
                 }
             },

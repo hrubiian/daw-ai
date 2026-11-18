@@ -69,11 +69,19 @@ impl DawView {
             .children(pads.iter().map(|pad| {
                 let pitch = pad.pitch;
                 let (base, soft, hard, reset) = (track.id.clone(), track.id.clone(), track.id.clone(), track.id.clone());
+                let (gate, gate_tid) = (pad.gate, track.id.clone());
                 div().flex().items_center().gap_1().flex_shrink_0()
                     .child(div().w(px(150.)).text_color(rgb(TEXT_DIM)).child(format!("{} · {} takes", note_name(pitch), pad.variants.len())))
                     .child(cell_btn(format!("take-base-{pitch}"), "Base", false, PANEL_ALT).on_click(cx.listener(move |this, _, _, _| this.load_pad_dialog(base.clone(), pitch))))
                     .child(cell_btn(format!("take-soft-{pitch}"), "+ Soft", false, PANEL_ALT).on_click(cx.listener(move |this, _, _, _| this.load_pad_variant_dialog(soft.clone(), pitch, 1, 63))))
                     .child(cell_btn(format!("take-hard-{pitch}"), "+ Hard", false, PANEL_ALT).on_click(cx.listener(move |this, _, _, _| this.load_pad_variant_dialog(hard.clone(), pitch, 64, 127))))
+                    .child(cell_btn(format!("pad-gate-{pitch}"), if gate { "Gate: note length" } else { "Gate: one-shot" }, gate, self.accent())
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            let before = this.st.project.clone();
+                            if this.st.project.set_sampler_gate(&gate_tid, pitch, !gate).is_ok() {
+                                this.undo.record("sampler gate", &before); this.push_live(); cx.notify();
+                            }
+                        })))
                     .child(cell_btn(format!("take-reset-{pitch}"), "Clear takes", false, PANEL_ALT).on_click(cx.listener(move |this, _, _, cx| {
                         let before = this.st.project.clone();
                         if this.st.project.set_sampler_variants(&reset, pitch, Vec::new()).is_ok() {
@@ -117,8 +125,8 @@ impl DawView {
             let (p1, p2, p3, p4, p5) = (pid.clone(), pid.clone(), pid.clone(), pid.clone(), pid.clone());
             div().flex().items_center().gap_2().pb_1().text_color(rgb(TEXT_DIM))
                 .child(div().child(format!("{} steps", steps)))
-                .child(cell_btn("seq-steps-down", "−4", false, PANEL_ALT).on_click(cx.listener(move |this, _e, _w, cx| { this.undo.record("steps", &this.st.project); this.st.project.resize_steps(&p1, -4); this.push_live(); cx.notify(); })))
-                .child(cell_btn("seq-steps-up", "+4", false, PANEL_ALT).on_click(cx.listener(move |this, _e, _w, cx| { this.undo.record("steps", &this.st.project); this.st.project.resize_steps(&p2, 4); this.push_live(); cx.notify(); })))
+                .child(cell_btn("seq-steps-down", "−4", false, PANEL_ALT).on_click(cx.listener(move |this, _e, _w, cx| { let before = this.st.project.clone(); if this.st.project.resize_steps(&p1, -4) { this.undo.record("steps", &before); this.push_live(); } cx.notify(); })))
+                .child(cell_btn("seq-steps-up", "+4", false, PANEL_ALT).on_click(cx.listener(move |this, _e, _w, cx| { let before = this.st.project.clone(); if this.st.project.resize_steps(&p2, 4) { this.undo.record("steps", &before); this.push_live(); } cx.notify(); })))
                 .child(cell_btn("seq-addrow", "+ Row", false, PANEL_ALT).on_click(cx.listener(move |this, _e, _w, cx| { this.undo.record("add row", &this.st.project); this.st.project.add_step_row(&p3); this.push_live(); cx.notify(); })))
                 .child(div().child(format!("gate {:.2}", gate)))
                 .child(cell_btn("seq-gate-down", "−", false, PANEL_ALT).on_click(cx.listener(move |this, _e, _w, cx| {
@@ -272,7 +280,8 @@ impl DawView {
         let cols = pat_len.div_ceil(TICKS_PER_COL).max(1) as usize;
         let cells = piano_cells(&pr.notes, TICKS_PER_COL);
         let visible_cols = piano_visible_columns(-f32::from(self.piano_scroll.offset().x),
-            f32::from(self.piano_scroll.bounds().size.width).max(1280.), cols);
+            // Before the first layout the width is unknown: assume a wide dock.
+            { let w = f32::from(self.piano_scroll.bounds().size.width); if w > 1.0 { w } else { 1280. } }, cols);
         let grid_width = cols as f32 * PR_COL_W;
         let document_width = 44. + grid_width;
 
@@ -317,8 +326,17 @@ impl DawView {
                 cx.notify();
             })));
 
+        // Only the pitch rows inside the scrolled viewport are built (plus a
+        // margin); spacers keep the document height, so scrolling is unchanged.
+        // Building all ~50 rows × visible columns cost most of a frame.
+        let row_h = PR_ROW_H + 1.0;
+        let total_rows = (hi - lo) as usize + 1;
+        let view_h = f32::from(self.piano_scroll.bounds().size.height);
+        let (first_row, row_count) = piano_visible_rows(-f32::from(self.piano_scroll.offset().y), view_h, row_h, total_rows);
+        let spacer_above = div().h(px(first_row as f32 * row_h)).flex_shrink_0();
+        let spacer_below = div().h(px((total_rows - first_row - row_count) as f32 * row_h)).flex_shrink_0();
         // High pitch at top down to low.
-        let rows = (lo..=hi).rev().map(|pitch| {
+        let rows = (lo..=hi).rev().skip(first_row).take(row_count).map(|pitch| {
             let is_black = matches!(pitch % 12, 1 | 3 | 6 | 8 | 10);
             let label = note_name(pitch);
             let cells: Vec<_> = visible_cols.clone().map(|c| {
@@ -336,7 +354,9 @@ impl DawView {
                     else { PANEL };
                 let pid_c = pid.clone();
                 let cell = div()
-                    .id(SharedString::from(format!("nt-{pid}-{pitch}-{c}")))
+                    // Integer id: a formatted string per cell was a measurable
+                    // share of the frame with ~1500 cells on screen.
+                    .id(("piano-cell", pitch as usize * 1_000_000 + c))
                     .absolute().left(px(c as f32 * PR_COL_W)).top_0()
                     .w(px(PR_COL_W))
                     .h(px(PR_ROW_H))
@@ -412,7 +432,8 @@ impl DawView {
                 .flex()
                 .flex_col()
                 .p_2()
-                .child(div().w(px(document_width)).flex_shrink_0().flex().flex_col().children(rows)),
+                .child(div().w(px(document_width)).flex_shrink_0().flex().flex_col()
+                    .child(spacer_above).children(rows).child(spacer_below)),
         )
     }
 
@@ -706,9 +727,33 @@ fn piano_visible_columns(offset: f32, width: f32, total: usize) -> std::ops::Ran
     first..end
 }
 
+/// (first row, row count) to build for a viewport `view_h` tall scrolled by
+/// `offset` px, with a few rows of margin. Before the first layout the
+/// viewport height is unknown (0): build a generous screenful.
+fn piano_visible_rows(offset: f32, view_h: f32, row_h: f32, total: usize) -> (usize, usize) {
+    let view_h = if view_h > 1.0 { view_h } else { 900.0 };
+    let margin = 2;
+    let first = ((offset.max(0.0) / row_h) as usize).saturating_sub(margin).min(total.saturating_sub(1));
+    let count = ((view_h / row_h).ceil() as usize + 2 * margin).min(total - first);
+    (first, count)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+    #[test]
+    fn piano_roll_builds_only_the_rows_in_view() {
+        // 13 px rows, 49 pitches, a 160 px viewport scrolled 200 px down.
+        let (first, count) = piano_visible_rows(200., 160., 13., 49);
+        assert_eq!(first, 13, "15 rows are scrolled off; 2 kept as margin");
+        assert!(count < 25 && first + count >= 15 + 13, "covers the view: {count}");
+        // Bottom of the document never runs past the last row.
+        let (first, count) = piano_visible_rows(10_000., 160., 13., 49);
+        assert_eq!(first + count, 49);
+        assert!(count >= 1);
+        // Unknown viewport (first frame): everything a tall window could show.
+        assert_eq!(piano_visible_rows(0., 0., 13., 49), (0, 49));
+    }
     #[test]
     fn piano_roll_preserves_short_and_off_grid_notes() {
         let notes = [

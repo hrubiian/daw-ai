@@ -45,6 +45,32 @@ enum Node {
 #[derive(Debug, Clone, PartialEq)]
 struct Term { node: Node, weight: f64 }
 
+impl Node {
+    /// Node count of this subtree (bounds `!` replication).
+    fn size(&self) -> usize {
+        match self {
+            Node::Atom(_) => 1,
+            Node::Seq(ts) => 1 + ts.iter().map(|t| t.node.size()).sum::<usize>(),
+            Node::Stack(ns) => 1 + ns.iter().map(Node::size).sum::<usize>(),
+            Node::Repeat(n, _) | Node::Euclid(n, ..) => 1 + n.size(),
+        }
+    }
+}
+
+// ── Limits ────────────────────────────────────────────────────────────────────
+// Input comes from the MCP `apply_mini_notation` tool and the REPL, so a
+// pattern like `bd*4000000000`, `[[[[…` or `[a!99]!99!99…` must fail with
+// an error instead of exhausting memory or overflowing the stack.
+
+/// Largest `*n`, `!n`, `@n` or Euclid argument.
+const MAX_NUM: u32 = 256;
+/// Deepest `[ ]` nesting.
+const MAX_DEPTH: usize = 32;
+/// Most AST nodes after `!` replication.
+const MAX_NODES: usize = 16_384;
+/// Most subtree visits while flattening (bounds nested `*n` / Euclid work).
+const MAX_VISITS: usize = 65_536;
+
 // ── Tokenizer ─────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
@@ -76,7 +102,7 @@ fn tokenize(input: &str) -> Vec<Tok> {
 
 // ── Parser (recursive descent) ────────────────────────────────────────────────
 
-struct Parser { toks: Vec<Tok>, pos: usize }
+struct Parser { toks: Vec<Tok>, pos: usize, depth: usize, nodes: usize }
 
 impl Parser {
     fn peek(&self) -> Option<&Tok> { self.toks.get(self.pos) }
@@ -124,6 +150,12 @@ impl Parser {
             }
         }
         let term = Term { node, weight };
+        if replicate > 1 {
+            self.nodes += term.node.size() * (replicate as usize - 1);
+            if self.nodes > MAX_NODES {
+                return Err(format!("pattern too large (over {MAX_NODES} nodes after `!`)"));
+            }
+        }
         Ok(if replicate <= 1 {
             vec![term]
         } else {
@@ -133,7 +165,16 @@ impl Parser {
 
     fn parse_primary(&mut self) -> Result<Node, String> {
         match self.bump() {
-            Some(Tok::LB)        => { let n = self.parse_stack()?; self.expect(Tok::RB)?; Ok(n) }
+            Some(Tok::LB)        => {
+                self.depth += 1;
+                if self.depth > MAX_DEPTH {
+                    return Err(format!("brackets nested deeper than {MAX_DEPTH}"));
+                }
+                let n = self.parse_stack()?;
+                self.expect(Tok::RB)?;
+                self.depth -= 1;
+                Ok(n)
+            }
             Some(Tok::Word(w))   => Ok(Node::Atom(w)),
             other                => Err(format!("unexpected token {other:?}")),
         }
@@ -141,7 +182,11 @@ impl Parser {
 
     fn num(&mut self) -> Result<u32, String> {
         match self.bump() {
-            Some(Tok::Word(w)) => w.parse::<u32>().map_err(|_| format!("expected a number, got `{w}`")),
+            Some(Tok::Word(w)) => match w.parse::<u32>() {
+                Ok(n) if n <= MAX_NUM => Ok(n),
+                Ok(n) => Err(format!("number {n} too large (max {MAX_NUM})")),
+                Err(_) => Err(format!("expected a number, got `{w}`")),
+            },
             other              => Err(format!("expected a number, got {other:?}")),
         }
     }
@@ -153,18 +198,24 @@ impl Parser {
 
 /// Parse mini-notation into a flat list of timed events over one cycle.
 pub fn parse(input: &str) -> Result<Vec<MiniEvent>, String> {
-    let mut p = Parser { toks: tokenize(input), pos: 0 };
+    let mut p = Parser { toks: tokenize(input), pos: 0, depth: 0, nodes: 0 };
     let node = p.parse_stack()?;
     if p.pos != p.toks.len() {
         return Err(format!("unexpected trailing token {:?}", p.toks.get(p.pos)));
     }
     let mut out = Vec::new();
-    flatten(&node, 0.0, 1.0, &mut out);
+    let mut budget = MAX_VISITS;
+    flatten(&node, 0.0, 1.0, &mut out, &mut budget);
+    if budget == 0 {
+        return Err(format!("pattern too large (over {MAX_VISITS} subdivisions)"));
+    }
     out.sort_by(|a, b| a.begin.partial_cmp(&b.begin).unwrap_or(std::cmp::Ordering::Equal));
     Ok(out)
 }
 
-fn flatten(node: &Node, begin: f64, end: f64, out: &mut Vec<MiniEvent>) {
+fn flatten(node: &Node, begin: f64, end: f64, out: &mut Vec<MiniEvent>, budget: &mut usize) {
+    if *budget == 0 { return; }
+    *budget -= 1;
     match node {
         Node::Atom(v) => {
             if v != "~" && !v.is_empty() {
@@ -178,19 +229,19 @@ fn flatten(node: &Node, begin: f64, end: f64, out: &mut Vec<MiniEvent>) {
             let mut cur = begin;
             for t in terms {
                 let w = span * t.weight / total;
-                flatten(&t.node, cur, cur + w, out);
+                flatten(&t.node, cur, cur + w, out, budget);
                 cur += w;
             }
         }
         Node::Stack(nodes) => {
-            for n in nodes { flatten(n, begin, end, out); }
+            for n in nodes { flatten(n, begin, end, out, budget); }
         }
         Node::Repeat(inner, n) => {
             let n = (*n).max(1);
             let span = (end - begin) / n as f64;
             for i in 0..n {
                 let b = begin + span * i as f64;
-                flatten(inner, b, b + span, out);
+                flatten(inner, b, b + span, out, budget);
             }
         }
         Node::Euclid(inner, p, s, r) => {
@@ -200,7 +251,7 @@ fn flatten(node: &Node, begin: f64, end: f64, out: &mut Vec<MiniEvent>) {
             for (i, &hit) in pat.iter().enumerate() {
                 if hit == 1 {
                     let b = begin + span * i as f64;
-                    flatten(inner, b, b + span, out);
+                    flatten(inner, b, b + span, out, budget);
                 }
             }
         }
@@ -252,7 +303,7 @@ fn note_pitch(s: &str) -> Option<u8> {
         _ => {}
     }
     let oct: i32 = if i < b.len() { s[i..].parse().ok()? } else { 4 };
-    let midi = (oct + 1) * 12 + semi;
+    let midi = oct.checked_add(1)?.checked_mul(12)?.checked_add(semi)?;
     (0..=127).contains(&midi).then_some(midi as u8)
 }
 
@@ -288,6 +339,19 @@ mod tests {
     use super::*;
 
     fn begins(s: &str) -> Vec<f64> { parse(s).unwrap().iter().map(|e| e.begin).collect() }
+
+    #[test]
+    fn hostile_patterns_error_instead_of_exhausting_resources() {
+        assert!(parse("bd*4000000000").is_err());
+        assert!(parse("bd!4000000000").is_err());
+        assert!(parse("bd(3,4000000000)").is_err());
+        assert!(parse(&format!("{}bd{}", "[".repeat(100_000), "]".repeat(100_000))).is_err());
+        assert!(parse("[[[[bd!200]!200]!200]!200]").is_err());
+        assert!(parse("[[[[~*256]*256]*256]*256]").is_err());
+        assert_eq!(note_pitch("c2147483647"), None, "octave overflow is not a panic");
+        // Ordinary use is untouched.
+        assert_eq!(parse("[bd sd]*4, hh*16").unwrap().len(), 24);
+    }
 
     #[test]
     fn sequences_and_rests() {

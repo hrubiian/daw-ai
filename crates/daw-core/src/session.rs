@@ -35,6 +35,9 @@ pub enum Command {
     Pause,
     Stop,
     Seek { tick: u32 },
+    /// Play test notes on a track in the running engine (sound design).
+    /// Edits nothing; the revision stays.
+    Audition { track_id: String, notes: Vec<crate::audition::AuditionNote> },
 }
 #[derive(Clone, Debug, Serialize, Deserialize)]
 pub struct Request {
@@ -237,6 +240,10 @@ impl Session {
                     self.recent_edit = format!("redo: {label}");
                     self.revision += 1;
                 }
+                Command::Audition { track_id, notes } => {
+                    anyhow::ensure!(self.project.tracks.iter().any(|t| &t.id == track_id), "missing track {track_id}");
+                    crate::audition::validate_notes(notes).map_err(anyhow::Error::msg)?;
+                }
                 _ => {}
             }
             Ok(())
@@ -275,6 +282,19 @@ mod tests {
             expected_revision: Some(revision),
             command,
         }
+    }
+
+    #[test]
+    fn audition_command_keeps_revision() {
+        let mut session = Session::new(Project::default_project()).unwrap();
+        let note = crate::audition::AuditionNote { pitch: 60, velocity: 100, start_ms: 0, dur_ms: 500 };
+        let ok = session.execute(&request("a1", 0, Command::Audition { track_id: "t1".into(), notes: vec![note] }));
+        assert!(ok.error.is_none(), "{:?}", ok.error);
+        assert_eq!(session.revision, 0, "auditioning edits nothing");
+        let missing = session.execute(&request("a2", 0, Command::Audition { track_id: "zz".into(), notes: vec![note] }));
+        assert!(missing.error.is_some());
+        let bad = session.execute(&request("a3", 0, Command::Audition { track_id: "t1".into(), notes: vec![] }));
+        assert!(bad.error.is_some(), "invalid notes are rejected");
     }
     #[test]
     fn preview_validates_without_mutation_or_history() {

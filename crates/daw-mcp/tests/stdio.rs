@@ -45,5 +45,6 @@ fn initialize_list_and_summary_over_stdio() {
     assert!(sum.contains("Drums"), "{sum}");
 
     child.kill().ok();
+    child.wait().ok();
     std::fs::remove_dir_all(&dir).ok();
 }

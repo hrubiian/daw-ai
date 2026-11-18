@@ -1,8 +1,9 @@
 # Assets
 
 Large binaries (`*.sf2`, `*.wav`, `assets/samples/`) are **gitignored** — they're
-fetched locally, not committed (same model as the soundfont). Get the free,
-redistributable extras with:
+fetched locally, not committed (same model as the soundfont). The guitar amp's
+built-in cabinets are synthesized in code, so no IR files ship either. Get the
+free, redistributable extras with:
 
 ```bash
 ./fetch-assets.sh

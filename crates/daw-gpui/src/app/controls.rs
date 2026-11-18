@@ -16,6 +16,18 @@ pub(super) fn cell_btn(
     let id = id.into();
     let label = label.into();
     let help = control_help(id.as_ref()).map(SharedString::from).unwrap_or_else(|| label.clone());
+    cell_btn_with_help(id, label, on, on_color, help)
+}
+
+pub(super) fn cell_btn_with_help(
+    id: impl Into<SharedString>,
+    label: impl Into<SharedString>,
+    on: bool,
+    on_color: u32,
+    help: SharedString,
+) -> gpui::Stateful<gpui::Div> {
+    let id = id.into();
+    let label = label.into();
     div()
         .id(id.clone())
         .debug_selector(|| id.to_string())
@@ -62,6 +74,7 @@ pub(super) fn control_help(id: &str) -> Option<&'static str> {
         _ if id.starts_with("mix-level-down-") => "Decrease level · Shift for fine adjustment",
         _ if id.starts_with("mix-send-up-") => "Increase effect send · Shift for fine adjustment",
         _ if id.starts_with("mix-send-down-") => "Decrease effect send · Shift for fine adjustment",
+        _ if id.starts_with("pad-gate-") => "One-shot plays the whole sample · Note length fades it out when the note ends (808s, pads, chops)",
         _ if id.starts_with("m-") => "Mute track",
         _ if id.starts_with("s-") => "Solo track",
         _ if id.starts_with("vd-") => "Decrease track volume",

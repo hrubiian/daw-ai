@@ -31,7 +31,7 @@ fn project_json(cents: f32) -> String {
 /// errors around 440-466 Hz.
 fn detect_hz(left: &[f32], sr: u32) -> f32 {
     let start = (sr as usize) / 2; // 0.5 s in — past the attack
-    let win = (sr as usize); // 1 s window
+    let win = sr as usize; // 1 s window
     let sig = &left[start..(start + win).min(left.len())];
     let mean = sig.iter().sum::<f32>() / sig.len() as f32;
     let sig: Vec<f32> = sig.iter().map(|s| s - mean).collect();

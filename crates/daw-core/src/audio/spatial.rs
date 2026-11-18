@@ -11,6 +11,11 @@ pub(crate) struct ToneFilter {
     lp: [f32; 2],
 }
 impl ToneFilter {
+    pub fn clear(&mut self) {
+        self.prev_x = [0.; 2];
+        self.hp = [0.; 2];
+        self.lp = [0.; 2];
+    }
     pub fn new(sr: u32) -> Self {
         Self {
             sr: sr as f32,
@@ -61,6 +66,13 @@ pub(crate) struct Predelay {
     started: bool,
 }
 impl Predelay {
+    pub fn clear(&mut self) {
+        self.buf.fill(0.);
+        self.pos = 0;
+        self.previous = self.samples;
+        self.fade = 0;
+        self.started = false;
+    }
     pub fn new(sr: u32) -> Self {
         Self {
             buf: vec![0.; sr as usize / 4 + 1],

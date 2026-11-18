@@ -19,7 +19,7 @@ serde-defaulted: files from older versions always load.
     "id": "t1", "name": "Drums", "type": "drum",   // drum | melodic | audio  ← key is "type" (not "track_type")
     "instrument": { "type": "soundfont", "preset": 0, "bank": 128 },
     //            | { "type": "sampler", "pads": [{ "pitch": 36, "path": "kick.wav", "gain": 1.0 }] }
-    //            | { "type": "audio_file", "path": "loop.wav" }
+    //            | { "type": "audio_file", "path": "loop.wav" }  // audio tracks; a non-empty path plays once from 0 s like a clip (prefer audio_clips)
     //            | { "type": "clap", "uid": "c1", "path": "/usr/lib/clap/X.clap",
     //                "id": "org.x.y", "state": "<base64>", "params": { "17": 0.42 } }
     "volume": 0.8,            // 0..2 (1.0 = unity)
@@ -90,6 +90,23 @@ and mixer edits retain it when the instrument resources are unchanged. Old pads
 without variants keep their original behavior. Replacing a base sample clears
 its variants; clearing variants alone preserves the base sample.
 
+### Note-length pads (`gate`)
+
+A pad plays its whole sample by default (a one-shot). Add `"gate": true` and
+the pad follows the note: when the note ends the sample fades out over about
+30 ms. One long sample then covers every length — a sustained 808, a pad, a
+vocal chop — instead of a pre-rendered file per duration.
+
+```json
+{ "pitch": 36, "path": "samples/808-long.wav", "gate": true }
+```
+
+Length comes from the note's `duration` in a piano-roll pattern, or from the
+pattern's `gate` fraction of a 16th in a step pattern. Overlapping repeats of
+the same pitch each keep their own length. Live playback and export behave the
+same. Create pads with MCP `set_sampler_pad(track_id, pitch, path, gain?, gate?)`
+(a track without a sampler becomes one), or toggle Gate per pad in the GUI FX tab.
+
 All sample loading occurs when preparing strips, outside the audio callback.
 Voices refer to the selected preloaded take, so another hit cannot change an
 already sounding voice. Each strip reserves 128 sampler voices; overload steals
@@ -108,3 +125,49 @@ Alt+click to decrease it; step cells show velocity and piano-roll starts show
 velocity in their hover help. These controls preserve an existing note's onset
 and duration. Step velocity 1 retains its legacy meaning (row-default); explicit
 step dynamics use 2–127.
+
+## LFO modulators
+
+Each track's `modulators` list adds movement over time:
+
+```json
+"modulators": [
+  { "dest": "cutoff", "shape": "sine", "rate_hz": 0.25, "depth": 0.3, "phase": 0.0 }
+]
+```
+
+`dest` is `cutoff`, `volume`, `pan` or `resonance`; `shape` is `sine`,
+`triangle`, `saw` or `square`; `rate_hz` is 0–100; `depth` (0–1) is the swing
+either side of the track's own value; `phase` (0–1) offsets the start.
+
+| dest | What moves | Track types |
+|------|-----------|-------------|
+| `cutoff` | The track's insert low-pass, around `effects.cutoff` (same curve) | all |
+| `volume` | Sampler, audio and CLAP tracks: the fader, around `volume` (tops out at 1.0). SoundFont tracks: the synth's MIDI volume (CC7), on top of the fader | all |
+| `pan` | The pan position, around `pan` | all |
+| `resonance` | Sent to SoundFont synths as CC71; the built-in filter is one-pole, so there is no audible resonance | SoundFont |
+
+The mixer glides between LFO values (and between fader, pan and mute edits),
+so sweeps and live changes do not step or click. Removing a modulator returns
+the track to its saved value. Use MCP `set_modulators(track_id, modulators)`.
+
+## Per-track recording input
+
+Tracks may include an optional `input` object. Omitting it inherits the user's
+Settings input device/channel and uses `auto` recording mode. This keeps older
+project files compatible. The route affects recording on Audio tracks.
+
+```json
+"input": {
+  "device": "Guitar interface",
+  "channels": { "mono": 0 },
+  "source": "guitar"
+}
+```
+
+`device: null` selects the system default input. Channel indices are zero-based;
+`{"stereo": [0, 1]}` records a stereo pair. `source` is `dry` (unprocessed),
+`guitar` (print the current amp/cabinet into the WAV), or `auto` (the default:
+print the rack if monitoring is enabled when armed). Device/channel changes
+require finishing the current take. Unavailable named devices or channels
+produce an error instead of silently recording another input.

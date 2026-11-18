@@ -64,7 +64,8 @@ and project import/export.
 - Search instruments by name or category; Esc clears the search.
 - Ctrl+Z undoes project edits; Ctrl+Shift+Z or Ctrl+Y redoes them.
 
-See [Desktop UI](../../docs/desktop-ui.md) for mixing, navigation and verification.
+See [Desktop UI](../../docs/desktop-ui.md) for mixing, navigation and verification,
+and [the UI review](../../docs/ui-review.md) for follow-up priorities and visual checks.
 
 ## Window and panel behavior
 

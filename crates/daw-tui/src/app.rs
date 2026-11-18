@@ -1,7 +1,7 @@
 use crate::midi::MidiEvent;
 use crate::midi_map::{ButtonAction, FaderParam, KnobParam, MidiMap};
 use crossbeam_channel::Sender;
-use daw_core::audio::RecordController;
+use daw_core::audio::input::{CaptureStream, RecordPhase, RecordingSession};
 use daw_core::project::{ArrangementSlot, Instrument, Note, Pattern, Project, TrackType};
 use daw_core::sequencer::SequencerCommand;
 use std::collections::HashMap;
@@ -12,6 +12,17 @@ use std::sync::{
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum DialogMode { None, SaveAs, ExportWav }
+
+/// Sequencer-owned transport atomics the audio-take flow reads (from `Host`).
+#[derive(Clone, Default)]
+pub struct RecordTransport {
+    /// Odd = recording window open; the capture writer splits takes on it.
+    pub take_gate: Arc<AtomicU32>,
+    /// Playhead tick where the current take began.
+    pub roll_start_tick: Arc<AtomicU32>,
+    /// Stopped / CountIn / Rolling.
+    pub transport_state: Arc<AtomicU8>,
+}
 
 #[derive(Debug, Clone, PartialEq)]
 pub enum Tab {
@@ -68,8 +79,18 @@ pub struct App {
     pub browser_right: usize,
     pub rename_mode:   bool,
     pub rename_buf:    String,
-    pub record_ctrl:   RecordController,
     pub is_recording:  bool,
+    /// Audio-take recording (same capture subsystem as the GUI): the input
+    /// stream is open only while a take is recording or finishing.
+    pub rec_transport: RecordTransport,
+    pub capture:       Option<CaptureStream>,
+    pub rec:           RecordingSession,
+    /// Track the current take lands on.
+    pub rec_track:     Option<String>,
+    pub rec_latency_trim_ms: f32,
+    /// A take was open at punch-out; keep the input until it arrives.
+    pub rec_awaiting_final: bool,
+    pub rec_status:    String,
     pub effects_param: usize,
     pub mod_sel:        usize,
     pub live_play:      bool,
@@ -118,7 +139,7 @@ impl App {
         project: Project,
         project_path: Option<std::path::PathBuf>,
         seq_tx: Sender<SequencerCommand>,
-        record_ctrl: RecordController,
+        rec_transport: RecordTransport,
         midi_ev_rx: crossbeam_channel::Receiver<MidiEvent>,
         midi_channel: Arc<AtomicU8>,
         midi_device: Option<String>,
@@ -153,8 +174,14 @@ impl App {
             browser_right: 0,
             rename_mode: false,
             rename_buf: String::new(),
-            record_ctrl,
             is_recording: false,
+            rec_transport,
+            capture: None,
+            rec: RecordingSession::default(),
+            rec_track: None,
+            rec_latency_trim_ms: 0.0,
+            rec_awaiting_final: false,
+            rec_status: String::new(),
             effects_param: 0,
             mod_sel: 0,
             live_play: false,
@@ -229,32 +256,124 @@ impl App {
         }
     }
 
+    /// Ctrl+R: record an audio take on the active audio track, or punch out.
+    /// The transport rolls (after the configured count-in when stopped) and
+    /// each take lands as an audio clip at its start tick — the same capture
+    /// flow as the GUI. Finished takes are placed by `poll_recording`.
     pub fn toggle_recording(&mut self) {
-        let Some(track) = self.project.tracks.get(self.active_track) else { return };
-        if track.track_type != TrackType::Audio {
-            return; // only audio tracks can record
-        }
-
         if self.is_recording {
             self.is_recording = false;
-            let track_id = self.project.tracks.get(self.active_track)
-                .map(|t| t.id.clone())
-                .unwrap_or_default();
-            // Sanitise track_id to prevent path traversal from crafted project files
-            let safe_id: String = track_id.chars()
-                .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
-                .collect();
-            let path = format!("recordings/{safe_id}.wav");
-            if self.record_ctrl.stop(std::path::Path::new(&path)).is_ok() {
-                if let Some(t) = self.project.tracks.get_mut(self.active_track) {
-                    t.instrument = Instrument::AudioFile { path: path.clone() };
-                }
-                self.cache_waveform(&track_id, &path);
-                self.send(SequencerCommand::UpdateLive(self.project.clone()));
+            // A take is open once the gate has opened; wait for its file.
+            self.rec_awaiting_final = self.rec.phase == RecordPhase::Recording
+                || self.rec_transport.take_gate.load(Ordering::Acquire) % 2 == 1;
+            if let Some(cs) = &self.capture {
+                cs.end_session();
             }
-        } else if self.record_ctrl.available() {
-            self.record_ctrl.start();
-            self.is_recording = true;
+            self.send(SequencerCommand::RecordStop);
+            if self.rec_awaiting_final {
+                self.rec_status = "finishing take…".into();
+            } else {
+                self.release_input();
+                self.rec_status = "recording cancelled".into();
+            }
+            return;
+        }
+        let Some(track) = self.project.tracks.get(self.active_track) else { return };
+        if track.track_type != TrackType::Audio {
+            return; // only audio tracks record audio takes
+        }
+        let track_id = track.id.clone();
+        let cfg = daw_io::config::UserConfig::load();
+        if self.capture.is_none() {
+            match CaptureStream::open(
+                cfg.input_device.as_deref(),
+                cfg.input_channels,
+                Arc::clone(&self.rec_transport.take_gate),
+                Arc::clone(&self.rec_transport.roll_start_tick),
+            ) {
+                Ok(cs) => self.capture = Some(cs),
+                Err(e) => {
+                    self.rec_status = format!("input unavailable: {e}");
+                    return;
+                }
+            }
+        }
+        // Sanitise the track id: it becomes part of a file name.
+        let safe_id: String = track_id.chars()
+            .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
+            .collect();
+        let now = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_secs())
+            .unwrap_or(0);
+        let stamp = daw_core::audio::input::utc_timestamp(now);
+        let _ = std::fs::create_dir_all("recordings");
+        // Session base: the writer appends "-p<N>.wav" per loop pass.
+        let base = std::path::PathBuf::from(format!("recordings/{safe_id}-{stamp}"));
+        if let Some(cs) = &self.capture {
+            cs.begin_session(base);
+        }
+        self.rec.arm();
+        self.rec.begin();
+        self.rec_track = Some(track_id);
+        self.rec_latency_trim_ms = cfg.latency_trim_ms;
+        let bars = if self.is_playing { 0 } else { cfg.count_in_bars };
+        self.send(SequencerCommand::RecordStart { count_in_bars: bars });
+        self.is_playing = true;
+        self.is_recording = true;
+        self.rec_status = if bars > 0 { format!("count-in: {bars} bar(s)…") } else { "recording…".into() };
+    }
+
+    /// Close the input stream and reset the take flow.
+    fn release_input(&mut self) {
+        self.capture = None;
+        self.rec.disarm();
+        self.rec_awaiting_final = false;
+    }
+
+    /// Per frame: latch the roll tick and place finished takes as clips.
+    pub fn poll_recording(&mut self) {
+        use daw_core::audio::input::TRANSPORT_ROLLING;
+        if self.rec.phase == RecordPhase::AwaitingRoll
+            && self.rec_transport.transport_state.load(Ordering::Acquire) == TRANSPORT_ROLLING
+        {
+            self.rec.rolled(self.rec_transport.roll_start_tick.load(Ordering::Acquire));
+            self.rec_status = "recording…".into();
+        }
+        let takes: Vec<daw_core::audio::input::TakeResult> = self.capture.as_ref()
+            .map(|c| c.take_rx.try_iter().collect())
+            .unwrap_or_default();
+        let got_take = !takes.is_empty();
+        for take in takes {
+            let placement = self.rec.finish(
+                take.start_tick, self.project.project.bpm, self.rec_latency_trim_ms, take.duration_sec,
+            );
+            let Some((start_sec, offset_sec, len_sec)) = placement else {
+                let _ = std::fs::remove_file(&take.path);
+                self.rec_status = "take too short — discarded".into();
+                continue;
+            };
+            let Some(track_id) = self.rec_track.clone() else { continue };
+            let path = take.path.to_string_lossy().into_owned();
+            self.project.audio_clips.push(daw_core::project::AudioClip {
+                track: track_id.clone(), path: path.clone(), start_sec, offset_sec, len_sec, gain: 1.0,
+            });
+            // Loop passes stack: silence the previous pass (kept for comping).
+            if let Some(prev) = self.rec.last_clip.take() {
+                self.project.set_audio_clip_gain(prev, 0.0);
+            }
+            self.rec.last_clip = Some(self.project.audio_clips.len() - 1);
+            self.rec.pass += 1;
+            self.cache_waveform(&track_id, &path);
+            self.send(SequencerCommand::UpdateLive(self.project.clone()));
+            self.rec_status = if take.dropped_frames > 0 {
+                format!("take saved: {path} ({} input frames dropped)", take.dropped_frames)
+            } else {
+                format!("take saved: {path}")
+            };
+        }
+        if got_take && !self.is_recording && self.rec_awaiting_final {
+            self.release_input();
         }
     }
 
@@ -782,24 +901,19 @@ impl App {
 mod tests {
     use super::*;
     use crate::midi_map::MidiMap;
-    use daw_core::{
-        audio::{RecordController, RecordState},
-        project::{EffectChain, Instrument, Project, Track, TrackType},
-    };
+    use daw_core::project::{EffectChain, Instrument, Project, Track, TrackType};
     use std::sync::{Arc, Mutex, atomic::{AtomicU8, AtomicU32}};
 
     fn make_app(tracks: Vec<Track>) -> App {
         let (seq_tx, _) = crossbeam_channel::unbounded();
         let (_, midi_rx) = crossbeam_channel::unbounded();
-        let record_state = Arc::new(Mutex::new(RecordState::default()));
-        let ctrl = RecordController::new(record_state);
         let mut project = Project::default_project();
         project.tracks = tracks;
         App::new(
             project,
             None,
             seq_tx,
-            ctrl,
+            RecordTransport::default(),
             midi_rx,
             Arc::new(AtomicU8::new(0)),
             None,
@@ -807,6 +921,30 @@ mod tests {
             Arc::new(AtomicU32::new(0)),
             Arc::new(Mutex::new(Vec::new())),
         )
+    }
+
+    #[test]
+    fn audio_take_flow_without_a_device() {
+        use daw_core::audio::input::{RecordPhase, TRANSPORT_ROLLING};
+        let mut app = make_app(Project::default_project().tracks);
+        // Default tracks are drums/bass: Ctrl+R records audio only on audio tracks.
+        app.toggle_recording();
+        assert!(!app.is_recording && app.capture.is_none());
+
+        // The roll latches the take's start tick once the transport rolls.
+        app.rec.begin();
+        app.rec_transport.roll_start_tick.store(480, Ordering::Release);
+        app.rec_transport.transport_state.store(TRANSPORT_ROLLING, Ordering::Release);
+        app.poll_recording();
+        assert_eq!((app.rec.phase, app.rec.roll_tick), (RecordPhase::Recording, 480));
+
+        // Punch-out during the count-in (no take open) releases the input now.
+        app.rec.begin();
+        app.is_recording = true;
+        app.rec_transport.take_gate.store(0, Ordering::Release);
+        app.toggle_recording();
+        assert!(!app.is_recording && !app.rec_awaiting_final && app.capture.is_none());
+        assert_eq!(app.rec.phase, RecordPhase::Idle);
     }
 
     fn melodic_track(id: &str) -> Track {
@@ -820,6 +958,7 @@ mod tests {
             modulators: Vec::new(),
             clap_fx: Vec::new(),
             tuning_cents: 0.0,
+            input: None,
         }
     }
 
@@ -834,6 +973,7 @@ mod tests {
             modulators: Vec::new(),
             clap_fx: Vec::new(),
             tuning_cents: 0.0,
+            input: None,
         }
     }
 
@@ -848,6 +988,7 @@ mod tests {
             modulators: Vec::new(),
             clap_fx: Vec::new(),
             tuning_cents: 0.0,
+            input: None,
         }
     }
 

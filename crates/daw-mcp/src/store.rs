@@ -102,7 +102,15 @@ pub fn summary(p: &Project) -> String {
             }
             daw_core::project::Instrument::AudioFile { .. } => "audio-file".into(),
             daw_core::project::Instrument::Sampler { pads } => {
-                format!("sampler({} pads)", pads.len())
+                // Pad pitches (g = gated: follows note length) so an agent
+                // can write notes for them without fetching the whole project.
+                let list = pads.iter().take(24)
+                    .map(|p| format!("{}{}", p.pitch, if p.gate { "g" } else { "" }))
+                    .collect::<Vec<_>>().join(",");
+                let lfos = if t.modulators.is_empty() { String::new() } else {
+                    format!(" lfo[{}]", t.modulators.iter().map(|m| m.dest.label()).collect::<Vec<_>>().join(","))
+                };
+                format!("sampler(pads {list}){lfos}")
             }
             daw_core::project::Instrument::Clap(c) => format!("clap {}", c.id),
         };

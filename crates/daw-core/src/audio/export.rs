@@ -130,8 +130,15 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
     let has_arr   = !project.arrangement.is_empty();
     let max_ticks = if has_arr { arrangement_total_ticks(project) } else { loop_total_ticks(project) };
     // Cover arranged audio clips that extend past the pattern timeline.
+    // Whole-file `AudioFile` sources play once from t=0 (as live playback).
+    let whole_files = project.tracks.iter().filter_map(|t| match &t.instrument {
+        Instrument::AudioFile { path } if !path.is_empty() => super::wav_duration_sec(Path::new(path)).ok(),
+        _ => None,
+    });
     let audio_end_samp = project.audio_clips.iter()
-        .map(|c| ((c.start_sec + c.len_sec) * EXPORT_SR as f64).ceil() as u64)
+        .map(|c| c.start_sec + c.len_sec)
+        .chain(whole_files)
+        .map(|end_sec| (end_sec * EXPORT_SR as f64).ceil() as u64)
         .max()
         .unwrap_or(0);
     let total_samp = ((max_ticks as f64 * spk).ceil() as u64)
@@ -208,6 +215,13 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
                 let velocity = humanize_velocity(vel, strip, pitch, tick, project.project.humanize);
                 if is_sampler {
                     evs.push((s, AudioEvent::TriggerSample { strip, pitch, gain: velocity as f32 / 127.0 }));
+                    // Gated pads follow the note length, as in live playback.
+                    let gated = matches!(&track.instrument, Instrument::Sampler { pads }
+                        if pads.iter().any(|p| p.pitch == pitch && p.gate));
+                    if gated {
+                        let off = ((tick + dur_ticks) as f64 * spk).round() as u64;
+                        evs.push((off, AudioEvent::NoteOff { strip, pitch }));
+                    }
                 } else {
                     let off = ((tick + dur_ticks) as f64 * spk).round() as u64;
                     evs.push((s, AudioEvent::NoteOn { strip, pitch, velocity }));
@@ -300,10 +314,16 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
     // ── LFO modulation jobs: (strip, cc, base value 0..1, modulator) ──────────
     let mut mod_jobs: Vec<(u8, u8, f32, crate::project::Modulator)> = Vec::new();
     for (i, track) in project.tracks.iter().enumerate() {
-        if track.track_type == TrackType::Audio { continue; }
-        if matches!(track.instrument, Instrument::Sampler { .. }) { continue; }
-        for m in &track.modulators {
-            mod_jobs.push((i as u8, m.dest.cc(), mod_base01(m.dest, track), m.clone()));
+        // Same split as the live sequencer: synth-less strips take the
+        // mixer-level destinations, SoundFont strips also take resonance.
+        let synthless = track.track_type == TrackType::Audio
+            || matches!(track.instrument, Instrument::Sampler { .. } | Instrument::Clap(_));
+        if synthless {
+            for (cc, base, m) in crate::sequencer::engine::mixer_mod_jobs(track) { mod_jobs.push((i as u8, cc, base, m)); }
+        } else {
+            for m in &track.modulators {
+                mod_jobs.push((i as u8, m.dest.cc(), mod_base01(m.dest, track), m.clone()));
+            }
         }
     }
 
@@ -325,8 +345,8 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
         if !mod_jobs.is_empty() {
             let t = pos as f32 / EXPORT_SR as f32;
             for (strip, cc, base01, m) in &mod_jobs {
-                let v = (modulated_value(m, *base01, t) * 127.0).round().clamp(0.0, 127.0) as u8;
-                mixer.handle_event(AudioEvent::RawCC { strip: *strip, cc: *cc, value: v });
+                let v = modulated_value(m, *base01, t);
+                mixer.handle_event(AudioEvent::Modulate { strip: *strip, cc: *cc, value: Some(v) });
             }
         }
 
@@ -575,6 +595,8 @@ mod tests {
     fn export_legato_holds_notes_until_the_next_phrase_entry() {
         let plugin = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/libdaw_clap_testplug_tone.so");
         assert!(plugin.exists(), "build workspace CLAP fixtures before running export regressions");
+        // Project-file plugin paths must sit inside a CLAP search path.
+        std::env::set_var("CLAP_PATH", plugin.parent().unwrap());
         let mut project = Project::default_project();
         project.tracks.clear(); project.patterns.clear(); project.arrangement.clear();
         project.project.bpm = 120.; project.project.timing = 0.;
@@ -601,6 +623,7 @@ mod tests {
             assert!(std::env::var_os("DAW_REQUIRE_TEST_ASSETS").is_none(), "required audio test assets missing"); eprintln!("skip: assets missing");
             return;
         }
+        std::env::set_var("CLAP_PATH", plug.parent().unwrap());
         let out = std::env::temp_dir().join("daw_export_clap_gain0.wav");
         let mut p = Project::default_project();
         let t0 = p.tracks[0].id.clone();
@@ -633,6 +656,28 @@ mod tests {
         let energy: f32 = tail.iter().map(|s| s.abs()).sum();
         assert!(energy > 0.05, "no reverb tail in export pad, energy {energy}");
         std::fs::remove_file(&out).ok();
+    }
+
+    #[test]
+    fn export_length_covers_whole_file_audio_tracks() {
+        // A 12 s whole-file source outlasts the 4-bar (8 s) default loop;
+        // the export must not cut it off.
+        let wav = std::env::temp_dir().join(format!("daw_export_wholefile_{}.wav", std::process::id()));
+        let spec = hound::WavSpec { channels: 1, sample_rate: 8000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for _ in 0..8000 * 12 { w.write_sample(1000i16).unwrap(); }
+        w.finalize().unwrap();
+        let mut p = Project::default_project();
+        p.tracks.clear(); p.patterns.clear(); p.arrangement.clear();
+        let t = p.add_track(TrackType::Audio);
+        p.tracks.iter_mut().find(|x| x.id == t).unwrap().instrument =
+            Instrument::AudioFile { path: wav.to_string_lossy().into_owned() };
+        let (out, sr) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
+        let secs = out.len() as f64 / 2.0 / sr as f64;
+        assert!(secs >= 12.0, "export covers the whole file, got {secs:.2} s");
+        let late = 11.5 * sr as f64;
+        assert!(out[(late as usize) * 2].abs() > 0.0, "audio still sounding at 11.5 s");
+        std::fs::remove_file(&wav).ok();
     }
 
     #[test]
@@ -695,6 +740,65 @@ mod sampler_variation_render_tests {
         assert_eq!(range,&full[start..start+range.len()]);
         std::fs::remove_file(&paths[2]).unwrap();
         assert!(render_project_samples(&p,Path::new("/missing.sf2"),false).unwrap_err().to_string().contains("sampler variant"));
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    /// A project with one sampler track playing a 2 s constant sample for a
+    /// quarter note at 120 BPM (0.5 s).
+    fn held_note_project(name: &str, gate: bool) -> (crate::project::Project, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("daw-{name}-{}-{}", std::process::id(),
+            std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).unwrap().as_nanos()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("long.wav");
+        let mut w = hound::WavWriter::create(&path, hound::WavSpec { channels: 1, sample_rate: 44100, bits_per_sample: 32, sample_format: hound::SampleFormat::Float }).unwrap();
+        // Alternating samples: the highest frequency, which a closed filter removes.
+        for k in 0..88200 { w.write_sample(if k % 2 == 0 { 0.3f32 } else { -0.3 }).unwrap(); }
+        w.finalize().unwrap();
+        let mut p = crate::project::Project::default_project();
+        p.tracks.clear(); p.patterns.clear(); p.arrangement.clear();
+        p.project.bpm = 120.; p.project.humanize = 0.; p.project.swing = 0.; p.project.timing = 0.;
+        p.add_track(crate::project::TrackType::Drum);
+        p.tracks[0].volume = 1.; p.tracks[0].pan = 0.; p.tracks[0].effects = Default::default();
+        p.tracks[0].instrument = serde_json::from_value(serde_json::json!({"type":"sampler","pads":[{"pitch":36,"path":path,"gate":gate}]})).unwrap();
+        p.tracks[0].patterns = vec!["hold".into()]; p.patterns.clear();
+        p.patterns.push(serde_json::from_value(serde_json::json!({"type":"piano_roll","id":"hold","name":"Hold","bars":1,"ticks_per_bar":480,"notes":[
+            {"pitch":36,"tick":0,"duration":120,"vel":127}]})).unwrap());
+        p.validate().unwrap();
+        (p, dir)
+    }
+    fn level(audio: &[f32], sr: u32, sec: f64) -> f32 {
+        let at = (sec * sr as f64) as usize * 2;
+        audio[at..at + 512].iter().fold(0f32, |a, x| a.max(x.abs()))
+    }
+    #[test]
+    fn gated_pad_follows_the_note_length_in_a_render_and_one_shots_ring_out() {
+        let (one_shot, dir_a) = held_note_project("oneshot", false);
+        let (audio, sr) = render_project_samples(&one_shot, Path::new("/missing.sf2"), false).unwrap();
+        assert!(level(&audio, sr, 0.25) > 0.29 && level(&audio, sr, 1.0) > 0.29, "one-shot ignores the note end");
+        let (gated, dir_b) = held_note_project("gated", true);
+        let (audio, sr) = render_project_samples(&gated, Path::new("/missing.sf2"), false).unwrap();
+        assert!(level(&audio, sr, 0.25) > 0.29, "held while the note lasts");
+        assert_eq!(level(&audio, sr, 0.6), 0.0, "released after the quarter note");
+        // The flag survives a save/load round trip and is omitted when off.
+        let json = serde_json::to_value(&gated).unwrap();
+        assert_eq!(json["tracks"][0]["instrument"]["pads"][0]["gate"], true);
+        assert!(serde_json::to_value(&one_shot).unwrap()["tracks"][0]["instrument"]["pads"][0].get("gate").is_none());
+        for dir in [dir_a, dir_b] { std::fs::remove_dir_all(dir).unwrap(); }
+    }
+    #[test]
+    fn cutoff_lfo_moves_a_sampler_track_in_a_render() {
+        let (mut p, dir) = held_note_project("lfo", false);
+        let (plain, sr) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
+        // Square LFO, 1 Hz: filter open for the first half second, shut for the next.
+        p.tracks[0].effects.cutoff = 0.6;
+        p.tracks[0].modulators = vec![crate::project::Modulator {
+            dest: crate::project::ModDest::Cutoff, shape: crate::project::LfoShape::Square, rate_hz: 1.0, depth: 0.5, phase: 0.0 }];
+        p.validate().unwrap();
+        let (swept, _) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
+        assert!(level(&plain, sr, 0.3) > 0.29 && level(&plain, sr, 0.8) > 0.29);
+        let (open, shut) = (level(&swept, sr, 0.3), level(&swept, sr, 0.8));
+        assert!(open > 0.25, "open half-cycle passes the sample: {open}");
+        assert!(shut < 0.02, "closed half-cycle filters it out: {shut}");
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

@@ -37,6 +37,17 @@ git clone https://github.com/hrubiian/daw-ai.git && cd daw-ai
 cargo run --release -- --gui examples/demo.daw.json  # desktop GUI
 ```
 
+Building on Linux needs a recent stable Rust and a few system libraries
+(Debian/Ubuntu names):
+
+```bash
+sudo apt-get install -y libasound2-dev libxkbcommon-x11-dev libwayland-dev \
+  libvulkan-dev libxcb1-dev libfontconfig1-dev libssl-dev pkg-config
+```
+
+`ffmpeg` is optional (needed for MP3 export); Surge XT is optional
+(sound design from words through the MCP server).
+
 - GNOME/Wayland: use `./run-gui.sh` for a normal resizable window
   on systems that need XWayland. Native Wayland also has client window controls.
 - Terminal UI instead: `cargo run --release` ([TUI guide](docs/tui.md)).
@@ -70,6 +81,7 @@ A disconnected agent reports an error instead of falling back to file replacemen
 | **Recording** | Transport-synced takes with count-in, punch-in/out, loop-cycle takes (one WAV per pass), MIDI recording into patterns, input metering with clip latch |
 | **Plugins** | CLAP hosting: instruments and insert effects, plugin discovery, generic param editing, state saved in the project |
 | **AI** | MCP server (~30 tools), JSON project format, JAM hot-reload, listening/analysis tools, auto-balance |
+| **Guitar** | Low-latency live amp rig (gate, boost, amp, modeled cabinets with A/B blend, pedals), custom cabinet IRs, presets, recording dry or through the rig, optional AmpForge CLAP backend ([guide](docs/guitar-amp.md)) |
 | **I/O** | GM soundfonts (per-track `.sf2`), velocity-layered samplers with alternate takes, audio clips, MIDI input, WAV and MP3 export |
 
 ## Architecture
@@ -77,7 +89,7 @@ A disconnected agent reports an error instead of falling back to file replacemen
 | Crate | Role |
 |---|---|
 | `daw-core` | Engine, mixer graph, sequencer, project format, analysis — no UI dependencies |
-| `daw-io` | Host glue: audio/MIDI device handling, capture, the engine relay |
+| `daw-io` | Host glue: audio/MIDI device handling, capture, guitar monitor, user config, the engine relay |
 | `daw-gpui` | Desktop GUI (gpui) |
 | `daw-tui` | Terminal UI (ratatui) |
 | `daw-mcp` | MCP server over a selected live session or project file (rmcp, stdio) |
@@ -95,13 +107,9 @@ and verified one slice at a time.
 - [MP3 export](docs/mp3-export.md)
 - [Listening and analysis tools](docs/analysis-and-ci.md)
 - [Musical collaboration workflow](docs/music-collaboration.md)
+- [Guitar amp and low-latency monitoring](docs/guitar-amp.md)
+- [Audio engine audit](docs/audio-engine-audit.md) · [Desktop UI review](docs/ui-review.md)
 - [CLAUDE.md](CLAUDE.md) — working on the codebase (with an AI or without)
-
-## Roadmap
-
-Automation lanes · piano-roll velocity/CC editing · take comping ·
-time-stretch · richer expression/articulation editing · DAWproject
-export · de-click micro-fades.
 
 ## License
 
@@ -110,19 +118,14 @@ fetched samples carry their own free licenses — see `fetch-assets.sh`.
 
 ---
 
-## P.S. — status
+## About this project
 
-**daw-ai is an experimental project, currently in beta testing.** It is
-**not** intended for serious music production. Its real purpose is a test
-bench: to measure how well current state-of-the-art LLMs can compose,
-arrange, and mix music when handed a real audio engine and a feedback loop
-(`listen`). The DAW is the instrument, the model is the musician, and this
-repo is the experiment. Expect rough edges, breaking changes, and bugs —
-and feel free to share what your model makes.
+daw-ai is an experimental research project. It serves as a test bench for
+measuring how well current state-of-the-art language models can compose,
+arrange and mix music when given a real audio engine and an audio feedback
+loop (the `listen` tool).
 
-**Ideas are very welcome.** If you have a feature, a direction, or just
-want to talk about where this could go, open an issue or get in touch with
-the developer: **nazariihrubiian@gmail.com**.
+Contact: nazariihrubiian@gmail.com
 
 ## Verification
 
@@ -130,3 +133,5 @@ Run `bash scripts/check.sh` for the Linux build, MCP protocol checks, workspace
 tests and Clippy. Set `DAW_REQUIRE_TEST_ASSETS=1` when the test soundfont is
 installed. MP3 integration tests require FFmpeg with libmp3lame. Hardware tests
 remain explicit; headless checks do not certify every audio device or plugin.
+See [CLAUDE.md](CLAUDE.md) for the crate layout and conventions. Issues and
+pull requests are welcome.

@@ -3,6 +3,20 @@ use super::*;
 const PLAYHEAD_GREEN: u32 = 0x4ade80;
 
 impl DawView {
+    /// One drag event on audio clip `idx` at cursor x `mouse_x`: snapshot
+    /// for undo when the drag starts, place the clip from its anchor (see
+    /// `HeadlessState::drag_audio_clip`) and push the edit live.
+    fn drag_audio_clip(&mut self, idx: usize, kind: AudioDragKind, mouse_x: f32, pps: f32, cx: &mut Context<Self>) {
+        if !self.st.is_audio_drag(idx, kind) {
+            let label = if kind == AudioDragKind::Move { "move audio clip" } else { "crop clip" };
+            self.undo.record(label, &self.st.project);
+        }
+        if self.st.drag_audio_clip(idx, kind, mouse_x, pps) {
+            self.push_live();
+            cx.notify();
+        }
+    }
+
     pub(super) fn track_h(&self, id: &str) -> f32 {
         self.st.track_heights.get(id).copied().unwrap_or(TRACK_H)
     }
@@ -18,8 +32,8 @@ impl DawView {
     }
 
     /// Visible height of the track-rows viewport (below the ruler), derived from
-    /// the window height minus the fixed chrome: menu(24) + optional sf2 banner
-    /// + transport(48) + song toolbar(30) + status(18), then the editor dock
+    /// the window height minus the fixed chrome (menu 24, optional sf2 banner,
+    /// transport 48, song toolbar 30, status 18), then the editor dock
     /// (splitter 5 + dock_h, absent in full-arrange mode), then the ruler.
     pub(super) fn tracks_vis_h(&self, window_h: f32) -> f32 {
         let banner = if self.sf2_missing { 22.0 } else { 0.0 };
@@ -166,6 +180,7 @@ impl DawView {
                                     cx.notify();
                                 }
                             })))
+                            .child(self.track_input_button(t, cx))
                             .child(div().id(SharedString::from(format!("instrument-{id}")))
                                 .tooltip({
                                     let text = SharedString::from(instr.clone());
@@ -396,7 +411,12 @@ impl DawView {
                                     .patterns
                                     .iter()
                                     .find(|p| p.id() == pid)
-                                    .map(|p| clip_preview_marks(p, bw * span as f32, th - 8.0, span * daw_core::sequencer::TICKS_PER_BAR))
+                                    .map(|p| {
+                                        // Clip-local x of the visible timeline window.
+                                        let clip_x = bar as f32 * bw + off_px;
+                                        clip_preview_marks_in(p, bw * span as f32, th - 8.0, span * daw_core::sequencer::TICKS_PER_BAR,
+                                            scroll_x - clip_x - 16.0, scroll_x - clip_x + vis_w + 16.0)
+                                    })
                                     .unwrap_or_default();
                                 div().absolute().inset_0().children(marks.into_iter().map(|(x, y, w, h)| {
                                     div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).rounded_sm().bg(rgb(BG))
@@ -458,7 +478,6 @@ impl DawView {
                                     .on_drag(ResizeClip { track: tid.clone(), bar }, |_, _, _, cx| cx.new(|_| EmptyDrag))
                                     .on_drag_move(cx.listener({
                                         let tr = tid.clone();
-                                        let bw = bw;
                                         move |this, e: &DragMoveEvent<ResizeClip>, _w, cx| {
                                             // Only the clip actually being dragged should resize:
                                             // on_drag_move fires for every ResizeClip handler.
@@ -575,29 +594,19 @@ impl DawView {
                         .border_color(rgb(BORDER))
                         .overflow_hidden()
                         .cursor_pointer()
+                        // Every press starts a fresh drag anchor (the edge
+                        // handles' presses bubble here too).
+                        .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.st.end_audio_drag()))
                         .on_click(cx.listener(move |this, _e, _w, cx| {
                             // Start playback from exactly where this audio clip begins.
                             this.seek_to_sec(start_sec);
                             cx.notify();
                         }))
                         .on_drag(AudioMove { idx }, |_, _, _, cx| cx.new(|_| EmptyDrag))
-                        .on_drag_move(cx.listener({
-                            move |this, e: &DragMoveEvent<AudioMove>, _w, cx| {
-                                // Only the dragged clip moves (fires for every AudioMove handler).
-                                if e.drag(cx).idx != idx { return; }
-                                // Block's current left (px) tracks start_sec; move it so its
-                                // left follows the cursor. Converges as the block re-renders.
-                                let block_x = f32::from(e.bounds.origin.x);
-                                let mouse_x = f32::from(e.event.position.x);
-                                let delta_sec = (mouse_x - block_x) / pps;
-                                if delta_sec.abs() > 0.001 {
-                                    let cur = this.st.project.audio_clips.get(idx).map(|c| c.start_sec).unwrap_or(0.0);
-                                    this.undo.record("move audio clip", &this.st.project);
-                                    this.st.project.move_audio_clip(idx, cur + delta_sec as f64);
-                                    this.push_live();
-                                    cx.notify();
-                                }
-                            }
+                        .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<AudioMove>, _w, cx| {
+                            // Only the dragged clip moves (fires for every AudioMove handler).
+                            if e.drag(cx).idx != idx { return; }
+                            this.drag_audio_clip(idx, AudioDragKind::Move, f32::from(e.event.position.x), pps, cx);
                         }))
                         .child(
                             div().absolute().inset_0().flex().items_center()
@@ -627,16 +636,7 @@ impl DawView {
                                 .on_drag(AudioCropL { idx }, |_, _, _, cx| cx.new(|_| EmptyDrag))
                                 .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<AudioCropL>, _w, cx| {
                                     if e.drag(cx).idx != idx { return; }
-                                    // handle's left ≈ clip's left edge; cursor delta (px→sec) trims the front.
-                                    let handle_x = f32::from(e.bounds.origin.x);
-                                    let mouse_x = f32::from(e.event.position.x);
-                                    let delta_sec = (mouse_x - handle_x) / pps;
-                                    if delta_sec.abs() > 0.001 {
-                                        this.undo.record("crop clip", &this.st.project);
-                                        this.st.project.crop_audio_clip_start(idx, delta_sec as f64);
-                                        this.push_live();
-                                        cx.notify();
-                                    }
+                                    this.drag_audio_clip(idx, AudioDragKind::CropStart, f32::from(e.event.position.x), pps, cx);
                                 }))
                         )
                         .child(
@@ -649,19 +649,7 @@ impl DawView {
                                 .on_drag(AudioCropR { idx }, |_, _, _, cx| cx.new(|_| EmptyDrag))
                                 .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<AudioCropR>, _w, cx| {
                                     if e.drag(cx).idx != idx { return; }
-                                    // handle sits at clip's right edge; (mouse - handle) is the length delta.
-                                    // Read len_sec into a local first to avoid borrow conflict.
-                                    let handle_x = f32::from(e.bounds.origin.x);
-                                    let mouse_x = f32::from(e.event.position.x);
-                                    let delta_sec = (mouse_x - handle_x) / pps;
-                                    let cur_len = this.st.project.audio_clips.get(idx).map(|c| c.len_sec).unwrap_or(0.01);
-                                    let new_len = (cur_len + delta_sec as f64).max(0.01);
-                                    if delta_sec.abs() > 0.001 {
-                                        this.undo.record("crop clip", &this.st.project);
-                                        this.st.project.crop_audio_clip_end(idx, new_len);
-                                        this.push_live();
-                                        cx.notify();
-                                    }
+                                    this.drag_audio_clip(idx, AudioDragKind::CropEnd, f32::from(e.event.position.x), pps, cx);
                                 }))
                         )
                         .into_any_element()

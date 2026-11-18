@@ -7,7 +7,10 @@ pub mod diff;
 pub mod groove;
 pub mod mix_analysis;
 pub mod snapshot;
+pub mod sound_design;
+pub mod sound_traits;
 pub mod store;
+pub mod synth_map;
 pub mod tools;
 
 pub mod jobs;

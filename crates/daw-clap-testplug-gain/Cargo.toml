@@ -10,3 +10,6 @@ crate-type = ["cdylib"]
 [dependencies]
 clack-plugin = "0.1"
 clack-extensions = { version = "0.1", features = ["clack-plugin", "audio-ports", "params", "state"] }
+
+[lints]
+workspace = true

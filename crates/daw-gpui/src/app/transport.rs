@@ -10,7 +10,7 @@ impl DawView {
         // Pausing also punches out an active audio take.
         if !self.playing {
             use daw_core::audio::input::RecordPhase;
-            if matches!(self.audio_rec.phase, RecordPhase::AwaitingRoll | RecordPhase::Recording) {
+            if self.audio_take_active || matches!(self.audio_rec.phase, RecordPhase::AwaitingRoll | RecordPhase::Recording) {
                 self.stop_audio_take();
             }
         }
@@ -35,15 +35,21 @@ impl DawView {
         }
         {
             use daw_core::audio::input::RecordPhase;
-            match self.audio_rec.phase {
-                RecordPhase::AwaitingRoll | RecordPhase::Recording => self.stop_audio_take(),
-                // Stop while armed-but-idle disarms (closes the input stream).
-                RecordPhase::Armed => {
-                    self.audio_rec.disarm();
-                    self.host.disarm_input();
-                    self.st.set_status("record disarmed");
+            if self.audio_take_active {
+                self.stop_audio_take();
+            } else if !self.audio_take_finishing {
+                match self.audio_rec.phase {
+                    RecordPhase::AwaitingRoll | RecordPhase::Recording => self.stop_audio_take(),
+                    // Stop while armed-but-idle disarms (closes the input stream).
+                    RecordPhase::Armed => {
+                        self.audio_rec.disarm();
+                        self.host.disarm_input();
+                        self.armed_track = None;
+                        self.armed_input = None;
+                        self.st.set_status("record disarmed");
+                    }
+                    RecordPhase::Idle => {}
                 }
-                RecordPhase::Idle => {}
             }
         }
         self.playing = false;
@@ -163,6 +169,8 @@ impl DawView {
     /// Rec pill: audio track → audio take flow; otherwise the MIDI-record flow.
     pub(super) fn toggle_record(&mut self) {
         use daw_core::audio::input::RecordPhase;
+        if self.audio_take_active { self.stop_audio_take(); return; }
+        if self.audio_take_finishing { self.st.set_status("finishing take…"); return; }
         if !self.selected_track_is_audio() {
             self.toggle_midi_record();
             return;
@@ -176,12 +184,21 @@ impl DawView {
 
     /// First Rec press on an audio track: open the input stream, meter live.
     pub(super) fn arm_audio_record(&mut self) {
-        match self.host.arm_input(&self.config) {
+        let Some(track_id) = self.st.selected_track.clone() else { return };
+        let Some(input) = self.effective_track_input(&track_id) else { return };
+        let mut cfg = self.config.clone();
+        cfg.input_device = input.device.clone();
+        cfg.input_channels = input.channels;
+        let guitar = input.source.uses_guitar(self.host.monitor.is_some());
+        match self.host.arm_input(&cfg, guitar) {
             Ok(cs) => {
                 cs.reset_clip_latch();
                 let name = cs.device_name.clone();
                 self.audio_rec.arm();
-                self.st.set_status(format!("armed: {name} — Rec to start, Stop to disarm"));
+                self.armed_track = Some(track_id);
+                self.armed_input = Some(input);
+                self.capture_guitar = guitar;
+                self.st.set_status(format!("armed: {name} · {} — Rec to start, Stop to disarm", if guitar { if cfg.guitar.ampforge_enabled { "AmpForge" } else { "amp + cabinet" } } else { "dry input" }));
             }
             Err(e) => self.st.set_status(format!("input unavailable: {e}")),
         }
@@ -190,10 +207,20 @@ impl DawView {
     /// Re-open the capture stream after a device/channel change (armed only —
     /// never mid-take).
     pub(super) fn reopen_capture_if_armed(&mut self) {
+        // The guitar amp follows the same input device and channel.
+        if self.host.monitor.is_some() { self.start_monitor(); }
+        self.rearm_capture_if_armed();
+    }
+
+    pub(super) fn rearm_capture_if_armed(&mut self) {
         use daw_core::audio::input::RecordPhase;
-        if self.host.capture.is_some() && self.audio_rec.phase == RecordPhase::Armed {
+        if !self.audio_take_active && !self.audio_take_finishing && self.host.capture.is_some() && self.audio_rec.phase == RecordPhase::Armed {
             self.host.disarm_input();
+            self.audio_rec.disarm();
+            let selection = self.st.selected_track.clone();
+            self.st.selected_track = self.armed_track.clone();
             self.arm_audio_record();
+            self.st.selected_track = selection;
         }
     }
 
@@ -201,6 +228,23 @@ impl DawView {
     /// transport is already rolling — punch-in).
     pub(super) fn start_audio_take(&mut self) {
         let Some(track_id) = self.st.selected_track.clone() else { return };
+        // The route must belong to the track receiving this take.
+        if self.armed_track.as_deref() != Some(track_id.as_str())
+            || self.armed_input != self.effective_track_input(&track_id)
+            || self.host.capture.is_none()
+        {
+            self.host.disarm_input();
+            self.audio_rec.disarm();
+            self.arm_audio_record();
+            if self.audio_rec.phase != daw_core::audio::input::RecordPhase::Armed { return; }
+        }
+        if let Some(input) = self.effective_track_input(&track_id) {
+            self.capture_guitar = input.source.uses_guitar(self.host.monitor.is_some());
+        }
+        if let Err(e) = self.sync_capture_tone() {
+            self.st.set_status(format!("cannot record guitar rack: {e}"));
+            return;
+        }
         let safe: String = track_id
             .chars()
             .map(|c| if c.is_alphanumeric() || c == '-' || c == '_' { c } else { '_' })
@@ -216,8 +260,13 @@ impl DawView {
             let _ = std::fs::create_dir_all(parent);
         }
         let Some(cs) = self.host.capture.as_ref() else { return };
+        if self.config.guitar.ampforge_enabled {
+            if let Some(plugin) = self.host.monitor.as_mut().and_then(|m| m.plugin.as_mut()) { plugin.hide_editor(); }
+        }
         cs.begin_session(base);
+        self.rec_track = Some(track_id.clone());
         self.audio_rec.begin();
+        self.audio_take_active = true;
         let bars = if self.playing { 0 } else { self.config.count_in_bars };
         let _ = self.send_command(SequencerCommand::RecordStart { count_in_bars: bars });
         self.playing = true;
@@ -231,6 +280,8 @@ impl DawView {
     /// Punch out: finalize the take; the transport keeps rolling. The clip is
     /// placed when the TakeResult arrives in `poll_recording`.
     pub(super) fn stop_audio_take(&mut self) {
+        self.audio_take_active = false;
+        self.audio_take_finishing = true;
         if let Some(cs) = self.host.capture.as_ref() {
             cs.end_session();
         }
@@ -242,6 +293,10 @@ impl DawView {
     /// Returns true while the meter should repaint (capture stream open).
     pub(super) fn poll_recording(&mut self) -> bool {
         use daw_core::audio::input::{RecordPhase, TRANSPORT_ROLLING};
+        // Acquire completion before draining results: a finished writer has
+        // published every take, so reopening cannot discard an unread WAV.
+        let writer_finished = self.host.capture.as_ref()
+            .is_none_or(|c| !c.shared.session_active.load(Ordering::Acquire));
         if self.audio_rec.phase == RecordPhase::AwaitingRoll
             && self.host.transport_state.load(Ordering::Relaxed) == TRANSPORT_ROLLING
         {
@@ -267,7 +322,15 @@ impl DawView {
                 self.st.set_status("take too short — discarded");
                 continue;
             };
-            let Some(track_id) = self.st.selected_track.clone() else { continue };
+            // The take belongs to the track it was started on, even if the
+            // selection moved while it recorded (or that track is gone).
+            let target = self.rec_track.clone().or_else(|| self.st.selected_track.clone())
+                .filter(|id| self.st.project.tracks.iter().any(|t| &t.id == id
+                    && t.track_type == daw_core::project::TrackType::Audio));
+            let Some(track_id) = target else {
+                self.st.set_status(format!("take kept on disk (its track was removed): {}", take.path.display()));
+                continue;
+            };
             let path_str = take.path.to_string_lossy().into_owned();
             // Undo removes the clip from the project; the WAV stays on disk.
             self.undo.record("record take", &self.st.project);
@@ -293,6 +356,10 @@ impl DawView {
             } else {
                 self.st.set_status(format!("take saved: {path_str}"));
             }
+        }
+        if self.audio_take_finishing && writer_finished {
+            self.audio_take_finishing = false;
+            self.audio_rec.arm(); // Also recovers a count-in canceled before any frames arrived.
         }
         self.host.capture.is_some()
     }

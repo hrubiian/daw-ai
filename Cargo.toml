@@ -10,7 +10,21 @@ members = [
     "crates/daw-clap-testplug-gain", "crates/daw-clap-testplug-tone",
     "crates/daw-mcp",
 ]
+exclude = ["vendor/cpal"]
 resolver = "2"
+
+# Style lints that fight real-time audio code: indexed loops over parallel
+# buffers, unboxed event enums (no allocation on the audio thread) and wide
+# DSP constructors are deliberate here. Everything else in Clippy stays on.
+[workspace.lints.clippy]
+too_many_arguments = "allow"
+type_complexity = "allow"
+needless_range_loop = "allow"
+large_enum_variant = "allow"
+result_large_err = "allow"
+
+[lints]
+workspace = true
 
 [dependencies]
 daw-tui             = { path = "crates/daw-tui" }
@@ -21,12 +35,19 @@ anyhow              = "1"
 crossbeam-channel   = "0.5"
 
 # Keep GPUI development/test builds practical on smaller workstations.
+# `cargo run` / ./run-gui.sh must be usable for real work: an unoptimized UI
+# toolkit and synth cost ~9x per frame (measured with the daw-gpui
+# `frame_cost_on_a_large_song` benchmark). Dependencies are built fully
+# optimized once; workspace crates get light optimization and keep line-level
+# debug info, so rust-gdb and backtraces still work.
 [profile.dev]
 debug = 1
 incremental = false
+opt-level = 1
 
 [profile.dev.package."*"]
 debug = 0
+opt-level = 3
 
 [profile.test]
 debug = 1
@@ -34,3 +55,7 @@ incremental = false
 
 [profile.test.package."*"]
 debug = 0
+
+# CPAL 0.15.3 ALSA shutdown fix; see vendor/cpal/DAW-PATCH.md.
+[patch.crates-io]
+cpal = { path = "vendor/cpal" }

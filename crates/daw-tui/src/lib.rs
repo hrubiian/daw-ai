@@ -44,6 +44,9 @@ fn event_loop(
         // JAM mode: hot-reload the project file if it changed on disk
         app.poll_hot_reload();
 
+        // Audio takes: latch the roll, place finished takes as clips
+        app.poll_recording();
+
         // Drain MIDI events — audio is already sent by the midir thread;
         // here we handle step-recording, button dispatch, and monitor updates
         while let Ok(ev) = app.midi_ev_rx.try_recv() {

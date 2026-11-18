@@ -3,6 +3,8 @@
 //!
 //! `daw-core` stays free of I/O dependencies; `midir` lives here.
 pub mod config;
+pub mod cabinet;
+pub mod guitar_presets;
 pub mod host;
 pub mod midi;
 pub mod midi_map;

@@ -26,3 +26,15 @@ recordings/
 # Personal/generated agent skills and packaged skills stay local.
 skills/
 *.skill
+
+# Cabinet IRs (built-in cabinets are synthesized in code) and personal
+# material kept local: screenshots, songwriting notes, plans, other agents.
+/assets/ir/
+/screenshots/
+/docs/superpowers/plans/
+/docs/bonobo-composer-experiment.md
+/docs/trip-hop-workflow-check.md
+/examples/inhuman-canon.daw.json
+/AGENTS.md
+/.codex/
+/docs/expressive-phrasing.md

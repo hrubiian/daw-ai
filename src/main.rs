@@ -90,8 +90,6 @@ fn main() -> Result<()> {
     // 2. Boot the engine: audio thread + sequencer + MIDI input, project loaded.
     let sf2_path = PathBuf::from("assets/GeneralUser.sf2");
     let sf2_str = sf2_path.to_string_lossy().into_owned();
-    // The legacy in-engine input recorder is TUI-only; the GPUI frontend uses
-    // the dedicated capture subsystem (no second stream grabbing input devices).
     let runtime_project = project_fmt::resolve_assets(
         &project,
         project_path
@@ -105,7 +103,7 @@ fn main() -> Result<()> {
         println!("Exported MP3: {}", output.display());
         return Ok(());
     }
-    let mut host = Host::start(&runtime_project, sf2_path, !gui);
+    let mut host = Host::start(&runtime_project, sf2_path);
     match daw_io::session::LiveSession::start(project.clone(), project_path.as_deref(), &host) {
         Ok(session) => host.session = Some(session),
         Err(e) => {
@@ -126,7 +124,11 @@ fn main() -> Result<()> {
         project,
         project_path,
         host.cmd_tx.clone(),
-        host.record_ctrl.clone(),
+        daw_tui::app::RecordTransport {
+            take_gate: Arc::clone(&host.take_gate),
+            roll_start_tick: Arc::clone(&host.roll_start_tick),
+            transport_state: Arc::clone(&host.transport_state),
+        },
         host.midi_ev_rx.clone(),
         Arc::clone(&host.midi_channel),
         host.midi_device.clone(),

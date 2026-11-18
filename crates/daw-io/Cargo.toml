@@ -9,8 +9,15 @@ daw-core          = { path = "../daw-core" }
 midir             = "0.10"
 crossbeam-channel = "0.5"
 anyhow            = "1"
+hound             = "3"
 serde             = { version = "1", features = ["derive"] }
 serde_json        = "1"
 
 [features]
 test-support = []
+
+[target.'cfg(any(target_os = "linux", target_os = "dragonfly", target_os = "freebsd", target_os = "netbsd"))'.dev-dependencies]
+libc = "0.2"
+
+[lints]
+workspace = true

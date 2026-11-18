@@ -4,7 +4,7 @@
 //!
 //! This module is cpal-free: the live engine callback and the offline WAV
 //! exporter both drive the same `Mixer`, so exports sound like playback by
-//! construction. See `docs/superpowers/specs/2026-06-10-mixer-graph-slice-a-design.md`.
+//! construction.
 
 use std::f64::consts::PI;
 use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
@@ -171,6 +171,17 @@ pub struct InsertChain {
     eq_comp:        EqComp,
     drive:          f32,
     lp_alpha:       f32, // 1.0 = fully open (bypass)
+    /// Where `lp_alpha` is heading: the configured cutoff, or an LFO's
+    /// override. The coefficient glides there so sweeps and edits don't step.
+    lp_target:      f32,
+    /// Cutoff from the track's effect chain (what a cleared LFO returns to).
+    lp_base:        f32,
+    lp_mod:         Option<f32>,
+    /// Per-sample glide factor for `lp_alpha` (≈30 ms).
+    lp_glide:       f32,
+    /// False until the first processed frame: a fresh chain adopts its
+    /// configuration at once instead of sweeping in from fully open.
+    primed:         bool,
     lp_l:           f32,
     lp_r:           f32,
     delay_buf_l:    Vec<f32>,
@@ -189,6 +200,11 @@ impl InsertChain {
             eq_comp:        EqComp::bypass(),
             drive:          0.0,
             lp_alpha:       1.0,
+            lp_target:      1.0,
+            lp_base:        1.0,
+            lp_mod:         None,
+            lp_glide:       1.0 - (-1.0 / (sample_rate.max(1) as f32 * 0.03)).exp(),
+            primed:         false,
             lp_l:           0.0,
             lp_r:           0.0,
             delay_buf_l:    vec![0.0; max_delay],
@@ -210,9 +226,8 @@ impl InsertChain {
         );
     }
 
-    /// Loose-parameter form, shared with the legacy `SetClipEffects` event.
     #[allow(clippy::too_many_arguments)]
-    pub fn configure_raw(&mut self,
+    fn configure_raw(&mut self,
         delay_time_ms: u32, delay_feedback: f32, delay_mix: f32, cutoff: f32, drive: f32,
         eq_low_gain: f32, eq_mid_gain: f32, eq_high_gain: f32, eq_mid_freq: f32,
         comp_threshold: f32, comp_ratio: f32, comp_attack_ms: f32, comp_release_ms: f32,
@@ -223,11 +238,21 @@ impl InsertChain {
             self.sample_rate,
         );
         self.drive          = drive.clamp(0.0, 1.0);
-        self.lp_alpha       = cutoff.clamp(0.0, 1.0).powi(2);
+        self.lp_base        = cutoff.clamp(0.0, 1.0).powi(2);
+        self.lp_target      = self.lp_mod.unwrap_or(self.lp_base);
+        if !self.primed { self.lp_alpha = self.lp_target; }
         self.delay_samples  = (((delay_time_ms as f32 / 1000.0) * self.sample_rate) as usize)
                                   .min(self.delay_buf_l.len().saturating_sub(1));
         self.delay_feedback = delay_feedback.clamp(0.0, 0.95);
         self.delay_mix      = delay_mix.clamp(0.0, 1.0);
+    }
+
+    /// LFO override of the low-pass cutoff (`0..=1`, same curve as the effect
+    /// chain's `cutoff`); `None` returns to the configured value.
+    pub fn modulate_cutoff(&mut self, cutoff: Option<f32>) {
+        self.lp_mod = cutoff.map(|c| c.clamp(0.0, 1.0).powi(2));
+        self.lp_target = self.lp_mod.unwrap_or(self.lp_base);
+        if !self.primed { self.lp_alpha = self.lp_target; }
     }
 
     /// Process one frame. Stage order mirrors the pre-mixer engine clip path
@@ -242,6 +267,11 @@ impl InsertChain {
             r = (r * gain).tanh();
         }
 
+        self.primed = true;
+        if self.lp_alpha != self.lp_target {
+            self.lp_alpha += self.lp_glide * (self.lp_target - self.lp_alpha);
+            if (self.lp_alpha - self.lp_target).abs() < 1e-4 { self.lp_alpha = self.lp_target; }
+        }
         // One-pole low-pass (alpha = 1.0 → bypass)
         self.lp_l += self.lp_alpha * (l - self.lp_l);
         self.lp_r += self.lp_alpha * (r - self.lp_r);
@@ -379,6 +409,21 @@ pub struct Freeverb {
 }
 
 impl Freeverb {
+    /// Discard tails when a live pedal is bypassed or its mode changes.
+    /// Reuses all existing storage and is safe for a control update.
+    pub fn clear(&mut self) {
+        for comb in self.combs_l.iter_mut().chain(self.combs_r.iter_mut()) {
+            comb.buf.fill(0.);
+            comb.pos = 0;
+            comb.filter_store = 0.;
+        }
+        for allpass in self.aps_l.iter_mut().chain(self.aps_r.iter_mut()) {
+            allpass.buf.fill(0.);
+            allpass.pos = 0;
+        }
+        self.tone.clear();
+        self.predelay.clear();
+    }
     pub fn new(sample_rate: u32) -> Self {
         let scale = sample_rate as f64 / 44_100.0;
         let sz = |n: usize| ((n as f64 * scale).round() as usize).max(1);
@@ -543,9 +588,7 @@ impl PingPongDelay {
 
 /// Engine events, routed by strip index (= track index in the project).
 /// `STRIP_UTILITY` targets the always-present utility synth (metronome,
-/// previews). The `LoadClip*`/`PlayClip`/`StopClip`/`SetClipEffects` variants
-/// are the legacy TUI preview path, handled by the engine callback directly
-/// (not by `Mixer::handle_event`).
+/// previews).
 /// Convert a microtonal detune in cents to a 14-bit MIDI pitch-bend value
 /// (0..=16383, where 8192 is no bend). Assumes the synth's default ±2-semitone
 /// (±200-cent) bend range; magnitudes beyond that clamp to the 14-bit endpoints.
@@ -569,9 +612,13 @@ pub enum AudioEvent {
     SetStripMute { strip: u8, muted: bool },
     /// Full per-strip insert chain + the GM CC subset to the strip's synth.
     SetStripEffects { strip: u8, effects: crate::project::EffectChain },
-    /// GM CC effects only (reverb/chorus/cutoff/resonance/LFO) to a strip synth.
-    SetMidiEffects { strip: u8, reverb: f32, chorus: f32, cutoff: f32, resonance: f32, lfo_depth: f32 },
     RawCC     { strip: u8, cc: u8, value: u8 },
+    /// Track LFO output for one destination (`cc` from `ModDest::cc`), `0..=1`.
+    /// Cutoff drives the strip's insert low-pass on every strip kind; volume
+    /// and pan replace the fader/pan on synth-less strips (sampler, audio,
+    /// CLAP) and go to the SoundFont synth as CC7/CC10 otherwise. `None`
+    /// clears the override when the modulator is removed.
+    Modulate  { strip: u8, cc: u8, value: Option<f32> },
     PitchBend { strip: u8, lsb: u8, msb: u8 },
     /// Trigger a one-shot sampler pad on a strip (gain = velocity 0..1).
     TriggerSample { strip: u8, pitch: u8, gain: f32 },
@@ -607,17 +654,6 @@ pub enum AudioEvent {
     CollectClapState { reply: crossbeam_channel::Sender<Vec<(String, Vec<u8>)>> },
     /// Immediately silence every synth voice on all strips + utility.
     Panic,
-    // ── Legacy TUI preview path (engine-handled, unchanged semantics) ────────
-    LoadClipFromFile { path: String, volume: f32 },
-    LoadClip  { left: Vec<f32>, right: Vec<f32>, volume: f32 },
-    PlayClip,
-    StopClip,
-    #[allow(clippy::too_many_arguments)]
-    SetClipEffects {
-        delay_time_ms: u32, delay_feedback: f32, delay_mix: f32, cutoff: f32, drive: f32,
-        eq_low_gain: f32, eq_mid_gain: f32, eq_high_gain: f32, eq_mid_freq: f32,
-        comp_threshold: f32, comp_ratio: f32, comp_attack_ms: f32, comp_release_ms: f32,
-    },
 }
 
 // ── Strip construction specs ──────────────────────────────────────────────────
@@ -709,12 +745,14 @@ struct VelocityLayer {
 /// Built off-thread. Matching velocity layers rotate deterministically, while
 /// uncovered velocities use the original pad. Existing voices retain their take.
 pub struct SamplerPadAudio {
+    /// Note-off releases the voice (≈30 ms fade) instead of playing to the end.
+    pub gate: bool,
     fallback: SampleTake,
     layers: Vec<VelocityLayer>,
 }
 impl SamplerPadAudio {
     pub fn new(left: Arc<Vec<f32>>, right: Arc<Vec<f32>>, gain: f32) -> Self {
-        Self { fallback: SampleTake { left, right, gain }, layers: Vec::new() }
+        Self { gate: false, fallback: SampleTake { left, right, gain }, layers: Vec::new() }
     }
     fn add_take(&mut self, min: u8, max: u8, left: Arc<Vec<f32>>, right: Arc<Vec<f32>>, gain: f32) {
         let take = SampleTake { left, right, gain };
@@ -741,6 +779,8 @@ struct SampleVoice {
     take: usize,
     position: usize,
     gain: f32,
+    /// Frames left of a note-off release (`None` = still held / one-shot).
+    release: Option<usize>,
 }
 
 /// One mixer channel. Built off the RT thread (relay), processed on it.
@@ -767,6 +807,15 @@ pub struct Strip {
     /// CLAP insert chain, in order (uids into `Mixer.clap`).
     pub clap_fx: Vec<String>,
     pub meter: Arc<StripMeter>,
+    /// Smoothed left/right fader gains actually applied; they glide to the
+    /// fader/pan/mute targets so edits and mutes never click.
+    gain_l: f32,
+    gain_r: f32,
+    /// False until the first rendered block (which adopts the targets at once).
+    gain_primed: bool,
+    /// LFO overrides of the fader and pan (synth-less strips only).
+    mod_gain: Option<f32>,
+    mod_pan: Option<f32>,
 }
 
 impl Strip {
@@ -778,7 +827,16 @@ impl Strip {
             self.sample_voices.remove(0);
             SAMPLER_VOICE_STEALS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
-        self.sample_voices.push(SampleVoice { pitch, layer, take, position: 0, gain });
+        self.sample_voices.push(SampleVoice { pitch, layer, take, position: 0, gain, release: None });
+    }
+
+    /// Note-off for a gated pad: release the oldest still-held voice of this
+    /// pitch, so overlapping repeats each keep their own length.
+    fn release_sample(&mut self, pitch: u8, release_frames: usize) {
+        if !self.pads.get(&pitch).is_some_and(|pad| pad.gate) { return; }
+        if let Some(voice) = self.sample_voices.iter_mut().find(|v| v.pitch == pitch && v.release.is_none()) {
+            voice.release = Some(release_frames.max(1));
+        }
     }
 
     /// A synthless strip (sampler/audio) with bypass inserts at unity.
@@ -798,6 +856,11 @@ impl Strip {
             clap_instrument: None,
             clap_fx: Vec::new(),
             meter: Arc::new(StripMeter::new()),
+            gain_l: 0.0,
+            gain_r: 0.0,
+            gain_primed: false,
+            mod_gain: None,
+            mod_pan: None,
         }
     }
 
@@ -960,6 +1023,8 @@ impl Mixer {
                             p.queue_note_off(pitch);
                         } else if let Some(s) = st.synth.as_mut() {
                             s.note_off(st.gm_channel, pitch as i32);
+                        } else {
+                            st.release_sample(pitch, (self.sample_rate as f32 * 0.03) as usize);
                         }
                     }
                 }
@@ -1003,16 +1068,6 @@ impl Mixer {
                     st.synth_msg(0xB0, 1,  cc(effects.lfo_depth));
                 }
             }
-            AudioEvent::SetMidiEffects { strip, reverb, chorus, cutoff, resonance, lfo_depth } => {
-                if let Some(st) = self.strip_mut(strip) {
-                    st.send_reverb = reverb.clamp(0.0, 1.0);
-                    let cc = |v: f32| (v.clamp(0.0, 1.0) * 127.0) as i32;
-                    st.synth_msg(0xB0, 93, cc(chorus));
-                    st.synth_msg(0xB0, 74, cc(cutoff));
-                    st.synth_msg(0xB0, 71, cc(resonance));
-                    st.synth_msg(0xB0, 1,  cc(lfo_depth));
-                }
-            }
             AudioEvent::SetReturns { returns } => {
                 let rv = &mut self.returns[0];
                 rv.gain = returns.reverb.gain.clamp(0.0, 1.25);
@@ -1043,6 +1098,25 @@ impl Mixer {
                     }
                 } else if let Some(st) = self.strip_mut(strip) {
                     st.synth_msg(0xB0, cc as i32, value as i32);
+                }
+            }
+            AudioEvent::Modulate { strip, cc, value } => {
+                if let Some(st) = self.strip_mut(strip) {
+                    let value = value.map(|v| if v.is_finite() { v.clamp(0.0, 1.0) } else { 0.0 });
+                    let synthless = st.synth.is_none();
+                    match cc {
+                        74 => st.inserts.modulate_cutoff(value),
+                        7 if synthless => st.mod_gain = value,
+                        10 if synthless => st.mod_pan = value.map(|v| v * 2.0 - 1.0),
+                        // SoundFont strips keep their established CC response;
+                        // clearing restores the GM defaults (volume 100, pan centre).
+                        _ => {
+                            let default = match cc { 7 => Some(100), 10 => Some(64), _ => None };
+                            if let Some(v) = value.map(|v| (v * 127.0).round() as i32).or(default) {
+                                st.synth_msg(0xB0, cc as i32, v);
+                            }
+                        }
+                    }
                 }
             }
             AudioEvent::PitchBend { strip, lsb, msb } => {
@@ -1115,18 +1189,13 @@ impl Mixer {
                     p.queue_param(param_id, value);
                 }
             }
-            // Relay/engine-handled or legacy variants: no-ops here.
+            // Relay/engine-handled variants: no-ops here.
             AudioEvent::Scheduled(_)
             | AudioEvent::RemoveClapInstance { .. }
             | AudioEvent::LoadClapInstances { .. }
             | AudioEvent::CollectClapState { .. }
             | AudioEvent::LoadStrips { .. }
-            | AudioEvent::LoadAudioClips { .. }
-            | AudioEvent::LoadClipFromFile { .. }
-            | AudioEvent::LoadClip { .. }
-            | AudioEvent::PlayClip
-            | AudioEvent::StopClip
-            | AudioEvent::SetClipEffects { .. } => {}
+            | AudioEvent::LoadAudioClips { .. } => {}
         }
     }
 
@@ -1137,6 +1206,9 @@ impl Mixer {
         out_r[..frames].fill(0.0);
 
         let fade = ((self.sample_rate as f32 * 0.003) as usize).max(1);
+        let release_frames = ((self.sample_rate as f32 * 0.03) as usize).max(1);
+        // Fader glide ≈15 ms: inaudible as a delay, long enough not to click.
+        let glide = 1.0 - (-1.0 / (self.sample_rate.max(1) as f32 * 0.015)).exp();
         let Mixer { strips, utility, returns, clap, master_meter, scratch_l, scratch_r, .. } = self;
 
         for rb in returns.iter_mut() {
@@ -1171,15 +1243,21 @@ impl Mixer {
                 let len = l.len();
                 if voice.position >= len { return false; }
                 let gain = take.gain * voice.gain;
+                let mut released = false;
                 for i in 0..frames {
                     let k = voice.position + i;
                     if k >= len { break; }
-                    let env = declick_env(k, len, fade, false);
+                    let mut env = declick_env(k, len, fade, false);
+                    if let Some(left) = voice.release.as_mut() {
+                        if *left == 0 { released = true; break; }
+                        env *= *left as f32 / release_frames as f32;
+                        *left -= 1;
+                    }
                     sl[i] += l[k] * gain * env;
                     sr[i] += r[k] * gain * env;
                 }
                 voice.position += frames;
-                voice.position < len
+                !released && voice.release != Some(0) && voice.position < len
             });
 
             // Audio-clip voices (same advance-while-muted behavior).
@@ -1201,7 +1279,18 @@ impl Mixer {
                 *pos < *end
             });
 
-            if st.muted {
+            // Fader/pan/mute targets; LFO overrides replace the fader or pan.
+            let fader = if st.muted { 0.0 } else { st.mod_gain.unwrap_or(st.gain) };
+            let pan = st.mod_pan.unwrap_or(st.pan);
+            let target_l = fader * (1.0 - pan.max(0.0));
+            let target_r = fader * (1.0 + pan.min(0.0));
+            if !st.gain_primed {
+                st.gain_primed = true;
+                st.gain_l = target_l;
+                st.gain_r = target_r;
+            }
+            // Fully faded out: skip the chain (as a hard mute always did).
+            if st.muted && st.gain_l == 0.0 && st.gain_r == 0.0 {
                 st.meter.store(0.0);
                 continue;
             }
@@ -1222,12 +1311,19 @@ impl Mixer {
             }
 
             // Fader/pan → sends → meter → accumulate into master.
-            let gl = st.gain * (1.0 - st.pan.max(0.0));
-            let gr = st.gain * (1.0 + st.pan.min(0.0));
+            let gliding = st.gain_l != target_l || st.gain_r != target_r;
             let mut peak = 0f32;
             for i in 0..frames {
-                let l = sl[i] * gl;
-                let r = sr[i] * gr;
+                if gliding {
+                    // Snap within -80 dB: closer than that, f32 steps near
+                    // unity are too coarse for the glide to ever arrive.
+                    st.gain_l += glide * (target_l - st.gain_l);
+                    st.gain_r += glide * (target_r - st.gain_r);
+                    if (st.gain_l - target_l).abs() < 1e-4 { st.gain_l = target_l; }
+                    if (st.gain_r - target_r).abs() < 1e-4 { st.gain_r = target_r; }
+                }
+                let l = sl[i] * st.gain_l;
+                let r = sr[i] * st.gain_r;
                 peak = peak.max(l.abs()).max(r.abs());
                 // Post-fader sends into the shared return buses.
                 if st.send_reverb > 0.0 {
@@ -1357,6 +1453,7 @@ pub fn build_strips_report(specs: &[StripSpec], main_sf2: &std::path::Path, samp
                     match super::load_wav_stereo(std::path::Path::new(&pad.path), sample_rate) {
                         Ok((left, right)) => {
                             let mut loaded = SamplerPadAudio::new(Arc::new(left), Arc::new(right), pad.gain);
+                            loaded.gate = pad.gate;
                             for variant in &pad.variants {
                                 match super::load_wav_stereo(std::path::Path::new(&variant.path), sample_rate) {
                                     Ok((left, right)) => loaded.add_take(variant.min_velocity, variant.max_velocity,
@@ -1433,8 +1530,7 @@ mod tests {
     #[test]
     fn insert_chain_drive_saturates_and_bounds() {
         let mut c = InsertChain::new(48_000);
-        let mut fx = crate::project::EffectChain::default();
-        fx.drive = 1.0;
+        let fx = crate::project::EffectChain { drive: 1.0, ..Default::default() };
         c.configure(&fx);
         let (l, _) = c.process(0.8, 0.8);
         assert!(l.abs() <= 1.0 && (l - 0.8).abs() > 0.01, "drive must alter and bound, got {l}");
@@ -1672,9 +1768,7 @@ mod tests {
     #[test]
     fn set_strip_effects_updates_sends() {
         let (mut m, _rm) = mixer_with_returns(vec![strip_with_pad(1.0, 0.0)]);
-        let mut fx = crate::project::EffectChain::default();
-        fx.reverb = 0.8;
-        fx.send_delay = 0.3;
+        let fx = crate::project::EffectChain { reverb: 0.8, send_delay: 0.3, ..Default::default() };
         m.handle_event(AudioEvent::SetStripEffects { strip: 0, effects: fx });
         assert_eq!(m.strips[0].send_reverb, 0.8);
         assert_eq!(m.strips[0].send_delay, 0.3);
@@ -1882,6 +1976,104 @@ mod sampler_expression_tests {
         m.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 36, gain: 40./127. });
         m.render_block(&mut l,&mut r);
         assert!((l[0] - 0.1*40./127.).abs()<1e-6);
+    }
+    /// A strip playing a long constant sample: any output change is the fader.
+    fn held(value: f32, gate: bool) -> Mixer {
+        let buf = Arc::new(vec![value; 44100]);
+        let mut s = Strip::new(44100);
+        let mut pad = SamplerPadAudio::new(buf.clone(), buf, 1.);
+        pad.gate = gate;
+        s.pads.insert(36, pad);
+        let mut m = mixer(s);
+        m.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 36, gain: 1. });
+        m
+    }
+    fn max_step(block: &[f32], previous: f32) -> f32 {
+        let mut last = previous;
+        block.iter().fold(0f32, |worst, &x| { let d = (x - last).abs(); last = x; worst.max(d) })
+    }
+    #[test]
+    fn fader_mute_and_pan_changes_glide_instead_of_stepping() {
+        let mut m = held(0.5, false);
+        let (mut l, mut r) = (vec![0.; 8192], vec![0.; 8192]);
+        m.render_block(&mut l, &mut r);
+        assert!(l.iter().all(|x| (x - 0.5).abs() < 1e-6), "a new strip starts at its fader, with no fade-in");
+        // A fader drop used to jump 0.5 -> 0.1 in one sample (a click).
+        m.handle_event(AudioEvent::SetStripGain { strip: 0, gain: 0.2 });
+        m.render_block(&mut l, &mut r);
+        assert!(max_step(&l, 0.5) < 0.01, "fader step {}", max_step(&l, 0.5));
+        assert!((l[8191] - 0.1).abs() < 1e-6, "settles on the exact fader value: {}", l[8191]);
+        // Mute fades out, then the strip is silent and skipped.
+        m.handle_event(AudioEvent::SetStripMute { strip: 0, muted: true });
+        m.render_block(&mut l, &mut r);
+        assert!(max_step(&l, 0.1) < 0.01 && l[0] > 0.05);
+        assert_eq!(l[8191], 0.0);
+        // Unmute fades back in to the fader.
+        m.handle_event(AudioEvent::SetStripMute { strip: 0, muted: false });
+        m.render_block(&mut l, &mut r);
+        assert!(max_step(&l, 0.0) < 0.01 && (l[8191] - 0.1).abs() < 1e-6);
+        // Pan right glides the left channel down.
+        m.handle_event(AudioEvent::SetStripPan { strip: 0, pan: 1.0 });
+        m.render_block(&mut l, &mut r);
+        assert!(max_step(&l, 0.1) < 0.01 && l[8191] == 0.0 && (r[8191] - 0.1).abs() < 1e-6);
+    }
+    #[test]
+    fn lfo_modulation_reaches_synthless_strips_and_clears() {
+        let mut m = held(0.5, false);
+        let (mut l, mut r) = (vec![0.; 8192], vec![0.; 8192]);
+        // Volume and pan replace the fader/pan on a sampler strip.
+        m.handle_event(AudioEvent::Modulate { strip: 0, cc: 7, value: Some(0.5) });
+        m.render_block(&mut l, &mut r);
+        assert!((l[8191] - 0.25).abs() < 1e-6, "volume LFO value is the fader: {}", l[8191]);
+        m.handle_event(AudioEvent::Modulate { strip: 0, cc: 10, value: Some(0.0) });
+        m.render_block(&mut l, &mut r);
+        assert!((l[8191] - 0.25).abs() < 1e-6 && r[8191] == 0.0, "pan LFO hard left");
+        for cc in [7, 10] { m.handle_event(AudioEvent::Modulate { strip: 0, cc, value: None }); }
+        m.render_block(&mut l, &mut r);
+        assert!((l[8191] - 0.5).abs() < 1e-6 && (r[8191] - 0.5).abs() < 1e-6, "cleared LFO returns to the fader: {} {}", l[8191], r[8191]);
+    }
+    #[test]
+    fn cutoff_lfo_sweeps_the_insert_filter_and_returns_to_the_configured_cutoff() {
+        // Alternating +-1 is the highest frequency: a closed filter removes it.
+        let buf = Arc::new((0..44100).map(|i| if i % 2 == 0 { 0.4 } else { -0.4 }).collect::<Vec<f32>>());
+        let mut s = Strip::new(44100);
+        s.pads.insert(36, SamplerPadAudio::new(buf.clone(), buf, 1.));
+        let mut m = mixer(s);
+        m.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 36, gain: 1. });
+        let (mut l, mut r) = (vec![0.; 8192], vec![0.; 8192]);
+        let level = |block: &[f32]| block[block.len() - 256..].iter().fold(0f32, |a, x| a.max(x.abs()));
+        m.render_block(&mut l, &mut r);
+        assert!(level(&l) > 0.399, "open filter passes the signal");
+        m.handle_event(AudioEvent::Modulate { strip: 0, cc: 74, value: Some(0.2) });
+        m.render_block(&mut l, &mut r);
+        assert!(level(&l) < 0.03, "closed filter: {}", level(&l));
+        assert!(l[0].abs() > 0.2, "the sweep glides rather than snapping shut: {}", l[0]);
+        m.handle_event(AudioEvent::Modulate { strip: 0, cc: 74, value: None });
+        m.render_block(&mut l, &mut r);
+        assert!(level(&l) > 0.39, "cleared LFO reopens to the track's cutoff: {}", level(&l));
+    }
+    #[test]
+    fn gated_pad_releases_on_note_off_and_one_shots_ignore_it() {
+        let (mut l, mut r) = (vec![0.; 8192], vec![0.; 8192]);
+        let mut one_shot = held(0.2, false);
+        one_shot.handle_event(AudioEvent::NoteOff { strip: 0, pitch: 36 });
+        one_shot.render_block(&mut l, &mut r);
+        assert!((l[8191] - 0.2).abs() < 1e-6, "a one-shot plays through note-off");
+
+        let mut gated = held(0.2, true);
+        // Two overlapping hits; one note-off releases only the older one.
+        gated.handle_event(AudioEvent::TriggerSample { strip: 0, pitch: 36, gain: 1. });
+        gated.render_block(&mut l[..64], &mut r[..64]);
+        assert!((l[63] - 0.4).abs() < 1e-6);
+        gated.handle_event(AudioEvent::NoteOff { strip: 0, pitch: 36 });
+        gated.render_block(&mut l, &mut r);
+        assert!(max_step(&l, 0.4) < 0.01, "release fades, no click");
+        assert!((l[8191] - 0.2).abs() < 1e-6, "the newer hit keeps sounding: {}", l[8191]);
+        assert_eq!(gated.strips[0].sample_voices.len(), 1, "the released voice is freed");
+        gated.handle_event(AudioEvent::NoteOff { strip: 0, pitch: 36 });
+        gated.render_block(&mut l, &mut r);
+        assert_eq!(l[8191], 0.0);
+        assert!(gated.strips[0].sample_voices.is_empty());
     }
     #[test]
     fn dense_sampler_input_keeps_voice_storage_bounded() {

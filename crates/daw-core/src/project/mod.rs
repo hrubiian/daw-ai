@@ -348,6 +348,32 @@ pub struct ProjectMeta {
     pub timing: f32,
 }
 
+/// Audio recording route. Absent on a track means use the user's input settings.
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+pub struct TrackInput {
+    /// Exact device name; None selects the system default.
+    pub device: Option<String>,
+    pub channels: crate::audio::input::InputChannels,
+    #[serde(default)]
+    pub source: RecordingSource,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum RecordingSource {
+    /// Print the guitar rack when live guitar monitoring is enabled.
+    #[default]
+    Auto,
+    Dry,
+    Guitar,
+}
+
+impl RecordingSource {
+    pub fn uses_guitar(self, monitoring: bool) -> bool {
+        self == Self::Guitar || (self == Self::Auto && monitoring)
+    }
+}
+
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct Track {
     pub id: String,
@@ -359,6 +385,8 @@ pub struct Track {
     pub pan: f32,
     pub muted: bool,
     pub patterns: Vec<String>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub input: Option<TrackInput>,
     #[serde(default)]
     pub effects: EffectChain,
     /// Per-track LFO modulators (the modulation matrix).
@@ -456,7 +484,7 @@ pub enum Instrument {
 }
 
 /// One hosted CLAP plugin slot (instrument or insert effect).
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct ClapSlot {
     /// Stable identity — plugin instances are cached by this across edits.
     pub uid: String,
@@ -482,6 +510,11 @@ pub struct SamplePad {
     /// Empty keeps legacy single-sample playback. Gaps use `path` as fallback.
     #[serde(default, skip_serializing_if = "Vec::is_empty")]
     pub variants: Vec<SampleVariant>,
+    /// `true`: the sample follows the note length — note-off fades it out
+    /// (≈30 ms), so one long sample (808, pad, vocal chop) covers every
+    /// duration. `false` (default) plays the whole sample as a one-shot.
+    #[serde(default, skip_serializing_if = "std::ops::Not::not")]
+    pub gate: bool,
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
@@ -585,7 +618,7 @@ impl Pattern {
     pub fn bars(&self) -> u32 {
         match self {
             // 16th-note steps: a pattern spans ceil(steps/16) bars.
-            Pattern::Step(p) => ((p.steps as u32) + 15) / 16,
+            Pattern::Step(p) => (p.steps as u32).div_ceil(16),
             Pattern::PianoRoll(p) => p.bars as u32,
         }
     }
@@ -746,6 +779,7 @@ impl Project {
                     modulators: Vec::new(),
                     clap_fx: Vec::new(),
                     tuning_cents: 0.0,
+                    input: None,
                 },
                 Track {
                     id: "t2".into(),
@@ -760,6 +794,7 @@ impl Project {
                     modulators: Vec::new(),
                     clap_fx: Vec::new(),
                     tuning_cents: 0.0,
+                    input: None,
                 },
             ],
             patterns: vec![
@@ -831,7 +866,7 @@ impl Project {
                     n.duration = duration.max(30);
                     let end = tick + n.duration;
                     let tpb = pr.ticks_per_bar.max(1);
-                    let need = ((end + tpb - 1) / tpb).min(64) as u8;
+                    let need = end.div_ceil(tpb).min(64) as u8;
                     if need > pr.bars {
                         pr.bars = need;
                     }
@@ -914,7 +949,7 @@ impl Project {
         let Instrument::Sampler { pads } = &mut t.instrument else { return false };
         match pads.iter_mut().find(|p| p.pitch == pitch) {
             Some(pad) => { pad.path = path; pad.variants.clear(); },
-            None => pads.push(SamplePad { pitch, path, gain: 1.0, variants: Vec::new() }),
+            None => pads.push(SamplePad { pitch, path, gain: 1.0, variants: Vec::new(), gate: false }),
         }
         true
     }
@@ -928,6 +963,15 @@ impl Project {
         updated.variants = variants;
         updated.validate_variants().map_err(|e| e.to_string())?;
         *pad = updated;
+        Ok(())
+    }
+
+    /// Make a sampler pad follow note lengths (`gate`) or play as a one-shot.
+    pub fn set_sampler_gate(&mut self, id: &str, pitch: u8, gate: bool) -> Result<(), String> {
+        let Some(t) = self.track_mut(id) else { return Err(format!("no track {id}")) };
+        let Instrument::Sampler { pads } = &mut t.instrument else { return Err("track is not a sampler".into()) };
+        let pad = pads.iter_mut().find(|p| p.pitch == pitch).ok_or_else(|| format!("no pad at pitch {pitch}"))?;
+        pad.gate = gate;
         Ok(())
     }
 
@@ -1028,7 +1072,7 @@ impl Project {
     /// Set the loop region (bars). `end` is clamped to at least `start + 1`.
     pub fn set_loop_region(&mut self, start_bar: u32, end_bar: u32) {
         self.loop_region.start_bar = start_bar;
-        self.loop_region.end_bar = end_bar.max(start_bar + 1);
+        self.loop_region.end_bar = end_bar.max(start_bar.saturating_add(1));
     }
     pub fn toggle_loop(&mut self) {
         self.loop_region.enabled = !self.loop_region.enabled;
@@ -1428,6 +1472,7 @@ impl Project {
             instrument, volume: 0.8, pan: 0.0, muted: false, patterns,
             effects: EffectChain::default(), modulators: Vec::new(),
             clap_fx: Vec::new(), tuning_cents: 0.0,
+            input: None,
         });
         tid
     }
@@ -1461,7 +1506,7 @@ impl Project {
     /// Add a new blank pattern matching the track's type (Step for Drum, PianoRoll
     /// for Melodic), attach it, return its id. None for unknown/Audio tracks.
     pub fn add_pattern(&mut self, track_id: &str) -> Option<String> {
-        let ttype = self.tracks.iter().find(|t| t.id == track_id)?.track_type.clone();
+        let ttype = self.tracks.iter().find(|t| t.id == track_id)?.track_type;
         let pid = self.next_pattern_id();
         match ttype {
             TrackType::Drum => self.patterns.push(Pattern::Step(StepPattern {
@@ -1631,6 +1676,7 @@ mod tests {
                 volume: 1.0, pan: 0.0, muted: false, patterns: vec![],
                 effects: EffectChain::default(), modulators: vec![],
                 clap_fx: vec![], tuning_cents: 0.0,
+                input: None,
             }
         }
         let tracks = vec![

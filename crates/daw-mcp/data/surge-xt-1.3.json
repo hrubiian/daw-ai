@@ -1,0 +1,230 @@
+[
+ {
+  "name": "osc1_type",
+  "surge": "A Osc 1 Type",
+  "group": "osc",
+  "help": "oscillator 1 waveform engine (classic, wavetable, FM, string, noise\u2026)"
+ },
+ {
+  "name": "osc1_octave",
+  "surge": "A Osc 1 Octave",
+  "group": "osc",
+  "help": "oscillator 1 octave shift"
+ },
+ {
+  "name": "osc1_pitch",
+  "surge": "A Osc 1 Pitch",
+  "group": "osc",
+  "help": "oscillator 1 fine pitch in semitones"
+ },
+ {
+  "name": "osc1_shape",
+  "surge": "A Osc 1 Shape",
+  "group": "osc",
+  "help": "oscillator 1 waveform shape: changes tone colour"
+ },
+ {
+  "name": "osc1_sub",
+  "surge": "A Osc 1 Sub Mix",
+  "group": "osc",
+  "help": "oscillator 1 sub-octave mix: adds weight below"
+ },
+ {
+  "name": "osc1_unison_voices",
+  "surge": "A Osc 1 Unison Voices",
+  "group": "osc",
+  "help": "oscillator 1 stacked voices: more = thicker, wider"
+ },
+ {
+  "name": "osc1_unison_detune",
+  "surge": "A Osc 1 Unison Detune",
+  "group": "osc",
+  "help": "oscillator 1 detune between stacked voices: more = wobblier, chorus-like"
+ },
+ {
+  "name": "osc1_level",
+  "surge": "A Osc 1 Volume",
+  "group": "osc",
+  "help": "oscillator 1 level in the mix"
+ },
+ {
+  "name": "osc2_type",
+  "surge": "A Osc 2 Type",
+  "group": "osc",
+  "help": "oscillator 2 waveform engine"
+ },
+ {
+  "name": "osc2_octave",
+  "surge": "A Osc 2 Octave",
+  "group": "osc",
+  "help": "oscillator 2 octave shift"
+ },
+ {
+  "name": "osc2_pitch",
+  "surge": "A Osc 2 Pitch",
+  "group": "osc",
+  "help": "oscillator 2 fine pitch in semitones (detune against osc 1)"
+ },
+ {
+  "name": "osc2_shape",
+  "surge": "A Osc 2 Shape",
+  "group": "osc",
+  "help": "oscillator 2 waveform shape"
+ },
+ {
+  "name": "osc2_level",
+  "surge": "A Osc 2 Volume",
+  "group": "osc",
+  "help": "oscillator 2 level in the mix"
+ },
+ {
+  "name": "noise_level",
+  "surge": "A Noise Volume",
+  "group": "noise",
+  "help": "noise level: breath, air, hiss, snare-like texture"
+ },
+ {
+  "name": "noise_color",
+  "surge": "A Noise Color",
+  "group": "noise",
+  "help": "noise colour: lower = darker rumble, higher = brighter hiss"
+ },
+ {
+  "name": "filter_type",
+  "surge": "A Filter 1 Type",
+  "group": "filter",
+  "help": "main filter type (low-pass, band-pass, high-pass, comb\u2026)"
+ },
+ {
+  "name": "filter_cutoff",
+  "surge": "A Filter 1 Cutoff",
+  "group": "filter",
+  "help": "brightness: lower = darker, more muffled"
+ },
+ {
+  "name": "filter_resonance",
+  "surge": "A Filter 1 Resonance",
+  "group": "filter",
+  "help": "emphasis at the cutoff: more = sharper, whistling, acid"
+ },
+ {
+  "name": "filter_env_amount",
+  "surge": "A Filter 1 FEG Mod Amount",
+  "group": "filter",
+  "help": "how much the filter envelope opens the filter: the 'pluck' or 'wow'"
+ },
+ {
+  "name": "filter_keytrack",
+  "surge": "A Filter 1 Keytrack",
+  "group": "filter",
+  "help": "how much brightness follows the note pitch"
+ },
+ {
+  "name": "highpass",
+  "surge": "A Highpass",
+  "group": "filter",
+  "help": "removes low end: higher = thinner"
+ },
+ {
+  "name": "amp_attack",
+  "surge": "A Amp EG Attack",
+  "group": "amp_env",
+  "help": "fade-in time: 0 = instant hit, longer = swell"
+ },
+ {
+  "name": "amp_decay",
+  "surge": "A Amp EG Decay",
+  "group": "amp_env",
+  "help": "time to fall from the peak to the sustain level"
+ },
+ {
+  "name": "amp_sustain",
+  "surge": "A Amp EG Sustain",
+  "group": "amp_env",
+  "help": "level held while the key is down: 0 = percussive"
+ },
+ {
+  "name": "amp_release",
+  "surge": "A Amp EG Release",
+  "group": "amp_env",
+  "help": "tail after the key is released"
+ },
+ {
+  "name": "filter_env_attack",
+  "surge": "A Filter EG Attack",
+  "group": "filter_env",
+  "help": "filter envelope attack time"
+ },
+ {
+  "name": "filter_env_decay",
+  "surge": "A Filter EG Decay",
+  "group": "filter_env",
+  "help": "filter envelope decay time: short = plucky"
+ },
+ {
+  "name": "filter_env_sustain",
+  "surge": "A Filter EG Sustain",
+  "group": "filter_env",
+  "help": "filter envelope sustain level"
+ },
+ {
+  "name": "filter_env_release",
+  "surge": "A Filter EG Release",
+  "group": "filter_env",
+  "help": "filter envelope release time"
+ },
+ {
+  "name": "lfo1_rate",
+  "surge": "A LFO 1 Rate",
+  "group": "lfo",
+  "help": "speed of LFO 1 movement (wobble, vibrato)"
+ },
+ {
+  "name": "lfo1_amount",
+  "surge": "A LFO 1 Amplitude",
+  "group": "lfo",
+  "help": "depth of LFO 1 movement"
+ },
+ {
+  "name": "drive",
+  "surge": "A Waveshaper Drive",
+  "group": "character",
+  "help": "saturation/distortion amount: grit and warmth"
+ },
+ {
+  "name": "shaper_type",
+  "surge": "A Waveshaper Type",
+  "group": "character",
+  "help": "saturation flavour (soft, hard, asymmetric, fold\u2026)"
+ },
+ {
+  "name": "feedback",
+  "surge": "A Feedback",
+  "group": "character",
+  "help": "filter feedback: thick, aggressive, unstable at high values"
+ },
+ {
+  "name": "drift",
+  "surge": "A Osc Drift",
+  "group": "character",
+  "help": "slow random pitch drift: analog/tape instability"
+ },
+ {
+  "name": "play_mode",
+  "surge": "A Play Mode",
+  "group": "voice",
+  "help": "poly, mono or legato playing"
+ },
+ {
+  "name": "glide",
+  "surge": "A Portamento",
+  "group": "voice",
+  "help": "pitch glide time between notes"
+ },
+ {
+  "name": "volume",
+  "surge": "A Volume",
+  "group": "voice",
+  "help": "overall level of the sound"
+ }
+]

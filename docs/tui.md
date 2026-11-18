@@ -220,21 +220,21 @@ Press `Shift+J` to arm JAM mode (`[JAM]` appears in the transport bar). While ar
 Render any project to a stereo WAV without launching the TUI:
 
 ```bash
-cargo run -p daw-core --example render -- projects/my-song.daw.json out.wav
+cargo run --release --example render_project -- my-song.daw.json out.wav
 ```
 
-The exporter peak-normalizes the master to −1 dBFS. Two demo tracks are included: `projects/midnight_static.daw.json` (electronic trip-hop) and `projects/neon_pulse.daw.json` (techno).
+The exporter peak-normalizes the master to −1 dBFS. `examples/demo.daw.json` is a ready-made song to try.
 
 ## Live Audio Recording
 
 1. Press `^A` on the Tracks tab to add an Audio track (`[AU]`)
 2. Select it with `↑` / `↓`
-3. Press `^R` — the track label turns red and the transport bar shows `[REC]`
+3. Press `^R` — the input opens, the transport rolls (after the configured count-in when stopped) and the transport bar shows `[REC]`
 4. Play or sing into your microphone / line-in
-5. Press `^R` again to stop — the clip is saved to `recordings/<track_id>.wav`
-6. Press `Space` to play back — the clip loops alongside your MIDI tracks
+5. Press `^R` again to punch out — the take is saved to `recordings/<track_id>-<time>-p<N>.wav` and placed on the track as an audio clip where the take started
+6. Press `Space` to play back — the clip plays at its position alongside your MIDI tracks
 
-Recordings are 32-bit float WAV. If the input and output devices run at different sample rates the clip is resampled automatically.
+This is the same capture flow as the desktop app: input device, channels, count-in and latency trim come from `~/.config/daw-ai/config.json`, and each loop pass becomes its own take (earlier passes are kept, muted, for comping). Recordings are 32-bit float WAV.
 
 ## Saving & Exporting
 

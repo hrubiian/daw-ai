@@ -28,7 +28,7 @@ pub fn diagnostics() -> AudioDiagnostics {
     AudioDiagnostics { sampler_voice_steals: super::mixer::SAMPLER_VOICE_STEALS.load(Relaxed), dropped_plugin_events: super::clap::DROPPED_CLAP_EVENTS.load(Relaxed), plugin_process_errors: super::clap::CLAP_PROCESS_ERRORS.load(Relaxed), late_events: LATE_AUDIO_EVENTS.load(Relaxed), dropped_events: DROPPED_AUDIO_EVENTS.load(Relaxed), callback_overruns: CALLBACK_OVERRUNS.load(Relaxed), callback_max_ns: CALLBACK_MAX_NS.load(Relaxed), stream_errors: AUDIO_STREAM_ERRORS.load(Relaxed) }
 }
 pub static DROPPED_AUDIO_EVENTS: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(0);
-use super::mixer::{AudioEvent, InsertChain, Mixer, StripMeter};
+use super::mixer::{AudioEvent, Mixer, StripMeter};
 use anyhow::Result;
 use cpal::traits::{DeviceTrait, HostTrait, StreamTrait};
 use ringbuf::traits::{Consumer, Producer, Split, Observer};
@@ -36,56 +36,6 @@ use ringbuf::HeapRb;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use std::path::Path;
 use std::sync::{Arc, Mutex};
-
-// ── Public recording state ────────────────────────────────────────────────────
-
-pub struct RecordState {
-    pub available:   bool,
-    pub active:      bool,
-    pub samples:     Vec<f32>,
-    pub sample_rate: u32,
-    pub channels:    u16,
-}
-
-impl Default for RecordState {
-    fn default() -> Self {
-        RecordState { available: false, active: false, samples: vec![], sample_rate: 0, channels: 0 }
-    }
-}
-
-#[derive(Clone)]
-pub struct RecordController(Arc<Mutex<RecordState>>);
-
-impl RecordController {
-    pub fn new(state: Arc<Mutex<RecordState>>) -> Self { RecordController(state) }
-    pub fn available(&self) -> bool   { self.0.lock().map(|s| s.available).unwrap_or(false) }
-    pub fn is_active(&self) -> bool   { self.0.lock().map(|s| s.active).unwrap_or(false) }
-
-    pub fn start(&self) {
-        if let Ok(mut s) = self.0.lock() {
-            if s.available {
-                s.samples.clear();
-                s.active = true;
-            }
-        }
-    }
-
-    pub fn stop(&self, path: &Path) -> Result<()> {
-        let (samples, sample_rate, channels) = {
-            let mut s = self.0.lock()
-                .map_err(|_| anyhow::anyhow!("record mutex poisoned"))?;
-            s.active = false;
-            (std::mem::take(&mut s.samples), s.sample_rate, s.channels)
-        };
-        if samples.is_empty() { return Ok(()); }
-        if let Some(parent) = path.parent() {
-            if !parent.as_os_str().is_empty() {
-                std::fs::create_dir_all(parent)?;
-            }
-        }
-        write_wav(path, &samples, sample_rate, channels)
-    }
-}
 
 pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32, channels: u16) -> Result<()> {
     let spec = hound::WavSpec {
@@ -102,24 +52,35 @@ pub fn write_wav(path: &Path, samples: &[f32], sample_rate: u32, channels: u16) 
 
 // ── WAV loading helper (used by relay thread) ─────────────────────────────────
 
+/// Decode every sample to f32 in [-1, 1]. Integer samples are scaled by
+/// their real bit depth (hound returns raw values, so 24-bit data divided by
+/// 2^31 came out 48 dB quiet). Stops at the first decode error: a truncated
+/// file — or a 44-byte header claiming gigabytes of data — can't expand into
+/// a huge zero-filled buffer.
+pub fn read_samples_f32<R: std::io::Read>(reader: &mut hound::WavReader<R>) -> Vec<f32> {
+    let spec = reader.spec();
+    match spec.sample_format {
+        hound::SampleFormat::Float => reader.samples::<f32>().map_while(|s| s.ok()).collect(),
+        hound::SampleFormat::Int => {
+            let bits = spec.bits_per_sample.clamp(1, 32) as u32;
+            let scale = 1.0 / (1u64 << (bits - 1)) as f32;
+            reader.samples::<i32>().map_while(|s| s.ok()).map(|s| s as f32 * scale).collect()
+        }
+    }
+}
+
 pub fn load_wav_stereo(path: &Path, target_sr: u32) -> Result<(Vec<f32>, Vec<f32>)> {
     let mut reader = hound::WavReader::open(path)?;
     let spec = reader.spec();
     let source_sr = spec.sample_rate;
     let ch = spec.channels as usize;
+    if ch == 0 || source_sr == 0 {
+        anyhow::bail!("invalid WAV header ({ch} channels, {source_sr} Hz)");
+    }
 
-    let raw: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
-        hound::SampleFormat::Int => {
-            if spec.bits_per_sample <= 16 {
-                reader.samples::<i16>().map(|s| s.unwrap_or(0) as f32 / 32768.0).collect()
-            } else {
-                reader.samples::<i32>().map(|s| s.unwrap_or(0) as f32 / 2_147_483_648.0).collect()
-            }
-        }
-    };
+    let raw = read_samples_f32(&mut reader);
 
-    let frames = raw.len() / ch.max(1);
+    let frames = raw.len() / ch;
     let left:  Vec<f32> = (0..frames).map(|i| raw[i * ch]).collect();
     let right: Vec<f32> = if ch >= 2 {
         (0..frames).map(|i| raw[i * ch + 1]).collect()
@@ -168,16 +129,7 @@ pub fn wav_peaks(path: &Path, buckets: usize) -> Result<Vec<f32>> {
     let spec = reader.spec();
     let ch = spec.channels.max(1) as usize;
 
-    let raw: Vec<f32> = match spec.sample_format {
-        hound::SampleFormat::Float => reader.samples::<f32>().map(|s| s.unwrap_or(0.0)).collect(),
-        hound::SampleFormat::Int => {
-            if spec.bits_per_sample <= 16 {
-                reader.samples::<i16>().map(|s| s.unwrap_or(0) as f32 / 32768.0).collect()
-            } else {
-                reader.samples::<i32>().map(|s| s.unwrap_or(0) as f32 / 2_147_483_648.0).collect()
-            }
-        }
-    };
+    let raw = read_samples_f32(&mut reader);
 
     let frames = raw.len() / ch;
     if frames == 0 { return Ok(vec![0.0; buckets]); }
@@ -199,18 +151,8 @@ pub fn wav_peaks(path: &Path, buckets: usize) -> Result<Vec<f32>> {
 
 // ── Audio engine ──────────────────────────────────────────────────────────────
 
-/// Legacy TUI preview-clip player (whole-file loop with its own FX chain).
-struct ClipPlayer {
-    left:     Vec<f32>,
-    right:    Vec<f32>,
-    position: usize,
-    playing:  bool,
-    volume:   f32,
-}
-
 pub struct AudioEngine {
     _output_stream: cpal::Stream,
-    _input_stream:  Option<cpal::Stream>,
     producer:       ringbuf::HeapProd<AudioEvent>,
     pub schedule_at: Option<(u64, u64)>,
     pub sample_rate: u32,
@@ -244,9 +186,7 @@ fn find_output_device(host: &cpal::Host) -> Result<(cpal::Device, cpal::Supporte
 impl AudioEngine {
     pub fn new(
         sf2_path: &Path,
-        record_state: Arc<Mutex<RecordState>>,
         vis_buf: Option<Arc<Mutex<Vec<f32>>>>,
-        enable_input: bool,
         master_meter: Arc<StripMeter>,
         return_meters: [Arc<StripMeter>; 2],
         clap_garbage: crossbeam_channel::Sender<(String, super::clap::ClapProcessor)>,
@@ -287,10 +227,6 @@ impl AudioEngine {
         let mut left_buf  = vec![0f32; max_frames];
         let mut right_buf = vec![0f32; max_frames];
 
-        // ── Legacy preview-clip state (TUI path; lives in the callback) ───
-        let mut clip: Option<ClipPlayer> = None;
-        let mut legacy_chain = InsertChain::new(sample_rate);
-
         // ── Output stream ─────────────────────────────────────────────────
         let stream_config: cpal::StreamConfig = config.into();
         let channels = stream_config.channels as usize;
@@ -311,25 +247,32 @@ impl AudioEngine {
                             let _ = retire_tx.try_push(AudioEvent::Scheduled(event));
                         }
                     } else {
-                        apply_callback_event(ev, &mut mixer, &mut clip, &mut legacy_chain, &mut retire_tx, &clap_garbage);
+                        apply_callback_event(ev, &mut mixer, &mut retire_tx, &clap_garbage);
                     }
                 }
 
-                data.fill(0.0); // Oversized callbacks must never expose uninitialized output.
-                let frames = (data.len() / channels).min(max_frames);
-                clock.quantum.store((data.len() / channels) as u32, std::sync::atomic::Ordering::Relaxed);
-                render_scheduled_block(&mut mixer, &mut scheduled, device_frame,
-                    clock.generation.load(std::sync::atomic::Ordering::Acquire),
-                    &mut left_buf[..frames], &mut right_buf[..frames],
-                    &mut clip, &mut legacy_chain, &mut retire_tx, &clap_garbage);
-                device_frame += (data.len() / channels) as u64;
+                let total = data.len() / channels;
+                clock.quantum.store(total as u32, std::sync::atomic::Ordering::Relaxed);
+                let generation = clock.generation.load(std::sync::atomic::Ordering::Acquire);
+                // Render oversized device buffers in `max_frames` chunks so the
+                // mixer stays in step with the device clock (no silent tail).
+                let mut done = 0;
+                let mut frames = 0; // last chunk's size (visualizer tail)
+                while done < total {
+                    frames = (total - done).min(max_frames);
+                    render_scheduled_block(&mut mixer, &mut scheduled, device_frame + done as u64, generation,
+                        &mut left_buf[..frames], &mut right_buf[..frames],
+                        &mut retire_tx, &clap_garbage);
+                    let out = &mut data[done * channels..(done + frames) * channels];
+                    for (i, frame) in out.chunks_mut(channels).enumerate() {
+                        for (ch, sample) in frame.iter_mut().enumerate() {
+                            *sample = if ch == 0 { left_buf[i] } else if ch == 1 { right_buf[i] } else { 0.0 };
+                        }
+                    }
+                    done += frames;
+                }
+                device_frame += total as u64;
                 clock.frame.store(device_frame, std::sync::atomic::Ordering::Release);
-
-                for (i, frame) in data.chunks_mut(channels).enumerate().take(frames) {
-                    for (ch, sample) in frame.iter_mut().enumerate() {
-                        *sample = if ch == 0 { left_buf[i] } else if ch == 1 { right_buf[i] } else { 0.0 };
-                    }
-                }
 
                 if let Some(ref vb) = vis_write {
                     if let Ok(mut vis) = vb.try_lock() {
@@ -341,7 +284,7 @@ impl AudioEngine {
                 }
                 let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 CALLBACK_MAX_NS.fetch_max(elapsed, std::sync::atomic::Ordering::Relaxed);
-                if frames < data.len() / channels || elapsed > (data.len() / channels) as u64 * 1_000_000_000 / sample_rate as u64 {
+                if elapsed > total as u64 * 1_000_000_000 / sample_rate as u64 {
                     CALLBACK_OVERRUNS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 }
             },
@@ -353,58 +296,13 @@ impl AudioEngine {
         )?;
         output_stream.play()?;
 
-        // ── Input stream (legacy TUI recording; the GPUI frontend uses
-        // daw_core::audio::input::CaptureStream instead) ───────────────────
-        let input_stream = if enable_input {
-            Self::try_open_input(&host, record_state)
-        } else {
-            None
-        };
-
         Ok(AudioEngine {
             _output_stream: output_stream,
             _retirement_lifetime: retirement_lifetime,
-            _input_stream: input_stream,
             producer,
             schedule_at: None,
             sample_rate,
         })
-    }
-
-    fn try_open_input(host: &cpal::Host, record_state: Arc<Mutex<RecordState>>) -> Option<cpal::Stream> {
-        let device = host.default_input_device()?;
-        let config = device.default_input_config().ok()?;
-        let in_sr = config.sample_rate().0;
-        let in_ch = config.channels();
-
-        {
-            let mut rs = record_state.lock().ok()?;
-            rs.sample_rate = in_sr;
-            rs.channels    = in_ch;
-            rs.available   = true;
-        }
-
-        // Max 10 minutes of recording at the input sample rate and channel count
-        let max_samples = 10 * 60 * in_sr as usize * in_ch as usize;
-
-        let stream_config: cpal::StreamConfig = config.into();
-        let stream = device.build_input_stream(
-            &stream_config,
-            move |data: &[f32], _| {
-                if let Ok(mut rs) = record_state.try_lock() {
-                    if rs.active {
-                        let remaining = max_samples.saturating_sub(rs.samples.len());
-                        if remaining > 0 {
-                            rs.samples.extend_from_slice(&data[..data.len().min(remaining)]);
-                        }
-                    }
-                }
-            },
-            |err| eprintln!("input stream error: {err}"),
-            None,
-        ).ok()?;
-        stream.play().ok()?;
-        Some(stream)
     }
 
     pub fn send(&mut self, event: AudioEvent) {
@@ -436,6 +334,36 @@ mod tests {
     }
 
     use super::*;
+
+    #[test]
+    fn int_wavs_scale_by_bit_depth_and_truncation_stops() {
+        let dir = std::env::temp_dir();
+        for bits in [8u16, 16, 24, 32] {
+            let path = dir.join(format!("daw_bits_{}_{bits}.wav", std::process::id()));
+            let spec = hound::WavSpec {
+                channels: 1, sample_rate: 44100,
+                bits_per_sample: bits, sample_format: hound::SampleFormat::Int,
+            };
+            let mut w = hound::WavWriter::create(&path, spec).unwrap();
+            let half = 1i64 << (bits - 2); // 0.5 full scale
+            for _ in 0..16 { w.write_sample(half as i32).unwrap(); }
+            w.finalize().unwrap();
+            let (l, _) = load_wav_stereo(&path, 44100).unwrap();
+            assert!((l[0] - 0.5).abs() < 1e-3, "{bits}-bit half scale → 0.5, got {}", l[0]);
+            std::fs::remove_file(&path).ok();
+        }
+        // A header claiming far more data than the file holds decodes only
+        // what is present instead of zero-filling the claimed length.
+        let path = dir.join(format!("daw_trunc_{}.wav", std::process::id()));
+        write_test_wav(&path, 44100, 1000, 0.25);
+        let mut bytes = std::fs::read(&path).unwrap();
+        bytes.truncate(44 + 400); // keep 100 f32 frames of the 1000 declared
+        std::fs::write(&path, &bytes).unwrap();
+        if let Ok((l, _)) = load_wav_stereo(&path, 44100) {
+            assert!(l.len() <= 100, "decoded {} frames from a truncated file", l.len());
+        }
+        std::fs::remove_file(&path).ok();
+    }
 
     fn write_test_wav(path: &std::path::Path, sr: u32, frames: usize, amp: f32) {
         let spec = hound::WavSpec {
@@ -475,10 +403,9 @@ mod tests {
     fn smoke_plays_note() {
         // Per-strip routing: build one melodic strip, then play through it.
         let sf2 = Path::new("../../assets/GeneralUser.sf2");
-        let state = Arc::new(Mutex::new(RecordState::default()));
         let master = Arc::new(StripMeter::new());
         let mut engine = AudioEngine::new(
-            sf2, state, None, true, Arc::clone(&master),
+            sf2, None, Arc::clone(&master),
             [Arc::new(StripMeter::new()), Arc::new(StripMeter::new())],
             crossbeam_channel::unbounded().0,
             Arc::new(super::super::scheduling::AudioClock::default()),
@@ -503,8 +430,7 @@ mod tests {
 }
 
 fn apply_callback_event(
-    ev: AudioEvent, mixer: &mut Mixer, clip: &mut Option<ClipPlayer>,
-    legacy_chain: &mut InsertChain, retire_tx: &mut ringbuf::HeapProd<AudioEvent>,
+    ev: AudioEvent, mixer: &mut Mixer, retire_tx: &mut ringbuf::HeapProd<AudioEvent>,
     clap_garbage: &crossbeam_channel::Sender<(String, super::clap::ClapProcessor)>,
 ) {
                     match ev {
@@ -516,30 +442,6 @@ fn apply_callback_event(
                             let old = std::mem::replace(&mut mixer.audio_clips, clips);
                             let _ = retire_tx.try_push(AudioEvent::PreparedAudioClips { clips: old });
                         }
-                        // Legacy preview clip (unchanged TUI semantics).
-                        AudioEvent::LoadClip { left, right, volume } => {
-                            let old = clip.replace(ClipPlayer { left, right, position: 0, playing: false, volume });
-                            if let Some(old) = old {
-                                let _ = retire_tx.try_push(AudioEvent::LoadClip { left: old.left, right: old.right, volume: old.volume });
-                            }
-                        }
-                        AudioEvent::PlayClip => {
-                            if let Some(c) = clip { c.position = 0; c.playing = true; }
-                        }
-                        AudioEvent::StopClip => {
-                            if let Some(c) = clip { c.playing = false; }
-                        }
-                        AudioEvent::SetClipEffects {
-                            delay_time_ms, delay_feedback, delay_mix, cutoff, drive,
-                            eq_low_gain, eq_mid_gain, eq_high_gain, eq_mid_freq,
-                            comp_threshold, comp_ratio, comp_attack_ms, comp_release_ms,
-                        } => {
-                            legacy_chain.configure_raw(
-                                delay_time_ms, delay_feedback, delay_mix, cutoff, drive,
-                                eq_low_gain, eq_mid_gain, eq_high_gain, eq_mid_freq,
-                                comp_threshold, comp_ratio, comp_attack_ms, comp_release_ms,
-                            );
-                        }
                         // Retire a CLAP processor: extract it and return it
                         // to the relay for stop/deactivate off the RT thread.
                         AudioEvent::RemoveClapInstance { uid } => {
@@ -548,8 +450,7 @@ fn apply_callback_event(
                             }
                         }
                         // Relay-thread events never reach the callback.
-                        AudioEvent::LoadClipFromFile { .. }
-                        | AudioEvent::LoadStrips { .. }
+                        AudioEvent::LoadStrips { .. }
                         | AudioEvent::LoadAudioClips { .. } => {}
                         // Everything else is mixer routing.
                         other => mixer.handle_event(other),
@@ -560,7 +461,6 @@ fn apply_callback_event(
 fn render_scheduled_block(
     mixer: &mut Mixer, scheduled: &mut super::scheduling::EventQueue,
     device_frame: u64, generation: u64, left_buf: &mut [f32], right_buf: &mut [f32],
-    clip: &mut Option<ClipPlayer>, legacy_chain: &mut InsertChain,
     retire_tx: &mut ringbuf::HeapProd<AudioEvent>,
     clap_garbage: &crossbeam_channel::Sender<(String, super::clap::ClapProcessor)>,
 ) {
@@ -574,7 +474,7 @@ fn render_scheduled_block(
                         if !event.cancelled(generation) {
                             if event.frame < cursor { LATE_AUDIO_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed); }
                             let payload = std::mem::replace(&mut event.event, AudioEvent::Panic);
-                            apply_callback_event(payload, mixer, clip, legacy_chain, retire_tx, clap_garbage);
+                            apply_callback_event(payload, mixer, retire_tx, clap_garbage);
                         }
                         // Deallocate the scheduling envelope (and cancelled payloads) off-thread.
                         let _ = retire_tx.try_push(AudioEvent::Scheduled(event));
@@ -586,15 +486,6 @@ fn render_scheduled_block(
                     let a = (cursor - device_frame) as usize;
                     let b = (next - device_frame) as usize;
                     mixer.render_block(&mut left_buf[a..b], &mut right_buf[a..b]);
-                    if let Some(c) = clip.as_mut().filter(|c| c.playing && !c.left.is_empty()) {
-                        let clip_len = c.left.len();
-                        for i in a..b {
-                            let pos = (c.position + i - a) % clip_len;
-                            let (l, r) = legacy_chain.process(c.left[pos] * c.volume, c.right[pos] * c.volume);
-                            left_buf[i] += l; right_buf[i] += r;
-                        }
-                        c.position = (c.position + b - a) % clip_len;
-                    }
                     cursor = next;
                 }
 
@@ -628,13 +519,12 @@ mod scheduled_playback_tests {
             for frame in [184, 368, 1286] { queue.push(event(frame, 0)).unwrap(); }
             let (mut retire, mut retired) = HeapRb::new(64).split();
             let (garbage, _) = crossbeam_channel::unbounded();
-            let mut chain = InsertChain::new(44100); let mut clip = None;
             let mut output = Vec::new(); let mut pos = 0;
             while pos < 2048 {
                 let frames = size.min(2048 - pos);
                 let (mut l, mut r) = (vec![0.; frames], vec![0.; frames]);
                 render_scheduled_block(&mut mixer, &mut queue, pos as u64, 0,
-                    &mut l, &mut r, &mut clip, &mut chain, &mut retire, &garbage);
+                    &mut l, &mut r, &mut retire, &garbage);
                 output.extend(l); pos += frames;
                 while retired.try_pop().is_some() {}
             }
@@ -651,12 +541,11 @@ mod scheduled_playback_tests {
             event: AudioEvent::Applied { revision: 7, ack: ack.clone() } })).unwrap();
         let (mut retire, _retired) = HeapRb::new(64).split();
         let (garbage, _) = crossbeam_channel::unbounded();
-        let mut chain = InsertChain::new(44100); let mut clip = None;
         let (mut l, mut r) = (vec![0.; 184], vec![0.; 184]);
-        render_scheduled_block(&mut mixer, &mut queue, 0, 1, &mut l, &mut r, &mut clip, &mut chain, &mut retire, &garbage);
+        render_scheduled_block(&mut mixer, &mut queue, 0, 1, &mut l, &mut r, &mut retire, &garbage);
         assert!(l.iter().all(|s| *s == 0.)); assert_eq!(ack.load(Ordering::Acquire), 0);
         let (mut l, mut r) = (vec![0.; 256], vec![0.; 256]);
-        render_scheduled_block(&mut mixer, &mut queue, 184, 1, &mut l, &mut r, &mut clip, &mut chain, &mut retire, &garbage);
+        render_scheduled_block(&mut mixer, &mut queue, 184, 1, &mut l, &mut r, &mut retire, &garbage);
         assert_eq!(ack.load(Ordering::Acquire), 7);
         assert!(l[..184].iter().all(|s| *s == 0.)); assert!(l[184] > 0.);
     }
@@ -670,12 +559,11 @@ mod scheduled_playback_tests {
         assert!(queue.push(event(1, 0)).is_err());
         let (mut retire, _retired) = HeapRb::new(4096).split();
         let (garbage, _) = crossbeam_channel::unbounded();
-        let mut chain = InsertChain::new(44100); let mut clip = None;
         let (mut l, mut r) = ([0.; 64], [0.; 64]);
-        render_scheduled_block(&mut mixer, &mut queue, 0, 0, &mut l, &mut r, &mut clip, &mut chain, &mut retire, &garbage);
+        render_scheduled_block(&mut mixer, &mut queue, 0, 0, &mut l, &mut r, &mut retire, &garbage);
         assert_eq!(queue.next_frame(), Some(0));
         let before = LATE_AUDIO_EVENTS.load(Ordering::Relaxed);
-        render_scheduled_block(&mut mixer, &mut queue, 64, 0, &mut l, &mut r, &mut clip, &mut chain, &mut retire, &garbage);
+        render_scheduled_block(&mut mixer, &mut queue, 64, 0, &mut l, &mut r, &mut retire, &garbage);
         assert!(LATE_AUDIO_EVENTS.load(Ordering::Relaxed) > before); assert_eq!(queue.next_frame(), None);
     }
 }

@@ -34,6 +34,7 @@ async fn blocking(f: impl FnOnce() -> Result<String, String> + Send + 'static) -
 #[derive(Clone)]
 struct DawServer {
     tools: Arc<DawTools>,
+    #[allow(dead_code, reason = "read by the #[tool_handler] macro expansion")]
     tool_router: ToolRouter<DawServer>,
 }
 
@@ -94,6 +95,31 @@ struct SetTrackArgs {
     preset: Option<u8>,
     /// Path to a .sf2 (empty string = project default).
     soundfont: Option<String>,
+    /// Constant detune in cents, -200..=200 (0 = 12-TET). Useful for matching
+    /// a sample or a sung take that sits between the keys.
+    tuning_cents: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct SamplerPadArgs {
+    track_id: String,
+    /// MIDI pitch that triggers this pad (GM drums: 36 kick, 38 snare, 42 hat).
+    pitch: u8,
+    /// .wav path, relative to the project file or absolute.
+    path: String,
+    /// Pad gain 0..=2 (default 1.0).
+    gain: Option<f32>,
+    /// true: the sample follows the note length (note-off fades it in ~30 ms),
+    /// so one long sample covers every duration. false (default): one-shot.
+    gate: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ModulatorsArgs {
+    track_id: String,
+    /// Array of {dest: cutoff|resonance|volume|pan, shape: sine|triangle|saw|square,
+    /// rate_hz: 0..100, depth: 0..1, phase?: 0..1}. [] removes all LFOs.
+    modulators: serde_json::Value,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -200,6 +226,94 @@ struct SpatialPresetArgs { preset: String }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct ClapUidArgs { uid: String }
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct FindPatchesArgs {
+    /// Words to match in the patch name or category ("" for all).
+    query: String,
+    /// Category folder, e.g. Basses, Pads, Leads, Percussion, Plucks, FX, Keys, Winds.
+    category: Option<String>,
+    /// Most results (default 20).
+    limit: Option<usize>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct LoadPatchArgs {
+    /// Patch path from find_patches.
+    patch_path: String,
+    /// Existing track to load onto; omit to create a new track for this sound.
+    track_id: Option<String>,
+    /// Name for a new track (defaults to the patch name), e.g. "Dusty Tom".
+    name: Option<String>,
+    /// Required to replace a named track's non-Surge instrument.
+    replace: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ShapeSoundArgs {
+    /// Surge XT slot uid (from load_patch / project_summary).
+    uid: String,
+    /// Controls to set: names from describe_sound; values are text in the
+    /// readout's units ("800 Hz", "120 ms") or a number in the control's range.
+    controls: serde_json::Map<String, serde_json::Value>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema, Clone, Copy)]
+struct AuditionNoteArg {
+    /// MIDI pitch (60 = middle C).
+    pitch: u8,
+    /// 1-127.
+    velocity: u8,
+    /// Start, ms from the phrase start.
+    start_ms: u32,
+    /// Length in ms.
+    dur_ms: u32,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AuditionArgs {
+    uid: String,
+    /// Built-in phrase: hit | note | chord | line (default note), in the song's key.
+    kind: Option<String>,
+    /// Explicit phrase instead of `kind` (at most 64 notes, 16 s).
+    notes: Option<Vec<AuditionNoteArg>>,
+    /// Octave of the phrase root (3 = MIDI 48-59; default 4). Lower for bass, higher for leads.
+    octave: Option<i8>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct PrintArgs {
+    uid: String,
+    /// Built-in phrase to print (hit | note | chord | line) when no bar range is given.
+    kind: Option<String>,
+    /// Explicit phrase to print instead of `kind`.
+    notes: Option<Vec<AuditionNoteArg>>,
+    /// Print the track's own part from this bar (0-based) instead of a phrase.
+    start_bar: Option<u32>,
+    /// End bar (exclusive) of that part; default the song end.
+    end_bar: Option<u32>,
+    /// Bar to place the printed clip at (default start_bar or 0).
+    at_bar: Option<u32>,
+}
+
+fn phrase_kind(kind: Option<String>) -> Result<Option<daw_core::audition::PhraseKind>, String> {
+    kind.map(|k| serde_json::from_value(serde_json::Value::String(k.clone()))
+        .map_err(|_| format!("unknown phrase kind '{k}' (hit | note | chord | line)")))
+        .transpose()
+}
+
+fn audition_notes(notes: Option<Vec<AuditionNoteArg>>) -> Option<Vec<daw_core::audition::AuditionNote>> {
+    notes.map(|v| v.into_iter().map(|n| daw_core::audition::AuditionNote {
+        pitch: n.pitch, velocity: n.velocity, start_ms: n.start_ms, dur_ms: n.dur_ms,
+    }).collect())
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct RevertSoundArgs {
+    uid: String,
+    /// Version number from sound_history.
+    version: usize,
+}
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct LoopRegionArgs {
@@ -358,9 +472,9 @@ impl DawServer {
         reply(self.tools.remove_track(a.track_id))
     }
 
-    #[tool(description = "Update track properties: volume, pan, mute, name, GM preset, soundfont path. All optional.")]
+    #[tool(description = "Update track properties: volume, pan, mute, name, GM preset, soundfont path, tuning_cents. All optional.")]
     fn set_track(&self, Parameters(a): Parameters<SetTrackArgs>) -> Result<CallToolResult, McpError> {
-        reply(self.tools.set_track(a.track_id, a.volume, a.pan, a.muted, a.name, a.preset, a.soundfont))
+        reply(self.tools.set_track(a.track_id, a.volume, a.pan, a.muted, a.name, a.preset, a.soundfont, a.tuning_cents))
     }
 
     #[tool(description = "Set the tempo in BPM (20-300).")]
@@ -428,6 +542,16 @@ impl DawServer {
         reply(self.tools.set_sampler_variants(a.track_id, a.pitch, a.variants))
     }
 
+    #[tool(description = "Create or replace a sampler pad: map a .wav to a MIDI pitch on a drum or melodic track (a track without a sampler becomes one, replacing its SoundFont instrument). gate=true makes the sample follow note lengths — use it for 808s, pads and chops written with set_notes; leave it false for one-shot drums. Then add velocity layers with set_sampler_variants.")]
+    fn set_sampler_pad(&self, Parameters(a): Parameters<SamplerPadArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_sampler_pad(a.track_id, a.pitch, a.path, a.gain, a.gate))
+    }
+
+    #[tool(description = "Replace a track's LFO modulators (movement over time). dest cutoff sweeps the track's low-pass around effects.cutoff on every track type; volume (tremolo) and pan (auto-pan) oscillate around the track's fader/pan. depth is the swing (0..1) either side of that base value; rate_hz 0.1 is a slow ~10 s breath, 4-8 a wobble. [] removes them.")]
+    fn set_modulators(&self, Parameters(a): Parameters<ModulatorsArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_modulators(a.track_id, a.modulators))
+    }
+
     #[tool(description = "Set effect-chain fields on a track: reverb (send), send_delay, chorus, cutoff, resonance, lfo_depth, delay_*, drive, eq_*, comp_*.")]
     fn set_effects(&self, Parameters(a): Parameters<EffectsArgs>) -> Result<CallToolResult, McpError> {
         reply(self.tools.set_effects(a.track_id, a.params))
@@ -471,6 +595,48 @@ impl DawServer {
     #[tool(description = "Inspect a CLAP slot's parameter ids, bounds, defaults, integer/read-only flags and saved overrides. Loads a separate instance on a worker; does not change the project or read live automation/internal edits. Use these ids before set_clap_param.")]
     async fn get_clap_params(&self, Parameters(a): Parameters<ClapUidArgs>) -> Result<CallToolResult, McpError> {
         let tools=self.tools.clone(); blocking(move ||tools.get_clap_params(a.uid)).await
+    }
+
+    #[tool(description = "SOUND DESIGN 1/5: search Surge XT's free patches by name/category to find a starting point for a described sound (\"deep tom\" → Percussion, \"dusty pad\" → Pads).")]
+    async fn find_patches(&self, Parameters(a): Parameters<FindPatchesArgs>) -> Result<CallToolResult, McpError> {
+        let tools=self.tools.clone(); blocking(move ||tools.find_patches(a.query,a.category,a.limit)).await
+    }
+
+    #[tool(description = "SOUND DESIGN 2/5: load a Surge XT patch onto its own new track (named after the sound), or onto a named track (replace=true needed if it plays something other than Surge XT). Live mode: heard in the GUI at once.")]
+    async fn load_patch(&self, Parameters(a): Parameters<LoadPatchArgs>) -> Result<CallToolResult, McpError> {
+        let tools=self.tools.clone(); blocking(move ||tools.load_patch(a.patch_path,a.track_id,a.name,a.replace)).await
+    }
+
+    #[tool(description = "SOUND DESIGN 3/5: the sound's musical controls (oscillators, filter, envelopes, LFO, drive, voice) with current values in readable units and a hint for each.")]
+    async fn describe_sound(&self, Parameters(a): Parameters<ClapUidArgs>) -> Result<CallToolResult, McpError> {
+        let tools=self.tools.clone(); blocking(move ||tools.describe_sound(a.uid)).await
+    }
+
+    #[tool(description = "SOUND DESIGN 4/5: set musical controls, e.g. {\"filter_cutoff\": \"600 Hz\", \"amp_decay\": \"180 ms\", \"drive\": 0.3}. All are checked before anything is saved. Live mode: heard in the GUI at once.")]
+    async fn shape_sound(&self, Parameters(a): Parameters<ShapeSoundArgs>) -> Result<CallToolResult, McpError> {
+        let tools=self.tools.clone(); blocking(move ||tools.shape_sound(a.uid,a.controls)).await
+    }
+
+    #[tool(description = "SOUND DESIGN 5/5: play a short phrase on the sound in the song's key — in the open GUI in live mode — and report its measured traits (pitch vs intended note, attack, decay, sustain, brightness, noisiness) plus a WAV path. The musician listens and judges; use the numbers to steer the next shape_sound.")]
+    async fn audition_sound(&self, Parameters(a): Parameters<AuditionArgs>) -> Result<CallToolResult, McpError> {
+        let kind = match phrase_kind(a.kind) { Ok(k) => k, Err(e) => return reply(Err(e)) };
+        let tools=self.tools.clone(); blocking(move ||tools.audition_sound(a.uid, kind, audition_notes(a.notes), a.octave)).await
+    }
+
+    #[tool(description = "Print a designed sound to audio: render a phrase (or the track's part over bars) to a WAV beside the project and place it as a clip on a new audio track \"<name> (print)\" — to keep the sound raw.")]
+    async fn print_sound(&self, Parameters(a): Parameters<PrintArgs>) -> Result<CallToolResult, McpError> {
+        let kind = match phrase_kind(a.kind) { Ok(k) => k, Err(e) => return reply(Err(e)) };
+        let tools=self.tools.clone(); blocking(move ||tools.print_sound(a.uid, audition_notes(a.notes), kind, a.start_bar, a.end_bar, a.at_bar)).await
+    }
+
+    #[tool(description = "List the versions of a designed sound made in this session (load, each shape, reverts).")]
+    fn sound_history(&self, Parameters(a): Parameters<ClapUidArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.sound_history(a.uid))
+    }
+
+    #[tool(description = "Return a designed sound to an earlier version from sound_history.")]
+    fn revert_sound(&self, Parameters(a): Parameters<RevertSoundArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.revert_sound(a.uid, a.version))
     }
 
     #[tool(description = "Append a CLAP effect plugin to a track's insert chain.")]
@@ -560,9 +726,10 @@ impl ServerHandler for DawServer {
             .with_instructions(
                 "daw-ai project server. Start with project_summary; in live mode also inspect session_state. \
                  Compose short editable phrases with explicit velocities, note lengths, intentional timing, rests and musical development. \
-                 Global swing and random humanization do not replace phrasing. Use set_notes for detailed performances and set_sampler_variants for velocity-layered or alternate sample takes. \
+                 Global swing and random humanization do not replace phrasing. Use set_notes for detailed performances, set_sampler_pad to build sampler kits (gate=true for sounds that should follow note length), set_sampler_variants for velocity-layered or alternate takes, and set_modulators for filter/volume/pan movement. \
                  Use start_listen for cancellable revision-linked audio renders and diagnostics. Audition the audio with the musician before expanding an arrangement; numerical analysis does not establish musical quality, and do not invent listening judgments or ratings. \
-                 Live mode shares revision-checked edits and undo with the musician; inspect engine application status. Offline mode edits files only."
+                 Live mode shares revision-checked edits and undo with the musician; inspect engine application status. Offline mode edits files only. \
+                 Designing sounds from words (Surge XT): find_patches → load_patch → describe_sound → shape_sound → audition_sound, then let the musician steer; the musician judges by ear."
                     .to_string(),
             )
     }

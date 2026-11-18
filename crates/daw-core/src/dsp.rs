@@ -40,9 +40,56 @@ pub fn spectrum(samples: &[f32], sample_rate: u32, bins: usize,
     out
 }
 
+/// Welch-averaged linear power spectrum: Hann-windowed `frame`-point FFTs
+/// over the signal (50% overlap), averaged; `frame / 2 + 1` bins of
+/// `sample_rate / frame` Hz each. All zeros for empty input.
+pub fn power_spectrum(samples: &[f32], frame: usize) -> Vec<f32> {
+    let bins = frame / 2 + 1;
+    let mut acc = vec![0.0f32; bins];
+    if samples.is_empty() || frame < 2 {
+        return acc;
+    }
+    let fft = FftPlanner::<f32>::new().plan_fft_forward(frame);
+    let window: Vec<f32> = (0..frame)
+        .map(|n| 0.5 - 0.5 * (std::f32::consts::TAU * n as f32 / (frame as f32 - 1.0)).cos())
+        .collect();
+    let hop = frame / 2;
+    let mut frames = 0usize;
+    let mut start = 0usize;
+    loop {
+        let mut buf: Vec<Complex<f32>> = (0..frame)
+            .map(|n| Complex { re: samples.get(start + n).copied().unwrap_or(0.0) * window[n], im: 0.0 })
+            .collect();
+        fft.process(&mut buf);
+        for (a, c) in acc.iter_mut().zip(&buf) {
+            *a += c.norm_sqr();
+        }
+        frames += 1;
+        start += hop;
+        if start + frame > samples.len() {
+            break;
+        }
+    }
+    for a in &mut acc {
+        *a /= frames as f32;
+    }
+    acc
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn power_spectrum_peaks_at_the_sine_bin() {
+        // 1 kHz at 44.1 kHz, 2048-point frames: bin 1000 / (44100 / 2048) ≈ 46.4.
+        let x: Vec<f32> = (0..8192).map(|i| (std::f32::consts::TAU * 1000.0 * i as f32 / 44_100.0).sin()).collect();
+        let p = power_spectrum(&x, 2048);
+        assert_eq!(p.len(), 1025);
+        let peak = p.iter().enumerate().max_by(|a, b| a.1.total_cmp(b.1)).unwrap().0;
+        assert!((45..=48).contains(&peak), "peak bin {peak}");
+        assert!(power_spectrum(&[], 2048).iter().all(|v| *v == 0.0));
+    }
 
     #[test]
     fn spectrum_empty_is_zeros() {

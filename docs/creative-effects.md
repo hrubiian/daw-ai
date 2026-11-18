@@ -84,3 +84,5 @@ flags and saved overrides from a separately loaded worker instance. It does
 not change the project or read live automation/internal edits. Use those IDs
 with `set_clap_param`. Build workspace test plugins before standalone MCP
 tests; `scripts/check.sh` already does this.
+
+No third-party plugin or long-running hardware qualification has been performed.

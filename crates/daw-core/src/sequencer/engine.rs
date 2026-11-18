@@ -36,6 +36,8 @@ pub enum SequencerCommand {
     SetClapParam { uid: String, param_id: u32, value: f64 },
     PreviewNote     { track_id: String, pitch: u8, velocity: u8 },
     PreviewNoteOff  { track_id: String, pitch: u8 },
+    /// Play test notes on a track, scheduled ahead of the audio clock.
+    Audition { track_id: String, notes: Vec<crate::audition::AuditionNote> },
     RawCC           { channel: u8, cc: u8, value: u8 },
     SetMetronome(bool),
     /// Begin a recording take: count in `count_in_bars` bars of clicks with the
@@ -176,9 +178,10 @@ struct TrackState {
     strip:    u8,
     slots:    Vec<SlotState>,
     muted:    bool,
-    is_audio: bool,
     /// True when this track triggers sampler pads instead of a synth.
     is_sampler: bool,
+    /// Sampler pitches whose pad follows note length (note-off releases them).
+    gated: Vec<u8>,
     /// (CC number, static base value 0..1, modulator) for each LFO on this track.
     mod_jobs: Vec<(u8, f32, Modulator)>,
 }
@@ -191,6 +194,15 @@ pub fn mod_base01(dest: ModDest, track: &crate::project::Track) -> f32 {
         ModDest::Volume    => track.volume,
         ModDest::Pan       => (track.pan + 1.0) * 0.5,
     }
+}
+
+/// Modulation jobs for strips without a SoundFont synth: cutoff (insert
+/// low-pass), volume and pan are applied by the mixer; resonance has no target.
+pub fn mixer_mod_jobs(track: &crate::project::Track) -> Vec<(u8, f32, Modulator)> {
+    track.modulators.iter()
+        .filter(|m| m.dest != ModDest::Resonance)
+        .map(|m| (m.dest.cc(), mod_base01(m.dest, track), m.clone()))
+        .collect()
 }
 
 pub struct Sequencer {
@@ -231,7 +243,6 @@ pub struct Sequencer {
     logical_gate: u32,
     strip_state: Vec<(String, StripSpec)>,
     clip_state: Vec<(u32, String)>,
-    legacy_paths: Vec<Option<String>>,
 }
 
 impl Sequencer {
@@ -264,7 +275,6 @@ impl Sequencer {
             logical_gate: 0,
             strip_state: Vec::new(),
             clip_state: Vec::new(),
-            legacy_paths: Vec::new(),
         }
     }
 
@@ -296,6 +306,24 @@ impl Sequencer {
         if self.event_frame.is_some() && self.audio_clock.is_some() {
             let _ = self.emit(AudioEvent::PublishU8 { target: self.transport_state.clone(), value });
         } else { self.transport_state.store(value, Ordering::Release); }
+    }
+
+    /// Play `notes` on `track_id`'s strip, each on its exact frame from the
+    /// audio clock's horizon. Without an audio clock (no device) nothing can
+    /// be heard, so nothing is sent.
+    pub(crate) fn audition(&mut self, track_id: &str, notes: &[crate::audition::AuditionNote]) {
+        let Some(clock) = self.audio_clock.clone() else { return };
+        let Some(strip) = self.tracks.iter().find(|(id, _)| id == track_id).map(|(_, ts)| ts.strip) else { return };
+        let sr = clock.sample_rate.load(Ordering::Acquire).max(1) as u64;
+        let start = clock.horizon();
+        let at = |ms: u32| start + ms as u64 * sr / 1000;
+        for n in notes {
+            self.event_frame = Some(at(n.start_ms));
+            let _ = self.emit(AudioEvent::NoteOn { strip, pitch: n.pitch, velocity: n.velocity });
+            self.event_frame = Some(at(n.start_ms.saturating_add(n.dur_ms)));
+            let _ = self.emit(AudioEvent::NoteOff { strip, pitch: n.pitch });
+        }
+        self.event_frame = None;
     }
 
     fn emit(&self, event: AudioEvent) -> Result<(), crossbeam_channel::TrySendError<AudioEvent>> {
@@ -414,11 +442,10 @@ impl Sequencer {
         }
     }
 
-    /// Transition into rolling playback: mark the state, restart the preview
-    /// clip, and arm arranged audio clips at the playhead (mirrors Play).
+    /// Transition into rolling playback: mark the state and arm arranged
+    /// audio clips at the playhead (mirrors Play).
     fn start_roll(&mut self) {
         self.publish_transport(TRANSPORT_ROLLING);
-        let _ = self.emit(AudioEvent::PlayClip);
         self.arm_audio_clips_at_playhead();
         // Legacy (no punch toggles): the gate opens right at the roll.
         self.update_gate();
@@ -460,15 +487,14 @@ impl Sequencer {
                 let _ = self.emit(AudioEvent::Applied { revision, ack });
             }
         }
-        let _ = self.emit(AudioEvent::StopClip);
         let _ = self.emit(AudioEvent::StopAudioClips);
     }
 
     /// One count-in tick: click on beats (accented on the bar), playhead held.
     /// Count-in clicks always sound, regardless of the metronome toggle.
     fn fire_count_in_tick(&mut self) {
-        if self.count_in % TICKS_PER_BEAT == 0 {
-            let vel = if self.count_in % TICKS_PER_BAR == 0 { 110u8 } else { 80u8 };
+        if self.count_in.is_multiple_of(TICKS_PER_BEAT) {
+            let vel = if self.count_in.is_multiple_of(TICKS_PER_BAR) { 110u8 } else { 80u8 };
             let _ = self.emit(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
             let _ = self.emit(AudioEvent::NoteOn { strip: STRIP_UTILITY, pitch: 75, velocity: vel });
         }
@@ -494,7 +520,7 @@ impl Sequencer {
         if self.event_frame.is_some() { self.publish_u32(&self.playback_tick, self.tick); }
         // 0. On a bar boundary, apply any queued live edit (cycle-quantized swap)
         //    before generating this bar's events, so it starts on the downbeat.
-        if self.tick % TICKS_PER_BAR == 0 {
+        if self.tick.is_multiple_of(TICKS_PER_BAR) {
             if let Some(p) = self.pending_update.take() {
                 self.apply_project(p, false);
                 if let Some((revision, ack)) = self.pending_ack.take() {
@@ -528,7 +554,7 @@ impl Sequencer {
             let Some(slot) = slot else { continue };
 
             let local_tick  = self.tick - slot.start_tick;
-            let pat_len     = pattern_length_ticks(&slot.pattern);
+            let pat_len     = pattern_length_ticks(&slot.pattern).max(1);
             let pat_tick    = if slot.loop_pat { local_tick % pat_len } else { local_tick };
 
             if pat_tick >= pat_len { continue; }
@@ -547,6 +573,10 @@ impl Sequencer {
                                 let velocity = humanize_velocity(velocity, strip, row.pitch, self.tick, self.humanize);
                                 if ts.is_sampler {
                                     note_ons.push(AudioEvent::TriggerSample { strip, pitch: row.pitch, gain: velocity as f32 / 127.0 });
+                                    if ts.gated.contains(&row.pitch) {
+                                        let off_tick = self.tick + sp.step_note_ticks(ticks_per_step);
+                                        note_offs.push((off_tick, AudioEvent::NoteOff { strip, pitch: row.pitch }));
+                                    }
                                 } else {
                                     note_ons.push(AudioEvent::NoteOn { strip, pitch: row.pitch, velocity });
                                     let off_tick = self.tick + sp.step_note_ticks(ticks_per_step);
@@ -563,6 +593,10 @@ impl Sequencer {
                             let velocity = humanize_velocity(note.vel, strip, note.pitch, self.tick, self.humanize);
                             if ts.is_sampler {
                                 note_ons.push(AudioEvent::TriggerSample { strip, pitch: note.pitch, gain: velocity as f32 / 127.0 });
+                                if ts.gated.contains(&note.pitch) {
+                                    let off_tick = self.tick + piano_note_duration(pr, note);
+                                    note_offs.push((off_tick, AudioEvent::NoteOff { strip, pitch: note.pitch }));
+                                }
                             } else {
                                 note_ons.push(AudioEvent::NoteOn { strip, pitch: note.pitch, velocity });
                                 // Legato: hold to the next note's nominal start; else natural duration.
@@ -597,28 +631,24 @@ impl Sequencer {
             }
         }
 
-        // LFO modulation: re-send modulated CCs on a coarse interval (~every
-        // 8th note) so live playback breathes like the export, without flooding.
-        if self.tick % (TICKS_PER_BEAT / 2) == 0 {
+        // LFO modulation: refresh every 32nd note (≈30–60 ms at usual tempos);
+        // the mixer glides between values, so sweeps stay smooth without flooding.
+        if self.tick.is_multiple_of(TICKS_PER_BEAT / 8) {
             let spt = 60.0 / self.bpm / TICKS_PER_BEAT as f64; // seconds per tick
             let t = (self.tick as f64 * spt) as f32;
             let mut ccs: Vec<AudioEvent> = Vec::new();
             for (_, ts) in &self.tracks {
                 for (cc, base01, m) in &ts.mod_jobs {
                     let v = modulated_value(m, *base01, t);
-                    ccs.push(AudioEvent::RawCC {
-                        strip:   ts.strip,
-                        cc:      *cc,
-                        value:   (v * 127.0).round().clamp(0.0, 127.0) as u8,
-                    });
+                    ccs.push(AudioEvent::Modulate { strip: ts.strip, cc: *cc, value: Some(v) });
                 }
             }
             for ev in ccs { let _ = self.emit(ev); }
         }
 
         // Metronome click (utility synth, pitch 75 = Claves)
-        if self.metronome && self.tick % TICKS_PER_BEAT == 0 {
-            let vel = if self.tick % TICKS_PER_BAR == 0 { 100u8 } else { 60u8 };
+        if self.metronome && self.tick.is_multiple_of(TICKS_PER_BEAT) {
+            let vel = if self.tick.is_multiple_of(TICKS_PER_BAR) { 100u8 } else { 60u8 };
             let _ = self.emit(AudioEvent::NoteOn { strip: STRIP_UTILITY, pitch: 75, velocity: vel });
             let off = self.tick + TICKS_PER_BEAT / 4;
             self.schedule.entry(off).or_default().push(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
@@ -692,16 +722,11 @@ impl Sequencer {
     /// Structural changes still rebuild strips because strip indices route audio.
     fn apply_project(&mut self, project: Project, reset_tick: bool) {
         let specs = StripSpec::from_project(&project);
-        let legacy_paths: Vec<_> = project.tracks.iter().map(|t| match &t.instrument {
-            Instrument::AudioFile { path } => Some(path.clone()), _ => None,
-        }).collect();
-        let reusable = !reset_tick && self.legacy_paths == legacy_paths && self.strip_state.len() == specs.len()
+        let reusable = !reset_tick && self.strip_state.len() == specs.len()
             && self.strip_state.iter().zip(project.tracks.iter().zip(&specs)).all(|((id, old), (track, new))| {
                 id == &track.id && old.kind == new.kind
                     && old.clap_instrument == new.clap_instrument && old.clap_fx == new.clap_fx
                     && old.tuning_cents == new.tuning_cents
-                    && (!matches!(track.instrument, Instrument::AudioFile { .. })
-                        || (old.gain == new.gain && old.effects == new.effects))
             });
         if reset_tick {
             self.schedule.clear();
@@ -723,7 +748,6 @@ impl Sequencer {
         } else {
             let _ = self.emit(AudioEvent::LoadStrips { specs: specs.clone() });
         }
-        self.legacy_paths = legacy_paths;
         self.strip_state = project.tracks.iter().map(|track| track.id.clone()).zip(specs).collect();
         self.bpm       = project.project.bpm.clamp(20.0, 300.0);
         let _ = self.emit(AudioEvent::SetTempo { bpm: self.bpm });
@@ -732,6 +756,11 @@ impl Sequencer {
         self.timing    = project.project.timing;
         self.metronome = project.project.metronome;
         self.loop_region = project.loop_region.clone();
+        // Destinations each strip was modulating, to clear the ones whose
+        // modulator this edit removed (the strip would keep the last LFO value).
+        let old_mods: Vec<(u8, Vec<u8>)> = if reusable {
+            self.tracks.iter().map(|(_, ts)| (ts.strip, ts.mod_jobs.iter().map(|j| j.0).collect())).collect()
+        } else { Vec::new() };
         self.tracks.clear();
 
         let _ = self.emit(AudioEvent::SetReturns {
@@ -758,6 +787,20 @@ impl Sequencer {
             });
             clip_specs.push((clip_id, clip.path.clone()));
         }
+        // An audio track's whole-file `AudioFile` source plays once from t=0
+        // through its strip — an implicit clip, exactly as the exporter does.
+        for (i, track) in project.tracks.iter().enumerate() {
+            let Instrument::AudioFile { path } = &track.instrument else { continue };
+            if path.is_empty() { continue; }
+            let Ok(len_sec) = crate::audio::wav_duration_sec(std::path::Path::new(path)) else { continue };
+            let clip_id = (project.audio_clips.len() + i) as u32;
+            self.audio_jobs.push(AudioClipJob {
+                clip_id, strip: i as u8, start_tick: 0,
+                end_tick: sec_to_tick(len_sec, self.bpm),
+                offset_sec: 0.0, len_sec: len_sec as f32, gain: 1.0,
+            });
+            clip_specs.push((clip_id, path.clone()));
+        }
         if reset_tick || clip_specs != self.clip_state {
             let _ = self.emit(AudioEvent::LoadAudioClips { specs: clip_specs.clone() });
             self.clip_state = clip_specs;
@@ -770,7 +813,7 @@ impl Sequencer {
         let auto_loop_len: u32 = project.tracks.iter()
             .flat_map(|t| t.patterns.first())
             .filter_map(|pid| project.patterns.iter().find(|p| p.id() == pid))
-            .map(|p| pattern_length_ticks(p))
+            .map(pattern_length_ticks)
             .max()
             .unwrap_or(TICKS_PER_BAR);
 
@@ -779,41 +822,17 @@ impl Sequencer {
 
         for (i, track) in project.tracks.iter().enumerate() {
             let strip = i as u8;
-            // Audio tracks: legacy preview clip (TUI path), skip MIDI scheduling.
-            // Program/volume/pan/effects for all strips are baked into the
-            // StripSpec build above; nothing per-track to send here.
+            // Audio tracks play through audio-clip jobs (above); no MIDI to
+            // schedule. Volume/pan/effects live in the StripSpec build.
             if track.track_type == TrackType::Audio {
-                if let Instrument::AudioFile { path } = &track.instrument {
-                    if !path.is_empty() && !reusable {
-                        let _ = self.emit(AudioEvent::LoadClipFromFile {
-                            path: path.clone(),
-                            volume: track.volume,
-                        });
-                        let fx = &track.effects;
-                        let _ = self.emit(AudioEvent::SetClipEffects {
-                            delay_time_ms:  fx.delay_time_ms,
-                            delay_feedback: fx.delay_feedback,
-                            delay_mix:      fx.delay_mix,
-                            cutoff:         fx.cutoff,
-                            drive:          fx.drive,
-                            eq_low_gain:    fx.eq_low_gain,
-                            eq_mid_gain:    fx.eq_mid_gain,
-                            eq_high_gain:   fx.eq_high_gain,
-                            eq_mid_freq:    fx.eq_mid_freq,
-                            comp_threshold: fx.comp_threshold,
-                            comp_ratio:     fx.comp_ratio,
-                            comp_attack_ms: fx.comp_attack_ms,
-                            comp_release_ms: fx.comp_release_ms,
-                        });
-                    }
-                }
                 self.tracks.push((track.id.clone(), TrackState {
                     strip,
                     slots:    Vec::new(),
                     muted:    track.muted,
-                    is_audio: true,
                     is_sampler: false,
-                    mod_jobs: Vec::new(), // clip modulation handled by the exporter
+                    gated: Vec::new(),
+                    // Audio strips have no synth: only mixer-level destinations apply.
+                    mod_jobs: mixer_mod_jobs(track),
                 }));
                 continue;
             }
@@ -849,23 +868,37 @@ impl Sequencer {
                     .unwrap_or_default()
             };
 
-            // Sampler tracks have no synth for modulators to drive.
-            let mod_jobs = if is_sampler {
-                Vec::new()
+            // Synth-less strips (sampler, CLAP) take the mixer-level
+            // destinations; SoundFont strips also take resonance as a CC.
+            let synthless = is_sampler || matches!(track.instrument, Instrument::Clap(_));
+            let mod_jobs = if synthless {
+                mixer_mod_jobs(track)
             } else {
                 track.modulators.iter()
                     .map(|m| (m.dest.cc(), mod_base01(m.dest, track), m.clone()))
                     .collect()
+            };
+            let gated = match &track.instrument {
+                Instrument::Sampler { pads } => pads.iter().filter(|p| p.gate).map(|p| p.pitch).collect(),
+                _ => Vec::new(),
             };
 
             self.tracks.push((track.id.clone(), TrackState {
                 strip,
                 slots,
                 muted:    track.muted,
-                is_audio: false,
                 is_sampler,
+                gated,
                 mod_jobs,
             }));
+        }
+
+        for (strip, ccs) in old_mods {
+            let now: Vec<u8> = self.tracks.iter().find(|(_, ts)| ts.strip == strip)
+                .map(|(_, ts)| ts.mod_jobs.iter().map(|j| j.0).collect()).unwrap_or_default();
+            for cc in ccs {
+                if !now.contains(&cc) { let _ = self.emit(AudioEvent::Modulate { strip, cc, value: None }); }
+            }
         }
 
         // Live swap: keep the playhead, but clamp it to the (possibly new) length.
@@ -906,7 +939,6 @@ impl Sequencer {
                         self.playing = true;
                         self.publish_u32(&self.roll_start_tick, self.tick);
                         self.publish_transport(TRANSPORT_ROLLING);
-                        let _ = self.emit(AudioEvent::PlayClip);
                         // Start any audio clip spanning the playhead from the right
                         // offset, so pressing Play mid-clip plays audio from there
                         // (not silence, and not only from the clip's start).
@@ -930,8 +962,9 @@ impl Sequencer {
                         next_tick = Instant::now();
                     }
                     SequencerCommand::SetBpm(bpm) => {
-                        self.bpm = bpm;
-                        let _ = self.emit(AudioEvent::SetTempo { bpm });
+                        // A zero/NaN tempo would make tick_duration() panic.
+                        self.bpm = if bpm.is_finite() { bpm.clamp(20.0, 300.0) } else { self.bpm };
+                        let _ = self.emit(AudioEvent::SetTempo { bpm: self.bpm });
                         next_tick = Instant::now();
                     }
                     SequencerCommand::SetSwing(sw) => {
@@ -981,24 +1014,6 @@ impl Sequencer {
                     }
                     SequencerCommand::SetTrackEffects { track_id, effects } => {
                         if let Some((_, ts)) = self.tracks.iter().find(|(id, _)| id == &track_id) {
-                            // Legacy preview-clip chain (TUI audio-file path).
-                            if ts.is_audio {
-                                let _ = self.emit(AudioEvent::SetClipEffects {
-                                    delay_time_ms:   effects.delay_time_ms,
-                                    delay_feedback:  effects.delay_feedback,
-                                    delay_mix:       effects.delay_mix,
-                                    cutoff:          effects.cutoff,
-                                    drive:           effects.drive,
-                                    eq_low_gain:     effects.eq_low_gain,
-                                    eq_mid_gain:     effects.eq_mid_gain,
-                                    eq_high_gain:    effects.eq_high_gain,
-                                    eq_mid_freq:     effects.eq_mid_freq,
-                                    comp_threshold:  effects.comp_threshold,
-                                    comp_ratio:      effects.comp_ratio,
-                                    comp_attack_ms:  effects.comp_attack_ms,
-                                    comp_release_ms: effects.comp_release_ms,
-                                });
-                            }
                             let _ = self.emit(AudioEvent::SetStripEffects {
                                 strip: ts.strip,
                                 effects,
@@ -1018,6 +1033,7 @@ impl Sequencer {
                         self.close_gate();
                         self.recording = false;
                     }
+                    SequencerCommand::Audition { track_id, notes } => self.audition(&track_id, &notes),
                     SequencerCommand::PreviewNote { track_id, pitch, velocity } => {
                         if let Some((_, ts)) = self.tracks.iter().find(|(id, _)| id == &track_id) {
                             let _ = self.emit(AudioEvent::NoteOn {
@@ -1079,6 +1095,35 @@ mod tests {
     }
 
     use crate::audio::input::{TRANSPORT_COUNT_IN, TRANSPORT_ROLLING, TRANSPORT_STOPPED};
+
+    #[test]
+    fn whole_file_audio_track_plays_as_a_clip_on_its_strip() {
+        // 1 s mono WAV: the track's `AudioFile` source becomes an ordinary
+        // clip job (loaded via LoadAudioClips, triggered at tick 0 on the
+        // track's own strip) — no separate preview-player path.
+        let wav = std::env::temp_dir().join(format!("daw_seq_wholefile_{}.wav", std::process::id()));
+        let spec = hound::WavSpec { channels: 1, sample_rate: 8000, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(&wav, spec).unwrap();
+        for _ in 0..8000 { w.write_sample(1000i16).unwrap(); }
+        w.finalize().unwrap();
+
+        let (mut seq, _, audio_rx) = make_sequencer();
+        let mut p = Project::default_project();
+        let tid = p.add_track(TrackType::Audio);
+        let strip = p.tracks.iter().position(|t| t.id == tid).unwrap() as u8;
+        p.tracks[strip as usize].instrument = Instrument::AudioFile { path: wav.to_string_lossy().into_owned() };
+        seq.load_project(p);
+        let loaded: Vec<AudioEvent> = audio_rx.try_iter().collect();
+        assert!(loaded.iter().any(|e| matches!(e, AudioEvent::LoadAudioClips { specs }
+            if specs.iter().any(|(_, path)| path == &wav.to_string_lossy()))), "file loads as a clip");
+        // 1 s at 120 bpm = 240 ticks; the song covers the whole file.
+        assert!(seq.song_length_ticks() >= 240);
+        seq.fire_tick();
+        assert!(audio_rx.try_iter().any(|e| matches!(e,
+            AudioEvent::TriggerAudioClip { strip: s, offset_sec, .. } if s == strip && offset_sec == 0.0)),
+            "starts at tick 0 on the track's strip");
+        std::fs::remove_file(&wav).ok();
+    }
 
     #[test]
     fn ordinary_edits_preserve_sustains_and_instrument_instances() {
@@ -1157,6 +1202,33 @@ mod tests {
         seq.do_pause();
         assert_eq!(clock.generation.load(Ordering::Acquire), 1);
         assert!(seq.next_sample.is_none());
+    }
+
+    #[test]
+    fn audition_schedules_notes_on_track_strip() {
+        let (_tx, rx) = crossbeam_channel::unbounded();
+        let (audio, events) = crossbeam_channel::unbounded();
+        let mut seq = Sequencer::new(rx, audio);
+        seq.load_project(Project::default_project());
+        let clock = Arc::new(crate::audio::scheduling::AudioClock::default());
+        clock.sample_rate.store(48_000, Ordering::Release);
+        clock.quantum.store(128, Ordering::Relaxed);
+        seq.audio_clock = Some(clock.clone());
+        let _ = events.try_iter().count();
+        let start = clock.horizon();
+        seq.audition("t2", &[crate::audition::AuditionNote { pitch: 60, velocity: 100, start_ms: 0, dur_ms: 500 }]);
+        let got: Vec<(u64, String)> = events.try_iter().filter_map(|e| match e {
+            AudioEvent::Scheduled(e) => match e.event {
+                AudioEvent::NoteOn { strip: 1, pitch: 60, .. } => Some((e.frame, "on".to_string())),
+                AudioEvent::NoteOff { strip: 1, pitch: 60 } => Some((e.frame, "off".to_string())),
+                _ => None,
+            },
+            _ => None,
+        }).collect();
+        assert_eq!(got, vec![(start, "on".into()), (start + 24_000, "off".into())]);
+        // Unknown track: nothing scheduled.
+        seq.audition("zz", &[crate::audition::AuditionNote { pitch: 60, velocity: 100, start_ms: 0, dur_ms: 500 }]);
+        assert_eq!(events.try_iter().count(), 0);
     }
 
     #[test]
@@ -1255,7 +1327,7 @@ mod tests {
         for tick in 0..2000u32 {
             let v = humanize_velocity(100, 9, 36, tick, 1.0);
             assert!((1..=127).contains(&v));
-            assert!(v >= 65 && v <= 127, "tick {tick} -> {v} out of ±35% band");
+            assert!((65..=127).contains(&v), "tick {tick} -> {v} out of ±35% band");
         }
         // different ticks produce variation (not a constant)
         let set: std::collections::HashSet<u8> =
@@ -1429,6 +1501,7 @@ mod tests {
             modulators: vec![],
             clap_fx: vec![],
             tuning_cents: 0.0,
+            input: None,
         });
         p.audio_clips.push(AudioClip {
             track: "vox".into(),

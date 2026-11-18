@@ -10,6 +10,8 @@ use std::sync::OnceLock;
 pub struct DawTools {
     pub store: ProjectStore,
     pub sf2_path: std::path::PathBuf,
+    /// Versions of each designed sound this server session (sound_design).
+    pub history: crate::sound_design::SoundHistory,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -48,6 +50,9 @@ fn gm_drum_name(pitch: u8) -> String {
     }
 }
 
+/// Most steps `set_steps` accepts per row (keeps `steps` far inside `u16`).
+const MAX_STEPS: usize = 1024;
+
 fn track_ids(p: &Project) -> String {
     p.tracks.iter().map(|t| t.id.clone()).collect::<Vec<_>>().join(", ")
 }
@@ -60,15 +65,41 @@ fn clap_cache() -> std::sync::Arc<Vec<daw_core::audio::clap::ClapPluginDesc>> {
     clap_catalog().lock().unwrap_or_else(|e|e.into_inner()).clone()
 }
 
+/// Default soundfont when `$DAW_SF2` is unset: `assets/GeneralUser.sf2` in
+/// the working directory, else in the nearest folder above the project file
+/// that has one (projects live inside the repo, e.g. `projects/<name>/`), so
+/// the server works no matter where it was started. Falls back to the
+/// working-directory path, which the "soundfont missing" error then names.
+pub fn default_sf2(project: &std::path::Path, cwd: &std::path::Path) -> std::path::PathBuf {
+    const REL: &str = "assets/GeneralUser.sf2";
+    let in_cwd = cwd.join(REL);
+    if in_cwd.exists() {
+        return in_cwd;
+    }
+    let project = if project.is_absolute() { project.to_path_buf() } else { cwd.join(project) };
+    project.ancestors().skip(1).map(|dir| dir.join(REL)).find(|p| p.exists()).unwrap_or(in_cwd)
+}
+
 impl DawTools {
     pub fn new(path: std::path::PathBuf) -> Self {
-        let sf2_path = std::env::var("DAW_SF2")
-            .map(std::path::PathBuf::from)
-            .unwrap_or_else(|_| std::path::PathBuf::from("assets/GeneralUser.sf2"));
-        Self { store: ProjectStore::new(path), sf2_path }
+        let sf2_path = std::env::var("DAW_SF2").map(std::path::PathBuf::from).unwrap_or_else(|_| {
+            let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
+            default_sf2(&path, &cwd)
+        });
+        Self { store: ProjectStore::new(path), sf2_path, history: Default::default() }
     }
 
-    fn with_summary(&self, head: String) -> Result<String, String> {
+    /// `p` with sample, soundfont and plugin paths resolved the way the
+    /// renderer needs them: relative to the project file, falling back to
+    /// the working directory for older repo-relative assets. Every tool that
+    /// renders must go through this, not the raw stored project.
+    pub(crate) fn runtime_project(&self, p: &Project) -> Result<Project, String> {
+        let base = self.store.path.parent().unwrap_or(std::path::Path::new("."));
+        let cwd = std::env::current_dir().map_err(|e| e.to_string())?;
+        Ok(daw_core::project::format::resolve_assets(p, base, &cwd))
+    }
+
+    pub(crate) fn with_summary(&self, head: String) -> Result<String, String> {
         let p = self.store.load()?;
         let live = if self.store.live_socket.is_some() {
             let state = self.store.inspect_live()?;
@@ -128,6 +159,7 @@ impl DawTools {
         name: Option<String>,
         preset: Option<u8>,
         soundfont: Option<String>,
+        tuning_cents: Option<f32>,
     ) -> Result<String, String> {
         self.store.mutate(|p| {
             {
@@ -145,6 +177,12 @@ impl DawTools {
                 }
                 if let Some(v) = name {
                     t.name = v;
+                }
+                if let Some(v) = tuning_cents {
+                    if !(-200.0..=200.0).contains(&v) {
+                        return Err(format!("tuning_cents {v} is outside -200..=200"));
+                    }
+                    t.tuning_cents = v;
                 }
                 if let Some(v) = soundfont {
                     if let daw_core::project::Instrument::Soundfont { soundfont: sf, .. } =
@@ -203,6 +241,10 @@ impl DawTools {
 
     pub fn set_steps(&self, pattern_id: String, rows: Vec<StepRowArg>) -> Result<String, String> {
         let nrows = rows.len();
+        let max = MAX_STEPS;
+        if let Some(r) = rows.iter().find(|r| r.steps.chars().count() > max) {
+            return Err(format!("row for pitch {} has more than {max} steps", r.pitch));
+        }
         self.store.mutate(|p| {
             let Some(Pattern::Step(sp)) = p.patterns.iter_mut().find(|x| x.id() == pattern_id)
             else {
@@ -225,8 +267,12 @@ impl DawTools {
                         .collect(),
                 })
                 .collect();
-            let len = rows.iter().map(|r| r.steps.len()).max().unwrap_or(16) as u16;
-            sp.steps = len.max(1);
+            let len = rows.iter().map(|r| r.steps.chars().count()).max().unwrap_or(16).max(1);
+            // Every row spans the pattern (validation rejects ragged rows).
+            for r in &mut sp.rows {
+                r.steps.resize(len, 0);
+            }
+            sp.steps = len as u16;
             Ok(format!("{nrows} rows set on {pattern_id}"))
         })?;
         self.with_summary(format!("steps set on {pattern_id}"))
@@ -327,6 +373,74 @@ impl DawTools {
             Ok("sampler takes updated".into())
         })?;
         self.with_summary(format!("velocity layers / alternate takes updated on {track_id} p{pitch}"))
+    }
+
+    /// Create or replace a sampler pad. A track that has no sampler yet
+    /// becomes one (its SoundFont instrument is replaced).
+    pub fn set_sampler_pad(&self, track_id: String, pitch: u8, path: String, gain: Option<f32>, gate: Option<bool>) -> Result<String, String> {
+        if pitch > 127 { return Err(format!("pitch {pitch} is outside 0..=127")); }
+        if path.trim().is_empty() { return Err("path is empty — give a .wav path (relative to the project file or absolute)".into()); }
+        if let Some(g) = gain {
+            if !(0.0..=2.0).contains(&g) { return Err(format!("gain {g} is outside 0..=2 (use the track volume for more)")); }
+        }
+        self.store.mutate(|p| {
+            use daw_core::project::{Instrument, TrackType};
+            let ids = track_ids(p);
+            let Some(t) = p.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return Err(format!("no track '{track_id}' — tracks: {ids}"));
+            };
+            if t.track_type == TrackType::Audio {
+                return Err(format!("'{track_id}' is an audio track — add a drum or melodic track for a sampler"));
+            }
+            if !matches!(t.instrument, Instrument::Sampler { .. }) {
+                t.instrument = Instrument::Sampler { pads: Vec::new() };
+            }
+            let Instrument::Sampler { pads } = &mut t.instrument else { unreachable!() };
+            match pads.iter_mut().find(|pad| pad.pitch == pitch) {
+                // Replacing the sample keeps the pad's takes only if asked via set_sampler_variants.
+                Some(pad) => {
+                    if pad.path != path { pad.path = path.clone(); pad.variants.clear(); }
+                    if let Some(g) = gain { pad.gain = g; }
+                    if let Some(g) = gate { pad.gate = g; }
+                }
+                None => pads.push(daw_core::project::SamplePad {
+                    pitch, path: path.clone(), gain: gain.unwrap_or(1.0), variants: Vec::new(), gate: gate.unwrap_or(false),
+                }),
+            }
+            Ok("pad set".into())
+        })?;
+        self.with_summary(format!("pad p{pitch} on {track_id} ← {path}"))
+    }
+
+    /// Replace a track's LFO modulators.
+    pub fn set_modulators(&self, track_id: String, modulators: serde_json::Value) -> Result<String, String> {
+        let modulators: Vec<daw_core::project::Modulator> = serde_json::from_value(modulators).map_err(|e| format!(
+            "{e} — expected [{{\"dest\":\"cutoff|resonance|volume|pan\",\"shape\":\"sine|triangle|saw|square\",\"rate_hz\":0.25,\"depth\":0.3,\"phase\":0}}]"))?;
+        if modulators.len() > 8 { return Err("at most 8 modulators per track".into()); }
+        let n = modulators.len();
+        let mut notes = Vec::new();
+        self.store.mutate(|p| {
+            let ids = track_ids(p);
+            let Some(t) = p.tracks.iter_mut().find(|t| t.id == track_id) else {
+                return Err(format!("no track '{track_id}' — tracks: {ids}"));
+            };
+            let synth = matches!(t.instrument, daw_core::project::Instrument::Soundfont { .. })
+                && t.track_type != daw_core::project::TrackType::Audio;
+            for m in &modulators {
+                use daw_core::project::ModDest::*;
+                match (m.dest, synth) {
+                    (Resonance, _) => notes.push("resonance has no audible target on this engine (the insert filter is one-pole)"),
+                    (Cutoff, _) if t.effects.cutoff + m.depth <= 0.0 => notes.push("cutoff LFO sits at 0: the track will be silent; raise effects.cutoff"),
+                    (Volume, false) if t.volume > 1.0 => notes.push("volume LFO replaces the fader and tops out at 1.0 on this track"),
+                    _ => {}
+                }
+            }
+            t.modulators = modulators.clone();
+            Ok("modulators set".into())
+        })?;
+        notes.dedup();
+        let note = if notes.is_empty() { String::new() } else { format!(" — note: {}", notes.join("; ")) };
+        self.with_summary(format!("{n} modulator(s) on {track_id}{note}"))
     }
 
     pub fn set_effects(&self, track_id: String, params: serde_json::Value) -> Result<String, String> {
@@ -503,7 +617,7 @@ impl DawTools {
         Ok(serde_json::json!({"uid":uid,"name":name,"source":"plugin metadata and saved overrides; not live readback","params":params}).to_string())
     }
 
-    fn resolve_clap(&self, plugin_id: &str) -> Result<(String, String), String> {
+    pub(crate) fn resolve_clap(&self, plugin_id: &str) -> Result<(String, String), String> {
         clap_cache()
             .iter()
             .find(|d| d.id == plugin_id)
@@ -566,7 +680,7 @@ impl DawTools {
                 self.sf2_path.display()
             ));
         }
-        let plan = daw_core::audio::balance::auto_balance(&p, &self.sf2_path)
+        let plan = daw_core::audio::balance::auto_balance(&self.runtime_project(&p)?, &self.sf2_path)
             .map_err(|e| e.to_string())?;
         let mut report = String::from("balanced:\n");
         for r in &plan {
@@ -611,7 +725,7 @@ impl DawTools {
 
     /// Render the project and save an analyzed fingerprint as the CI baseline.
     pub fn snapshot(&self) -> Result<String, String> {
-        let p = self.store.load()?;
+        let p = self.runtime_project(&self.store.load()?)?;
         if !self.sf2_path.exists() {
             return Err(format!("soundfont missing at {} — download GeneralUser.sf2 (see README)", self.sf2_path.display()));
         }
@@ -627,7 +741,7 @@ impl DawTools {
 
     /// Re-render and report regressions vs the saved snapshot baseline.
     pub fn check(&self) -> Result<String, String> {
-        let p = self.store.load()?;
+        let p = self.runtime_project(&self.store.load()?)?;
         if !self.sf2_path.exists() {
             return Err(format!("soundfont missing at {} — download GeneralUser.sf2 (see README)", self.sf2_path.display()));
         }
@@ -661,7 +775,7 @@ impl DawTools {
     /// Report the song's density (tracks active per bar) and dynamic arc, and
     /// flag flat/static textures or missing intro builds.
     pub fn analyze_arrangement(&self) -> Result<String, String> {
-        let p = self.store.load()?;
+        let p = self.runtime_project(&self.store.load()?)?;
         if !self.sf2_path.exists() {
             return Err(format!(
                 "soundfont missing at {} — download GeneralUser.sf2 (see README)",
@@ -674,7 +788,7 @@ impl DawTools {
     /// Solo-render each track, profile its spectrum, and report where each
     /// track lives + which tracks mask each other (frequency collisions).
     pub fn analyze_mix(&self) -> Result<String, String> {
-        let p = self.store.load()?;
+        let p = self.runtime_project(&self.store.load()?)?;
         if !self.sf2_path.exists() {
             return Err(format!(
                 "soundfont missing at {} — download GeneralUser.sf2 (see README)",
@@ -731,7 +845,7 @@ impl DawTools {
         let e_label = end_bar.map(|e| e.to_string()).unwrap_or_else(|| "end".into());
         let out = dir.join(format!("{stem}-{s}-{e_label}-{}.wav", daw_io::session::operation_id()));
         let bpm = p.project.bpm;
-        let p = daw_core::project::format::resolve_assets(&p, self.store.path.parent().unwrap_or(std::path::Path::new(".")), &std::env::current_dir().map_err(|e| e.to_string())?);
+        let p = self.runtime_project(&p)?;
         let range = if start_bar.is_some() || end_bar.is_some() { Some((s, end_bar.unwrap_or_else(|| p.song_bars()))) } else { None };
         let (samples, sr) = daw_core::audio::export::render_range_samples(&p, &self.sf2_path, false, range, &Default::default()).map_err(|e| e.to_string())?;
         let spec = hound::WavSpec { channels: 2, sample_rate: sr, bits_per_sample: 32, sample_format: hound::SampleFormat::Float };
@@ -783,6 +897,39 @@ mod tests {
     }
 
     #[test]
+    fn agents_can_build_a_sampler_kit_and_add_movement() {
+        let (t, _path) = tools("sampler-pad");
+        // A SoundFont drum track becomes a sampler on its first pad.
+        let out = t.set_sampler_pad("t1".into(), 36, "kick.wav".into(), None, None).unwrap();
+        assert!(out.contains("sampler(pads 36)"), "{out}");
+        let out = t.set_sampler_pad("t1".into(), 48, "808.wav".into(), Some(0.8), Some(true)).unwrap();
+        assert!(out.contains("sampler(pads 36,48g)"), "summary marks gated pads: {out}");
+        // Re-setting a pad changes only what was passed.
+        t.set_sampler_pad("t1".into(), 48, "808.wav".into(), None, Some(false)).unwrap();
+        let p = t.store.load().unwrap();
+        let daw_core::project::Instrument::Sampler { pads } = &p.tracks[0].instrument else { panic!("sampler") };
+        assert_eq!((pads.len(), pads[1].gain, pads[1].gate), (2, 0.8, false));
+        assert!(t.set_sampler_pad("t1".into(), 36, "".into(), None, None).is_err());
+        assert!(t.set_sampler_pad("t1".into(), 36, "kick.wav".into(), Some(3.0), None).is_err());
+        assert!(t.set_sampler_pad("nope".into(), 36, "kick.wav".into(), None, None).unwrap_err().contains("tracks: t1"));
+
+        let out = t.set_modulators("t1".into(), serde_json::json!([
+            {"dest":"cutoff","shape":"sine","rate_hz":0.25,"depth":0.3},
+            {"dest":"pan","shape":"triangle","rate_hz":2.0,"depth":0.5,"phase":0.25}])).unwrap();
+        assert!(out.contains("2 modulator(s)") && out.contains("lfo[cutoff,pan]"), "{out}");
+        let err = t.set_modulators("t1".into(), serde_json::json!([{"dest":"wobble"}])).unwrap_err();
+        assert!(err.contains("expected"), "the error shows the accepted shape: {err}");
+        assert!(t.set_modulators("t1".into(), serde_json::json!([{"dest":"pan","shape":"sine","rate_hz":500.0,"depth":0.5}])).is_err(),
+            "out-of-range values are rejected by project validation");
+        t.set_modulators("t1".into(), serde_json::json!([])).unwrap();
+        assert!(t.store.load().unwrap().tracks[0].modulators.is_empty());
+
+        t.set_track("t1".into(), None, None, None, None, None, None, Some(-35.0)).unwrap();
+        assert_eq!(t.store.load().unwrap().tracks[0].tuning_cents, -35.0);
+        assert!(t.set_track("t1".into(), None, None, None, None, None, None, Some(900.0)).is_err());
+    }
+
+    #[test]
     fn sampler_variants_are_validated_and_preserved_by_mcp_mutations() {
         let (t,path)=tools("sampler-variants");
         t.store.mutate(|p| {
@@ -811,14 +958,14 @@ mod tests {
         let (t, path) = tools("track");
         let out = t.add_track("melodic".into()).unwrap();
         assert!(out.contains("t3"), "{out}");
-        t.set_track("t3".into(), Some(0.5), Some(-0.2), Some(true), Some("Lead".into()), Some(81), None)
+        t.set_track("t3".into(), Some(0.5), Some(-0.2), Some(true), Some("Lead".into()), Some(81), None, None)
             .unwrap();
         t.set_tempo(140.0).unwrap();
         let p = daw_core::project::format::load(&path).unwrap();
         assert_eq!(p.project.bpm, 140.0);
         let tr = p.tracks.iter().find(|x| x.id == "t3").unwrap();
         assert_eq!((tr.volume, tr.muted, tr.name.as_str()), (0.5, true, "Lead"));
-        let err = t.set_track("nope".into(), Some(1.0), None, None, None, None, None).unwrap_err();
+        let err = t.set_track("nope".into(), Some(1.0), None, None, None, None, None, None).unwrap_err();
         assert!(err.contains("t1"), "error lists valid ids: {err}");
     }
 
@@ -865,6 +1012,59 @@ mod tests {
     }
 
     #[test]
+    fn default_soundfont_is_found_above_the_project() {
+        // Repo layout: <root>/assets/GeneralUser.sf2 and <root>/projects/x/song.daw.json,
+        // with the server started from some unrelated folder.
+        let root = std::env::temp_dir().join(format!("daw_mcp_sf2_{}", std::process::id()));
+        std::fs::create_dir_all(root.join("assets")).unwrap();
+        std::fs::create_dir_all(root.join("projects/x")).unwrap();
+        std::fs::create_dir_all(root.join("elsewhere")).unwrap();
+        std::fs::write(root.join("assets/GeneralUser.sf2"), b"").unwrap();
+        let song = root.join("projects/x/song.daw.json");
+        assert_eq!(default_sf2(&song, &root.join("elsewhere")), root.join("assets/GeneralUser.sf2"));
+        // A relative project path resolves against the working directory.
+        assert_eq!(default_sf2(std::path::Path::new("projects/x/song.daw.json"), &root),
+            root.join("assets/GeneralUser.sf2"));
+        // Nothing anywhere: the working-directory default (for the error message).
+        let bare = std::env::temp_dir().join(format!("daw_mcp_sf2_none_{}", std::process::id()));
+        std::fs::create_dir_all(&bare).unwrap();
+        assert_eq!(default_sf2(&bare.join("s.daw.json"), &bare), bare.join("assets/GeneralUser.sf2"));
+        std::fs::remove_dir_all(&root).ok();
+        std::fs::remove_dir_all(&bare).ok();
+    }
+
+    #[test]
+    fn analysis_tools_resolve_samples_relative_to_the_project() {
+        let sf2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/GeneralUser.sf2");
+        if !sf2.exists() {
+            assert!(std::env::var_os("DAW_REQUIRE_TEST_ASSETS").is_none(), "required audio test assets missing");
+            eprintln!("skip: no soundfont");
+            return;
+        }
+        // The kick pad lives next to the project as `samples/kick.wav`; the
+        // test runs from the crate directory, so cwd-relative lookups miss it.
+        let dir = std::env::temp_dir().join(format!("daw_mcp_relassets_{}", std::process::id()));
+        std::fs::create_dir_all(dir.join("samples")).unwrap();
+        let spec = hound::WavSpec { channels: 1, sample_rate: 44100, bits_per_sample: 16, sample_format: hound::SampleFormat::Int };
+        let mut w = hound::WavWriter::create(dir.join("samples/kick.wav"), spec).unwrap();
+        for i in 0..4410 { w.write_sample(((i as f32 * 0.05).sin() * 12000.0) as i16).unwrap(); }
+        w.finalize().unwrap();
+        let path = dir.join("song.daw.json");
+        let mut p = Project::default_project();
+        p.tracks[0].instrument = daw_core::project::Instrument::Sampler {
+            pads: vec![serde_json::from_value(serde_json::json!({"pitch": 36, "path": "samples/kick.wav"})).unwrap()],
+        };
+        let t = DawTools { store: crate::store::ProjectStore::new(path.clone()), sf2_path: sf2, history: Default::default() };
+        t.store.save(&p).unwrap();
+        t.analyze_mix().expect("analyze_mix finds project-relative samples");
+        t.analyze_arrangement().expect("analyze_arrangement finds project-relative samples");
+        t.snapshot().expect("snapshot finds project-relative samples");
+        t.check().expect("check finds project-relative samples");
+        t.auto_balance().expect("auto_balance finds project-relative samples");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
     fn auto_balance_tool_applies_volumes() {
         let sf2 = std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../assets/GeneralUser.sf2");
         if !sf2.exists() {
@@ -872,8 +1072,8 @@ mod tests {
             return;
         }
         let (_, path) = tools("balance");
-        let t = DawTools { store: crate::store::ProjectStore::new(path.clone()), sf2_path: sf2 };
-        t.set_track("t1".into(), Some(0.2), None, None, None, None, None).unwrap();
+        let t = DawTools { store: crate::store::ProjectStore::new(path.clone()), sf2_path: sf2, history: Default::default() };
+        t.set_track("t1".into(), Some(0.2), None, None, None, None, None, None).unwrap();
         let out = t.auto_balance().unwrap();
         assert!(out.contains("balanced:"), "{out}");
         let p = daw_core::project::format::load(&path).unwrap();
@@ -888,7 +1088,7 @@ mod tests {
             return;
         }
         let (_, path) = tools("listen");
-        let t = DawTools { store: crate::store::ProjectStore::new(path.clone()), sf2_path: sf2 };
+        let t = DawTools { store: crate::store::ProjectStore::new(path.clone()), sf2_path: sf2, history: Default::default() };
         let report = t.listen(None, None, None).unwrap();
         assert!(report.contains("peak"), "{report}");
         assert!(report.contains("per-bar RMS"));
@@ -936,6 +1136,8 @@ mod tests {
         let (t,path)=tools("clap-metadata");
         let plugin=std::path::Path::new(env!("CARGO_MANIFEST_DIR")).join("../../target/debug/libdaw_clap_testplug_gain.so");
         assert!(plugin.exists(),"build the workspace test plugin before this regression");
+        // Project-file plugin paths must sit inside a CLAP search path.
+        std::env::set_var("CLAP_PATH",plugin.parent().unwrap());
         let uid=t.store.mutate(|p|Ok(p.add_clap_fx("t1",plugin.to_str().unwrap(),"test.gain").unwrap())).unwrap();
         let saved=std::fs::read(&path).unwrap();
         let data: serde_json::Value=serde_json::from_str(&t.get_clap_params(uid).unwrap()).unwrap();

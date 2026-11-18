@@ -514,32 +514,18 @@ impl DawView {
             .child(
                 div().id("fm-new").px_3().py_1().cursor_pointer().text_color(rgb(TEXT))
                     .bg(rgb(PANEL_ALT)).whitespace_nowrap().child("New")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.undo.record("new project", &this.st.project);
-                        this.st.project = daw_core::project::Project::default_project();
-                        this.st.project_path = None;
-                        this.st.file_revision = None;
-                        this.st.saved_hash.clear();
-                        this.st.soloed.clear();
-                        this.st.selected_return = None;
-                        this.st.arrange_scroll_x = 0.;
-                        this.st.arrange_scroll_y = 0.;
-                        if let Some(id) = this.st.project.tracks.first().map(|t| t.id.clone()) {
-                            this.st.select_track(&id);
-                        }
-                        this.sync_midi_strip();
-                        this.push_live();
+                    .on_click(cx.listener(|this, _e, w, cx| {
                         this.st.open_menu = None;
-                        this.st.set_status("new project (unsaved — Save As to name it)");
+                        this.request_replace(ConfirmThen::New, w);
                         cx.notify();
                     }))
             )
             .child(
                 div().id("fm-load").px_3().py_1().cursor_pointer().text_color(rgb(TEXT))
-                    .bg(rgb(PANEL_ALT)).whitespace_nowrap().child("Load")
-                    .on_click(cx.listener(|this, _e, _w, cx| {
-                        this.open_dialog();
+                    .bg(rgb(PANEL_ALT)).whitespace_nowrap().child("Open…")
+                    .on_click(cx.listener(|this, _e, w, cx| {
                         this.st.open_menu = None;
+                        this.request_replace(ConfirmThen::Open, w);
                         cx.notify();
                     }))
             )
@@ -813,6 +799,10 @@ impl DawView {
                             cx.notify();
                         })))
             )
+            // Guitar amp (live monitoring) section
+            .child(section_title("Guitar amp"))
+            .child(div().px_3().py_1().child(self.amp_setup_button(cx)))
+            .child(self.guitar_settings(cx))
             // Appearance section
             .child(section_title("Appearance"))
             .child(swatch_row)
@@ -822,18 +812,35 @@ impl DawView {
 impl DawView {
     pub(super) fn close_overlay(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
         if !self.close_confirmation { return None; }
+        let (title, discard, save) = match self.confirm_then {
+            ConfirmThen::Close => ("Save changes before closing?", "Discard & close", "Save & close"),
+            ConfirmThen::New => ("Save changes before starting a new project?", "Discard & start new", "Save & start new"),
+            ConfirmThen::Open => ("Save changes before opening another project?", "Discard & open", "Save & open"),
+        };
         Some(overlay_surface().id("close-confirmation").absolute().inset_0()
             .flex().items_center().justify_center().bg(gpui::rgba(0x00000099))
-            .child(overlay_surface().w(px(440.)).p_4().rounded_md().bg(rgb(PANEL)).text_color(rgb(TEXT))
-                .child(div().text_lg().child("Save changes before closing?"))
+            .child(overlay_surface().w(px(480.)).p_4().rounded_md().bg(rgb(PANEL)).text_color(rgb(TEXT))
+                .child(div().text_lg().child(title))
                 .child(div().py_2().child(self.project_name()))
                 .child(div().py_2().text_color(rgb(TEXT_DIM)).child(self.st.status.clone()))
                 .child(div().flex().gap_2()
                     .child(cell_btn("close-cancel", "Cancel", false, PANEL_ALT).on_click(cx.listener(|this, _, _, cx| {
-                        this.close_confirmation = false; this.close_after_save = false; cx.notify();
+                        this.close_confirmation = false; this.close_after_save = false;
+                        this.confirm_then = ConfirmThen::Close; cx.notify();
                     })))
-                    .child(cell_btn("close-discard", "Discard & close", false, RECORD).on_click(cx.listener(|_, _, w, _| w.remove_window())))
-                    .child(cell_btn("close-save", "Save & close", true, self.accent()).on_click(cx.listener(|this, _, _, cx| {
+                    .child(cell_btn("close-discard", discard, false, RECORD).on_click(cx.listener(|this, _, w, cx| {
+                        match this.confirm_then {
+                            ConfirmThen::Close => w.remove_window(),
+                            then => {
+                                this.close_confirmation = false;
+                                this.close_after_save = false;
+                                this.confirm_then = ConfirmThen::Close;
+                                this.replace_project(then);
+                                cx.notify();
+                            }
+                        }
+                    })))
+                    .child(cell_btn("close-save", save, true, self.accent()).on_click(cx.listener(|this, _, _, cx| {
                         this.close_after_save = true;
                         this.save_project();
                         cx.notify();

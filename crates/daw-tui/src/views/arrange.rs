@@ -47,7 +47,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
     );
 }
 
-fn render_grid(frame: &mut Frame, area: Rect, app: &App, total_bars: usize) {
+fn render_grid(frame: &mut Frame, area: Rect, app: &App, _total_bars: usize) {
     let inner_w = area.width.saturating_sub(2) as usize; // subtract borders
     let avail   = inner_w.saturating_sub(LABEL_W);
     let visible = (avail / CELL_W).max(1);
@@ -170,11 +170,10 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Up   => {
             app.arr_track = app.arr_track.saturating_sub(1);
         }
-        KeyCode::Down => {
-            if track_count > 0 {
+        KeyCode::Down
+            if track_count > 0 => {
                 app.arr_track = (app.arr_track + 1).min(track_count - 1);
             }
-        }
         KeyCode::Left  => {
             app.arr_bar = app.arr_bar.saturating_sub(1);
         }

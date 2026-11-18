@@ -63,3 +63,44 @@ compose (apply_mini_notation / set_steps / set_notes)
   → check                      # did anything regress?
   → diff_project <baseline>    # what exactly changed
 ```
+
+## Designing sounds (Surge XT)
+
+The musician describes a sound in words, and Claude designs it on Surge XT
+(free and open source; the `surge-xt` deb installs it to
+`/usr/lib/clap/Surge XT.clap`). With the GUI open in live mode, every
+change is heard on the track at once.
+
+| Step | Tool | What it does |
+|------|------|--------------|
+| 1 | `find_patches` | Search Surge's free patches by name or category for a starting point ("deep tom" → Percussion). |
+| 2 | `load_patch` | Put the patch on its **own new track**, named after the sound. Loading onto a named track whose instrument isn't Surge XT needs `replace: true`. |
+| 3 | `describe_sound` | Read the sound's musical controls (oscillators, noise, filter, envelopes, LFO, drive, voice) in Surge's own units. |
+| 4 | `shape_sound` | Set controls with text like `"600 Hz"` / `"180 ms"` or a number in range. Everything is checked before saving. |
+| 5 | `audition_sound` | Play a phrase (hit, note, chord or line) in the song's key: in the GUI in live mode, and always as a WAV. Reports pitch versus the intended note, attack, decay, sustain, brightness and noisiness. |
+| — | `sound_history` / `revert_sound` | Step back to any earlier version from this session. |
+| — | `print_sound` | Render the sound (a phrase, or the track's part over bars) to `prints/` and place it on a new audio track "<name> (print)". |
+
+Loop: steps 4–5 until the measured traits match the words, then hand over
+to the musician, who steers ("darker", "shorter") by ear. The numbers
+guide the next tweak; they never establish that a sound is good.
+
+Patches are stored as the plugin's state in the project, so reload,
+`listen`, `start_listen` and export reproduce the sound exactly.
+Patch files are read only from Surge's patch folders (plus
+`$SURGE_PATCH_DIRS`).
+
+## Building kits and adding movement
+
+| Goal | Tool |
+|------|------|
+| Map a .wav to a pitch (creates the sampler if the track has none) | `set_sampler_pad(track_id, pitch, path, gain?, gate?)` |
+| A long sample that should follow note length (808, pad, chop) | `set_sampler_pad(…, gate: true)`, then write durations with `set_notes` |
+| Soft/hard layers and round-robin takes | `set_sampler_variants` |
+| Filter sweep, tremolo, auto-pan | `set_modulators(track_id, [{dest, shape, rate_hz, depth, phase?}])` |
+| Detune a track between the keys | `set_track(track_id, tuning_cents)` |
+
+`project_summary` lists each sampler's pad pitches (`g` marks gated pads) and
+the LFO destinations on a track, so notes can be written for the right pitches
+without fetching the whole project.
+

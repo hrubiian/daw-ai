@@ -142,6 +142,10 @@ impl Service {
                         Some(SequencerCommand::Seek(0))
                     }
                     Command::Seek { tick } => Some(SequencerCommand::Seek(tick)),
+                    Command::Audition { ref track_id, ref notes } => Some(SequencerCommand::Audition {
+                        track_id: track_id.clone(),
+                        notes: notes.clone(),
+                    }),
                     _ => None,
                 }
             };

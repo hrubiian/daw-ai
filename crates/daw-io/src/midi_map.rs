@@ -142,6 +142,10 @@ impl MidiMap {
                     return map;
                 }
             }
+            // Unreadable or hand-edited with a typo: use defaults for this
+            // session but never overwrite the user's mappings.
+            eprintln!("midi map: cannot parse {}; using defaults", path.display());
+            return MidiMap::default();
         }
         let default = MidiMap::default();
         if let Some(dir) = path.parent() {
@@ -180,7 +184,7 @@ impl MidiMap {
             .find(|(_, b)| {
                 b.cc == cc
                     && value >= b.min_value
-                    && b.max_value.map_or(true, |max| value <= max)
+                    && b.max_value.is_none_or(|max| value <= max)
             })
             .map(|(&a, _)| a)
     }

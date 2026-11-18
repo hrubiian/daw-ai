@@ -16,3 +16,6 @@ rfd      = "0.15"
 [dev-dependencies]
 gpui = { version = "0.2", features = ["test-support"] }
 daw-io = { path = "../daw-io", features = ["test-support"] }
+
+[lints]
+workspace = true

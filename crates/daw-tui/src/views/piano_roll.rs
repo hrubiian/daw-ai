@@ -270,7 +270,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
     let ticks_per_col: u32 = 120;
 
     match key.code {
-        KeyCode::Char('r') => { app.toggle_pr_midi_record(); return; }
+        KeyCode::Char('r') => { app.toggle_pr_midi_record();}
         KeyCode::Up    => { app.pr_pitch = app.pr_pitch.saturating_add(1); }
         KeyCode::Down  => { app.pr_pitch = app.pr_pitch.saturating_sub(1); }
         KeyCode::Right => {

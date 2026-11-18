@@ -89,7 +89,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             .style(Style::default().fg(Color::Yellow))
             .block(Block::default().borders(Borders::ALL).title("Rename  [Enter] confirm  [Esc] cancel"))
     } else {
-        let rec_hint = if app.record_ctrl.available() { "  [Ctrl+R] rec" } else { "" };
+        let rec_hint = "  [Ctrl+R] rec";
         let met_state = if app.project.project.metronome { "ON " } else { "OFF" };
         let met_style = if app.project.project.metronome { " fg=yellow" } else { "" };
         let _ = met_style; // used via Span below
@@ -150,8 +150,8 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 app.send(daw_core::sequencer::SequencerCommand::SetTrackMute { track_id, muted });
             }
         }
-        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-            if app.active_track < app.project.tracks.len() {
+        KeyCode::Char('d') if key.modifiers.contains(KeyModifiers::CONTROL)
+            && app.active_track < app.project.tracks.len() => {
                 let removed = app.project.tracks.remove(app.active_track);
 
                 // Drop arrangement slots that referenced the deleted track.
@@ -172,7 +172,6 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 // Reload so the sequencer stops playing the deleted track.
                 app.send(daw_core::sequencer::SequencerCommand::UpdateLive(app.project.clone()));
             }
-        }
         _ => {}
     }
 }
@@ -259,6 +258,7 @@ fn add_track(app: &mut App, track_type: TrackType) {
         modulators: Vec::new(),
         clap_fx: Vec::new(),
         tuning_cents: 0.0,
+        input: None,
     });
 
     // Select the new track so the user lands on it immediately.
