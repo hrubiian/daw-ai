@@ -60,7 +60,7 @@ fn render_hz(cents: f32) -> f32 {
     let sf2 = Path::new("../../assets/GeneralUser.sf2");
     let proj: Project = serde_json::from_str(&project_json(cents)).expect("parse");
     let (samples, sr) = render_project_samples(&proj, sf2, false).expect("render");
-    let left: Vec<f32> = samples.chunks_exact(2).map(|c| c[0]).collect();
+    let left: Vec<f32> = samples.iter().step_by(2).copied().collect();
     detect_hz(&left, sr)
 }
 
