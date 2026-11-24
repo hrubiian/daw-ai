@@ -9,7 +9,7 @@ GUI, terminal UI, and an MCP server that lets AI agents compose, mix, and
 ![Plugins](https://img.shields.io/badge/plugins-CLAP-purple)
 ![AI](https://img.shields.io/badge/agents-MCP-green)
 
-![The First Light demo with its arrangement, mixer, and piano roll visible](assets/screenshots/desktop-workspace.png)
+![First Light in the dark theme with the beat ruler, mixer, and piano roll visible](assets/screenshots/desktop-workspace.png)
 
 ## Why this exists
 
@@ -66,15 +66,24 @@ run `cargo run --release --locked -- examples/quickstart.daw.json --export-wav f
 
 ## Desktop workspace
 
-The transport groups playback, tempo, loop and recording controls beside the
-millisecond clock. Open **Mixer** to show channel strips below the arrangement,
-then use the lower tabs for the Piano Roll, Sequencer or FX. Drag the horizontal
-dividers to resize the panels, or choose **Arrange ⛶** for more timeline space.
+Click the bar or beat ruler to place the playhead exactly where playback should
+start. Use the **Timeline** controls to scroll to the start or end of the song,
+or move the view four bars at a time. Hold **Ctrl** while scrolling to zoom around
+the pointer.
+
+Open **Mixer** to show channel strips below the arrangement. Edit notes in the
+**Piano Roll** or **Sequencer**, and adjust **Swing**, **Humanize**, and **Timing**
+in **FX**. Drag the panel dividers to resize them, or choose **Arrange ⛶** for more
+timeline space.
+
+Use the microphone and keyboard icons beside **Amp setup** to configure your
+audio input and MIDI controller. Switch between **Dark** and **White** in
+**Settings → Appearance**.
 
 Hover over **Browse instruments…** or press **Ctrl+K** to search SoundFont and
 CLAP instruments for the selected track.
 
-![The centered instrument browser open over the First Light desktop workspace](assets/screenshots/instrument-browser.png)
+![The instrument browser open over First Light in the white theme](assets/screenshots/instrument-browser.png)
 
 ### Import a Flow Music plugin
 
