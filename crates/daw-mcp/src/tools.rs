@@ -82,11 +82,15 @@ pub fn default_sf2(project: &std::path::Path, cwd: &std::path::Path) -> std::pat
 
 impl DawTools {
     pub fn new(path: std::path::PathBuf) -> Self {
+        Self::with_store(ProjectStore::new(path))
+    }
+
+    pub fn with_store(store: ProjectStore) -> Self {
         let sf2_path = std::env::var("DAW_SF2").map(std::path::PathBuf::from).unwrap_or_else(|_| {
             let cwd = std::env::current_dir().unwrap_or_else(|_| ".".into());
-            default_sf2(&path, &cwd)
+            default_sf2(&store.path, &cwd)
         });
-        Self { store: ProjectStore::new(path), sf2_path, history: Default::default() }
+        Self { store, sf2_path, history: Default::default() }
     }
 
     /// `p` with sample, soundfont and plugin paths resolved the way the
@@ -285,6 +289,10 @@ impl DawTools {
             else {
                 return Err(format!("no piano-roll pattern '{pattern_id}'"));
             };
+            let length = pr.length_ticks();
+            if notes.iter().any(|note| note.tick >= length) {
+                return Err(format!("note starts outside pattern {pattern_id}"));
+            }
             pr.notes = notes
                 .iter()
                 .map(|n| Note { pitch: n.pitch, tick: n.tick, duration: n.duration, vel: n.vel })

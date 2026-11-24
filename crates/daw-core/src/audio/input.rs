@@ -14,6 +14,7 @@ use serde::{Deserialize, Serialize};
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
+use super::track_monitor::{self, MonitorSwitch, MonitorWriter, TrackMonitorInput};
 
 /// Transport states shared between the sequencer, the capture callback, and the UI.
 pub const TRANSPORT_STOPPED: u8 = 0;
@@ -384,6 +385,7 @@ pub fn run_writer(
 #[derive(Debug, Clone)]
 pub struct InputDeviceInfo {
     pub name: String,
+    pub label: String,
     pub channels: u16,
     pub sample_rate: u32,
 }
@@ -413,6 +415,7 @@ pub fn list_input_devices() -> Vec<InputDeviceInfo> {
             }
             let Ok(cfg) = d.default_input_config() else { continue };
             out.push(InputDeviceInfo {
+                label: name.clone(),
                 name,
                 channels: cfg.channels(),
                 sample_rate: cfg.sample_rate().0,
@@ -436,6 +439,8 @@ pub struct CaptureStream {
     pub take_rx: Receiver<TakeResult>,
     writer_handle: Option<std::thread::JoinHandle<()>>,
     plugin: Option<super::live_plugin::LivePlugin>,
+    monitor_switch: Arc<MonitorSwitch>,
+    monitor_input: Option<TrackMonitorInput>,
 }
 
 /// Build the input stream for native sample type `T`, converting to f32 in
@@ -449,6 +454,7 @@ fn build_capture_stream<T>(
     take_gate: Arc<AtomicU32>,
     cb_shared: Arc<CaptureShared>,
     mut producer: ringbuf::HeapProd<f32>,
+    mut monitor: MonitorWriter,
 ) -> Result<cpal::Stream>
 where
     T: cpal::SizedSample,
@@ -463,6 +469,7 @@ where
             scratch.clear();
             scratch.extend(raw.iter().map(|&s| f32::from_sample(s)));
             let data: &[f32] = &scratch;
+            monitor.write(data, ch, selection);
 
             // Peak + clip latch over the selected channels only.
             let mut peak = 0f32;
@@ -513,23 +520,24 @@ impl CaptureStream {
         take_gate: Arc<AtomicU32>,
         roll_start_tick: Arc<AtomicU32>,
     ) -> Result<CaptureStream> {
-        Self::open_routed(device_name, None, selection, take_gate, roll_start_tick)
+        Self::open_routed(device_name, None, None, selection, take_gate, roll_start_tick)
     }
 
     /// Route a capture stream through the sound server to the chosen interface.
     pub fn open_routed(
         device_name: Option<&str>,
         server_source: Option<&str>,
+        source_channels: Option<u16>,
         selection: InputChannels,
         take_gate: Arc<AtomicU32>,
         roll_start_tick: Arc<AtomicU32>,
     ) -> Result<CaptureStream> {
         super::monitor::with_target(server_source, || Self::open_device(
-            if server_source.is_some() { None } else { device_name }, selection, take_gate, roll_start_tick))
+            if server_source.is_some() { None } else { device_name }, source_channels, selection, take_gate, roll_start_tick))
     }
 
     fn open_device(
-        device_name: Option<&str>, selection: InputChannels,
+        device_name: Option<&str>, source_channels: Option<u16>, selection: InputChannels,
         take_gate: Arc<AtomicU32>, roll_start_tick: Arc<AtomicU32>,
     ) -> Result<CaptureStream> {
         let host = cpal::default_host();
@@ -542,10 +550,11 @@ impl CaptureStream {
         let resolved = device.name().unwrap_or_default();
         let mut config = device.default_input_config()?;
         let last_channel = match selection { InputChannels::Mono(c) => c, InputChannels::Stereo(l, r) => l.max(r) };
-        if last_channel >= config.channels() {
-            config = super::monitor::input_config_at(&device, config.sample_rate().0, last_channel)?;
+        let required = super::monitor::required_input_channel(last_channel, source_channels)?;
+        if required >= config.channels() {
+            config = super::monitor::input_config_at(&device, config.sample_rate().0, required)?;
         }
-        anyhow::ensure!(last_channel < config.channels(), "input channel {} is unavailable", u32::from(last_channel) + 1);
+        anyhow::ensure!(required < config.channels(), "cannot open all {} required input channels", u32::from(required) + 1);
         let channels = config.channels();
         let sample_rate = config.sample_rate().0;
         let selection = selection.clamped(channels);
@@ -554,6 +563,8 @@ impl CaptureStream {
         // 8 seconds of headroom so a stalled writer never costs samples.
         let rb = HeapRb::<f32>::new(sample_rate as usize * channels as usize * 8);
         let (producer, consumer) = rb.split();
+        let monitor_switch = Arc::new(MonitorSwitch::default());
+        let (monitor, monitor_input) = track_monitor::channel(sample_rate, monitor_switch.clone());
 
         // Open the stream in the device's *native* sample format and convert
         // to f32 in the callback. Requesting f32 unconditionally makes raw
@@ -562,13 +573,13 @@ impl CaptureStream {
         let sample_format = config.sample_format();
         let stream_config: cpal::StreamConfig = config.into();
         let stream = match sample_format {
-            cpal::SampleFormat::F32 => build_capture_stream::<f32>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer),
-            cpal::SampleFormat::I32 => build_capture_stream::<i32>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer),
-            cpal::SampleFormat::I16 => build_capture_stream::<i16>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer),
-            cpal::SampleFormat::U16 => build_capture_stream::<u16>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer),
-            cpal::SampleFormat::I8  => build_capture_stream::<i8>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer),
-            cpal::SampleFormat::U8  => build_capture_stream::<u8>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer),
-            cpal::SampleFormat::F64 => build_capture_stream::<f64>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer),
+            cpal::SampleFormat::F32 => build_capture_stream::<f32>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer, monitor),
+            cpal::SampleFormat::I32 => build_capture_stream::<i32>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer, monitor),
+            cpal::SampleFormat::I16 => build_capture_stream::<i16>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer, monitor),
+            cpal::SampleFormat::U16 => build_capture_stream::<u16>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer, monitor),
+            cpal::SampleFormat::I8  => build_capture_stream::<i8>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer, monitor),
+            cpal::SampleFormat::U8  => build_capture_stream::<u8>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer, monitor),
+            cpal::SampleFormat::F64 => build_capture_stream::<f64>(&device, &stream_config, channels, selection, Arc::clone(&take_gate), Arc::clone(&shared), producer, monitor),
             other => anyhow::bail!("unsupported input sample format {other:?}"),
         }?;
         stream.play()?;
@@ -592,7 +603,21 @@ impl CaptureStream {
             take_rx,
             writer_handle: Some(writer_handle),
             plugin: None,
+            monitor_switch,
+            monitor_input: Some(monitor_input),
         })
+    }
+
+    pub fn take_monitor_input(&mut self) -> Option<TrackMonitorInput> {
+        self.monitor_input.take()
+    }
+
+    pub fn set_monitoring(&self, enabled: bool) {
+        self.monitor_switch.set_enabled(enabled);
+    }
+
+    pub fn is_monitoring(&self) -> bool {
+        self.monitor_switch.is_enabled()
     }
 
     /// Load on the caller/main thread, process on the writer, and return the
@@ -658,6 +683,7 @@ impl CaptureStream {
 
 impl Drop for CaptureStream {
     fn drop(&mut self) {
+        self.set_monitoring(false);
         // Stop producing before draining/joining. In particular a costly
         // external amp must not chase a continuously refilled input ring.
         self._stream.take();
@@ -694,6 +720,7 @@ mod tests {
             _stream: None, shared, device_name: "synthetic input".into(), channels: 1,
             sample_rate: 44_100, selection: InputChannels::Mono(0), ctrl_tx, take_rx,
             writer_handle: Some(writer), plugin: None,
+            monitor_switch: Default::default(), monitor_input: None,
         };
         let input: Vec<f32> = (0..4096).map(|i| (i as f32 * 0.11).sin() * 0.06).collect();
         let dir = std::env::temp_dir().join(format!("daw-ampforge-rearm-{}", std::process::id()));

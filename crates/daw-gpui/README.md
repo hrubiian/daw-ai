@@ -30,6 +30,10 @@ cargo run -- --gui my-song.daw.json
 
 (`cargo run` with no `--gui` still launches the ratatui TUI.)
 
+Use `./run-gui.sh --cached my-song.daw.json` to launch the last dev build directly.
+If the executable is missing, the launcher builds it. Leave out `--cached` to
+pick up source edits with an incremental build.
+
 ## System dependencies (Linux)
 
 GPUI links against system graphics/input libraries. On Debian/Ubuntu you need the
@@ -55,13 +59,25 @@ and project import/export.
 - Track headers group name, mute/solo and track actions above volume, pan and
   instrument controls. Hover controls for help; double-click a name to rename.
 - Volume is shown as a percentage; pan reads Center, L or R with an amount.
-- Scroll the timeline with the wheel, zoom with Ctrl+wheel, and scroll tracks
-  with Shift+wheel. Scrolling over track headers also scrolls tracks vertically.
+- Choose **White** or **Dark** under **Settings → Appearance**. The app remembers
+  your choice.
+- The microphone and keyboard icons beside **Amp setup…** open recording
+  input and MIDI keyboard settings.
+- Scroll vertically over the track lanes or headers. Scroll horizontally
+  with Shift+wheel, a trackpad, the ruler, or the scrollbar below the lanes.
+  Ctrl+wheel zooms around the pointer. The timeline buttons jump to the
+  start or end of the arrangement, and the ruler shows beat numbers as space allows.
+- In Piano Roll, scroll pitches with the wheel and move through bars with
+  **Shift+wheel** or the horizontal scrollbar.
 - A green playhead crosses the ruler and visible track lanes at the current
   playback position, including positions between bars. It follows zoom, scroll,
   seeks and loop returns, and stays at the paused position.
+  Click the ruler or the body of a clip to set the playhead, then press
+  **Space** to play from that position.
 - Transport and song toolbars support horizontal scrolling when they overflow.
-- Search instruments by name or category; Esc clears the search.
+- Hover over **Browse instruments…** in the header to preview the library, or
+  click it or press **Ctrl+K** to type. Search by preset, category, or plugin name.
+  **Esc** closes the library.
 - Ctrl+Z undoes project edits; Ctrl+Shift+Z or Ctrl+Y redoes them.
 
 See [Desktop UI](../../docs/desktop-ui.md) for mixing, navigation and verification,
@@ -69,10 +85,10 @@ and [the UI review](../../docs/ui-review.md) for follow-up priorities and visual
 
 ## Window and panel behavior
 
-- Browser toggles its side dock; Mixing opens the dedicated mixing tab.
-  Side docks collapse automatically
-  when necessary to leave at least 200 px for the timeline; widening the window
-  restores requested docks. The editor dock height is bounded after resizing.
+- The instrument library floats over the arrangement. Mixing opens the
+  dedicated mixing tab. The mixer side dock collapses on narrow windows to
+  leave at least 200 px for the timeline. The editor dock height is bounded
+  after resizing.
 - Browser lists, mixer channels, pattern tabs, Settings, effects and sequencer
   grids scroll when their content exceeds the available space.
 - The piano roll uses sixteenth-note columns and displays notes between grid

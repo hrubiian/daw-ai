@@ -1,9 +1,20 @@
 # Local collaboration and reliable rendering
 
-Run the GUI or TUI normally. Each process publishes one local Unix socket. Discover and explicitly select the musician's session:
+Run the GUI or TUI normally. Each process publishes one local Unix socket. In
+the desktop app, open **Agent Session** to see the current song, latest edit,
+and engine status. Use **Copy MCP configuration** and add the copied `daw`
+entry to your client's MCP settings, replacing the file-mode entry if present.
+Build both binaries in the same Cargo profile. The copied configuration uses
+`daw-mcp --live` and works before daw-ai opens and across restarts. In Codex, set
+`args = ["--live"]` under `[mcp_servers.daw]`.
+
+With one DAW session open, the agent connects automatically. After a session
+change, ask the agent to read the open song before continuing an edit. If several
+sessions are open, leave just the intended one open or select its socket
+explicitly.
 
 ```sh
-cargo build --workspace --locked
+cargo build -p daw-mcp --locked
 target/debug/daw-mcp --list-sessions
 target/debug/daw-mcp --session /path/from/discovery.sock
 ```
@@ -34,9 +45,41 @@ Read the actual revision and track IDs first. A batch validates completely befor
 
 Use `preview` instead of `batch` to receive a validated proposed project without changing the project or undo history. After the musician reviews it, submit a batch against the same revision; an intervening edit requires a refreshed preview. Preview is optional and does not itself authorize destructive actions.
 
+Use `add_piano_roll`, `set_notes`, `place_clip`, and `remove_clip` for note and
+arrangement changes. For example, use the following as the `edits` array in a
+preview, then use the same edits in a batch with a new operation ID:
+
+```json
+[
+  {"type": "add_piano_roll", "track_id": "t2", "pattern_id": "bridge-bass", "name": "Bridge bass", "bars": 8,
+   "notes": [{"pitch": 36, "tick": 0, "duration": 180, "vel": 88}]},
+  {"type": "place_clip", "track_id": "t2", "pattern_id": "bridge-bass", "bar": 8}
+]
+```
+
+`set_notes` replaces the notes of an existing piano-roll pattern, including
+wherever it is reused. Create a new pattern to change a single clip. `place_clip`
+adds or replaces one clip at `(track_id, bar, offset_ticks)`. Use `len_bars` to
+override its length. `remove_clip` removes the clip at that exact position. They
+preserve other positions, including overlaps. Bars are zero-based and
+`offset_ticks` defaults to 0 with a range of 0–479. Add a pattern to the track
+before placing it.
+
 Commands also include `undo`, `redo`, `play`, `pause`, `stop`, and `seek` with a tick value. One bar is 480 ticks in supported 4/4 projects. GUI Ctrl+Z/Ctrl+Shift+Z and TUI Ctrl+Z/Ctrl+Y access the same session history. Opening another project stores its asset directory with undo history.
 
-An accepted edit can still be `pending`: while playing, project swaps occur at the next bar. `applied_revision` advances only when the audio callback consumes the acknowledgement. Pausing flushes a pending edit. `applied` means the engine consumed the update, not that a listener necessarily heard it. Initialization, asset, plugin, stream and queue failures are reported separately. The GUI status includes the current revision and latest edit. “Sync session” (TUI Ctrl+U) preserves differing local work in a uniquely named recovery project before refreshing from the authoritative session.
+An accepted edit can still be `pending`. While playing, note and arrangement
+swaps occur at the next bar. `applied_revision` advances when the audio callback
+consumes the acknowledgement. Pausing flushes a pending edit. Initialization,
+asset, plugin, stream and queue failures are reported separately. “Sync session”
+(TUI Ctrl+U) preserves differing local work in a uniquely named recovery project
+before refreshing from the authoritative session.
+
+Agent edits that rebuild audio resources return `resources_require_pause`
+while the transport is running. This includes track and instrument changes,
+plugin state replacement, and changes to audio clip sources. The current loop
+continues. Pause and retry against the current revision. Once accepted while
+paused, wait for `loading_audio_resources` to clear before starting playback or
+recording. The desktop panel shows this state as **loading audio resources**.
 
 ## Files and recovery
 
@@ -54,7 +97,11 @@ Range rendering warms the mixer from the song start, discards the prefix and sto
 
 Completed jobs write unique `renders/<job-id>/` directories containing `audio.wav`, `project.json`, and `report.json`. Reports include a project hash, live revision when available, engine package version, sample rate, normalization policy, warm-up policy, asset/plugin hashes and structured measurements. WAVs are unnormalized for listening. Selected-track renders hash the effective rendered snapshot, including its mute mask.
 
-`compare_renders` returns two completed reports and audio artifacts for A/B listening; settings must match. `rate_render` stores the musician's explicit 1–5 rating and comment as a separate event alongside an artifact. Do not infer ratings from measurements. Masking, groove and arrangement measurements are diagnostics, not musical-quality scores.
+For a dry render, pass `dry: true` to `start_listen`. The snapshot bypasses DAW
+track effects and shared returns while keeping track levels, pan, and instruments.
+The report records whether the snapshot was dry. The session itself is unchanged.
+
+`compare_renders` returns two completed reports and audio artifacts for A/B listening. Render ranges, sample rates and normalization must match. `rate_render` stores the musician's explicit 1–5 rating and comment as a separate event alongside an artifact. Do not infer ratings from measurements. Masking, groove and arrangement measurements are diagnostics, not musical-quality scores.
 
 The job manager retains up to 32 reports in memory; artifacts and ratings remain on disk. `render_history` lists saved reports from the current project directory across restarts (default 20 entries, maximum 100, lexicographic ID order; use `next_offset` for the next page). `job_status`, `compare_renders`, and `rate_render` also read these durable reports. Artifact paths are rebased when the project directory moves. Corrupt entries are reported individually. Running and terminal states are atomically checkpointed, including failed/cancelled jobs. A saved running job not owned by this MCP process is shown as `unavailable`: it may still be running elsewhere or have been interrupted; inspection does not change its report. Cancellation only controls jobs owned by the current process. GUI export is limited to one background job; invoking either Export WAV or Export MP3 again requests cancellation. TUI Ctrl+E cancels a running background export. GUI exports write unique directories with project and provenance files. MP3 export uses FFmpeg/libmp3lame at 320 kbps, including full-song effect tails; see [MP3 export](mp3-export.md). Legacy synchronous tools remain available and run on bounded blocking workers; cancellation is exposed through the new background job API.
 
@@ -66,7 +113,7 @@ DAW_REQUIRE_TEST_ASSETS=1 cargo test --workspace --locked
 cargo run -p daw-core --example session_bench --release
 ```
 
-The CI matrix includes ordinary Linux builds and a required-soundfont job, builds CLAP fixtures, exercises the MCP wire protocol and runs GPUI headless regressions. Hardware playback tests remain explicit/ignored. The GUI displays package version, git revision, dirty marker and build timestamp; `install-desktop.sh` builds a locked release before installing.
+The CI matrix includes ordinary Linux builds and a required-soundfont job, builds CLAP fixtures, exercises the MCP wire protocol and runs GPUI headless regressions. Hardware playback tests remain explicit/ignored. The GUI displays package version and Git revision; `install-desktop.sh` builds a locked release before installing.
 
 Callback work drains at most 1,024 events per block. Replaced strip and audio-buffer collections are retired through a bounded queue on a worker. Diagnostics expose queue drops, late scheduled events, maximum callback time, callback overruns and stream errors. Counters are cumulative for the process lifetime. This is not a complete realtime certification: voice growth, plugin event/storage behavior and legacy recording allocation still require further audit. Sequenced events now carry device-frame timestamps through the relay. The producer prepares two callback buffers plus 10 ms ahead; the audio callback splits rendering at event positions. The UI playhead and transport/gate publications are scheduled alongside audio. Pause/seek invalidate old performance events while preserving project updates and their acknowledgements. Both event intake and scheduled dispatch are bounded to 1,024 events per callback; future events use a preallocated 4,096-entry queue and scheduling envelopes retire off-thread. Overload can still cause late delivery and is counted. Direct MIDI/preview input retains immediate callback delivery. Hardware recording alignment and whole-mix live/offline sample identity remain unqualified; controlled sampler timing tests pass across buffer sizes.
 

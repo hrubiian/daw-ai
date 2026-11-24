@@ -66,12 +66,14 @@ impl Project {
                         "{} needs positive bars and 480 ticks per bar",
                         p.id
                     );
-                    let length = p.bars as u32 * p.ticks_per_bar;
+                    // A shortened piano roll retains its notes so extending it
+                    // again restores them. Their onsets must fit a valid bar count.
+                    let max_length = u32::from(u8::MAX) * p.ticks_per_bar;
                     for n in &p.notes {
                         ensure!(
                             n.pitch <= 127
                                 && n.vel <= 127
-                                && n.tick < length
+                                && n.tick < max_length
                                 && n.duration > 0
                                 && n.tick.checked_add(n.duration).is_some(),
                             "invalid note in {}",

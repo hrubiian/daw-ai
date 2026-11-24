@@ -1,10 +1,14 @@
 # Examples
 
-**demo.daw.json** — an 8-track, 36-bar electro groove composed entirely
-through the MCP server (an LLM wrote every pattern, arranged the song, and
-mixed it with the listening tools). Self-contained: needs only the free
-soundfont from `../fetch-assets.sh`.
+**quickstart.daw.json** is *First Light*, an eight-bar groove with drums, bass,
+and electric piano. It uses the default General MIDI SoundFont and the built-in
+engine. Follow [Quickstart](../README.md#quickstart) to set up the SoundFont.
 
 ```bash
-cargo run --release -- --gui examples/demo.daw.json
+cargo run --release --locked -- --gui examples/quickstart.daw.json
 ```
+
+**demo.daw.json** is the original 36-bar electro groove composed through MCP.
+It uses VCSL and additional WAV samples. Run
+`cargo run --release --locked -- doctor --headless examples/demo.daw.json`
+to check which files are missing from your checkout.

@@ -4,19 +4,20 @@
 
 use daw_core::project::{Pattern, Project};
 
-/// Symbolic groove report: grid alignment of all piano-roll notes plus the
+/// Symbolic groove report: grid alignment of active piano-roll notes plus the
 /// project's swing/humanize/timing. No render required.
 pub fn groove_report(project: &Project) -> String {
     let mut offsets: Vec<i32> = Vec::new();
     let mut n_pat = 0usize;
     for pat in &project.patterns {
         if let Pattern::PianoRoll(pr) = pat {
-            if pr.notes.is_empty() {
+            let mut notes = pr.active_notes().peekable();
+            if notes.peek().is_none() {
                 continue;
             }
             let grid = (pr.ticks_per_bar / 16).max(1);
             n_pat += 1;
-            for note in &pr.notes {
+            for note in notes {
                 offsets.push(nearest_grid_offset(note.tick, grid));
             }
         }
@@ -41,7 +42,7 @@ pub fn groove_report(project: &Project) -> String {
         m.swing, m.humanize, m.timing
     ));
     if findings.is_empty() {
-        s.push_str("feel: OK — not dead-mechanical.\n");
+        s.push_str("notes depart from the grid or playback feel settings are enabled.\n");
     } else {
         s.push_str("\nfindings:\n");
         for f in &findings {

@@ -23,6 +23,8 @@ pub struct JobReport {
     pub engine_version: String,
     pub sample_rate: u32,
     pub normalized: bool,
+    #[serde(default)]
+    pub dry: bool,
     pub warmup: String,
     pub range: Option<(u32, u32)>,
     pub artifacts: Vec<PathBuf>,
@@ -86,6 +88,17 @@ fn render_directory(base: &Path, id: &str) -> Result<PathBuf, String> {
     Ok(directory)
 }
 
+fn bypass_effects(project: &mut Project) {
+    use daw_core::project::ModDest;
+    for track in &mut project.tracks {
+        track.effects = Default::default();
+        track.clap_fx.clear();
+        track.modulators.retain(|modulator| matches!(modulator.dest, ModDest::Volume | ModDest::Pan));
+    }
+    project.returns.reverb.muted = true;
+    project.returns.delay.muted = true;
+}
+
 impl Jobs {
     pub fn submit(
         &'static self,
@@ -95,11 +108,26 @@ impl Jobs {
         sf2: PathBuf,
         range: Option<(u32, u32)>,
     ) -> Result<String, String> {
+        self.submit_with_dry(project, revision, base, sf2, range, false)
+    }
+
+    pub fn submit_with_dry(
+        &'static self,
+        mut project: Project,
+        revision: Option<u64>,
+        base: PathBuf,
+        sf2: PathBuf,
+        range: Option<(u32, u32)>,
+        dry: bool,
+    ) -> Result<String, String> {
         project.validate().map_err(|e| e.to_string())?;
         if let Some((a, b)) = range {
             if a >= b {
                 return Err("range requires start < end".into());
             }
+        }
+        if dry {
+            bypass_effects(&mut project);
         }
         let hash = format::project_revision(&project).map_err(|e| e.to_string())?;
         // Reserve one of two render slots (compare-and-swap; no `fetch_update`,
@@ -125,6 +153,7 @@ impl Jobs {
             engine_version: env!("CARGO_PKG_VERSION").into(),
             sample_rate: 44100,
             normalized: false,
+            dry,
             warmup: "from song start; fixed 1024-frame blocks".into(),
             range,
             artifacts: vec![],

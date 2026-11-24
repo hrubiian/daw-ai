@@ -1,3 +1,4 @@
+use crate::audio::clap::{slot_specs, ClapSlotSpec};
 use crate::audio::input::{TRANSPORT_COUNT_IN, TRANSPORT_ROLLING, TRANSPORT_STOPPED};
 use crate::audio::mixer::{StripSpec, STRIP_UTILITY};
 use crate::audio::AudioEvent;
@@ -93,7 +94,7 @@ pub fn note_fire_tick(pitch: u8, nominal: u32, strip: u8, timing: f32, pattern_l
 
 pub fn piano_note_duration(pattern: &crate::project::PianoRollPattern, note: &crate::project::Note) -> u32 {
     if pattern.legato {
-        pattern.notes.iter().map(|n| n.tick).filter(|&tick| tick > note.tick).min()
+        pattern.active_notes().map(|n| n.tick).filter(|&tick| tick > note.tick).min()
             .map(|next| next - note.tick).unwrap_or(note.duration)
     } else { note.duration }
 }
@@ -140,8 +141,53 @@ pub fn pattern_length_ticks(pattern: &Pattern) -> u32 {
         // 2 bars, 4 steps = a 1-beat loop). The serialized `bars` field is
         // back-compat only.
         Pattern::Step(p)      => (p.steps as u32).max(1) * (TICKS_PER_BAR / 16),
-        Pattern::PianoRoll(p) => p.ticks_per_bar * p.bars as u32,
+        Pattern::PianoRoll(p) => p.length_ticks(),
     }
+}
+
+pub struct PatternPlacement<'a> {
+    pub start: u32,
+    pub end: u32,
+    pub pattern: &'a Pattern,
+    pub repeats: bool,
+}
+
+impl PatternPlacement<'_> {
+    pub fn local_tick_at(&self, tick: u32) -> Option<u32> {
+        (self.start..self.end)
+            .contains(&tick)
+            .then(|| (tick - self.start) % pattern_length_ticks(self.pattern).max(1))
+    }
+}
+
+/// Playback gives the earliest active clip precedence. Clips starting at the
+/// same tick keep their order in the project. Live, export, and timing analysis
+/// use the same placement order.
+pub fn arranged_track_patterns<'a>(
+    project: &'a Project,
+    track_id: &str,
+) -> Vec<PatternPlacement<'a>> {
+    let mut placements: Vec<_> = project
+        .arrangement
+        .iter()
+        .filter(|clip| clip.track == track_id)
+        .filter_map(|clip| {
+            let pattern = project.patterns.iter().find(|p| p.id() == clip.pattern)?;
+            let start = clip.start_tick();
+            let length = clip.len_bars.map_or_else(
+                || pattern_length_ticks(pattern),
+                |bars| bars.max(1) * TICKS_PER_BAR,
+            );
+            Some(PatternPlacement {
+                start,
+                end: start + length,
+                pattern,
+                repeats: clip.len_bars.is_some(),
+            })
+        })
+        .collect();
+    placements.sort_by_key(|clip| clip.start);
+    placements
 }
 
 /// Convert seconds to absolute ticks at `bpm` (rounded).
@@ -242,6 +288,7 @@ pub struct Sequencer {
     recording: bool,
     logical_gate: u32,
     strip_state: Vec<(String, StripSpec)>,
+    clap_state: Vec<ClapSlotSpec>,
     clip_state: Vec<(u32, String)>,
 }
 
@@ -274,6 +321,7 @@ impl Sequencer {
             recording: false,
             logical_gate: 0,
             strip_state: Vec::new(),
+            clap_state: Vec::new(),
             clip_state: Vec::new(),
         }
     }
@@ -587,7 +635,7 @@ impl Sequencer {
                     }
                 }
                 Pattern::PianoRoll(pr) => {
-                    for note in &pr.notes {
+                    for note in pr.active_notes() {
                         let fire = note_fire_tick(note.pitch, note.tick, strip, self.timing, pat_len);
                         if fire == pat_tick {
                             let velocity = humanize_velocity(note.vel, strip, note.pitch, self.tick, self.humanize);
@@ -718,13 +766,39 @@ impl Sequencer {
         self.apply_project(project, true);
     }
 
+    /// Forward control changes immediately while the note and arrangement swap
+    /// waits for the bar line. The relay reuses instances with unchanged state.
+    fn update_playing_clap_params(&mut self, project: &Project) {
+        let specs = slot_specs(project);
+        let mut changed = false;
+        for (previous, next) in self.clap_state.iter().zip(&specs) {
+            if previous.uid != next.uid
+                || previous.id != next.id
+                || previous.path != next.path
+                || previous.state != next.state
+            {
+                return;
+            }
+            changed |= previous.params != next.params;
+        }
+        if changed && specs.len() == self.clap_state.len() {
+            self.load_clap_specs(specs);
+        }
+    }
+
+    fn load_clap_specs(&mut self, specs: Vec<ClapSlotSpec>) {
+        if self.emit(AudioEvent::LoadClapInstances { specs: specs.clone() }).is_ok() {
+            self.clap_state = specs;
+        }
+    }
+
     /// Update scheduling while retaining voices/tails for unchanged instruments.
     /// Structural changes still rebuild strips because strip indices route audio.
     fn apply_project(&mut self, project: Project, reset_tick: bool) {
         let specs = StripSpec::from_project(&project);
         let reusable = !reset_tick && self.strip_state.len() == specs.len()
             && self.strip_state.iter().zip(project.tracks.iter().zip(&specs)).all(|((id, old), (track, new))| {
-                id == &track.id && old.kind == new.kind
+                id == &track.id && old.kind == new.kind && old.audio_track == new.audio_track
                     && old.clap_instrument == new.clap_instrument && old.clap_fx == new.clap_fx
                     && old.tuning_cents == new.tuning_cents
             });
@@ -768,9 +842,7 @@ impl Sequencer {
         });
         // CLAP instances: the relay diffs these against what's live, so this
         // is cheap when nothing plugin-related changed.
-        let _ = self.emit(AudioEvent::LoadClapInstances {
-            specs: crate::audio::clap::slot_specs(&project),
-        });
+        self.load_clap_specs(slot_specs(&project));
 
         let old_audio_jobs = std::mem::take(&mut self.audio_jobs);
         let mut clip_specs: Vec<(u32, String)> = Vec::new();
@@ -840,21 +912,14 @@ impl Sequencer {
             let is_sampler = matches!(track.instrument, Instrument::Sampler { .. });
 
             let slots: Vec<SlotState> = if has_arrangement {
-                // Build slots from explicit arrangement entries for this track
-                let mut v: Vec<SlotState> = project.arrangement.iter()
-                    .filter(|s| s.track == track.id)
-                    .filter_map(|s| {
-                        let pat = project.patterns.iter().find(|p| p.id() == s.pattern)?.clone();
-                        let start = s.bar * TICKS_PER_BAR + s.offset_ticks;
-                        let (end, loop_pat) = match s.len_bars {
-                            Some(n) => (start + n.max(1) * TICKS_PER_BAR, true), // loop to fill
-                            None => (start + pattern_length_ticks(&pat), false), // natural, unchanged
-                        };
-                        Some(SlotState { start_tick: start, end_tick: end, loop_pat, pattern: pat })
+                arranged_track_patterns(&project, &track.id).into_iter()
+                    .map(|clip| SlotState {
+                        start_tick: clip.start,
+                        end_tick: clip.end,
+                        loop_pat: clip.repeats,
+                        pattern: clip.pattern.clone(),
                     })
-                    .collect();
-                v.sort_by_key(|s| s.start_tick);
-                v
+                    .collect()
             } else {
                 // Auto-loop: first pattern fills the entire song cycle
                 track.patterns.first()
@@ -981,6 +1046,7 @@ impl Sequencer {
                     }
                     SequencerCommand::UpdateRevision { project, revision, ack } => {
                         if self.playing {
+                            self.update_playing_clap_params(&project);
                             self.pending_update = Some(project);
                             self.pending_ack = Some((revision, ack));
                         } else {
@@ -1410,6 +1476,47 @@ mod tests {
     }
 
     #[test]
+    fn shortened_piano_roll_plays_remaining_bars_and_restores_later_notes() {
+        use crate::session::{Command, Edit, Request, Session, PROTOCOL_VERSION};
+
+        let (mut seq, _, audio_rx) = make_sequencer();
+        let original = Project::default_project();
+        let mut session = Session::new(original.clone()).unwrap();
+        let mut shortened = original;
+        assert!(shortened.resize_pr_bars("p2", -1));
+        let edit = session.execute(&Request {
+            version: PROTOCOL_VERSION,
+            operation_id: "shorten-piano-roll".into(),
+            expected_revision: Some(0),
+            command: Command::Batch {
+                label: "pr bars".into(),
+                edits: vec![Edit::Replace { project: shortened }],
+            },
+        });
+        assert!(edit.error.is_none(), "{:?}", edit.error);
+
+        let mut project = edit.project;
+        let Pattern::PianoRoll(pattern) = &project.patterns[1] else { panic!("preset bass piano roll") };
+        assert_eq!(pattern.notes.len(), 3);
+        assert_eq!(pattern.active_notes().count(), 1);
+        seq.load_project(project.clone());
+        seq.fire_tick();
+        assert!(audio_rx.try_iter().any(|event| matches!(event,
+            AudioEvent::NoteOn { strip: 1, pitch: 36, .. })));
+        seq.tick = TICKS_PER_BAR - 1;
+        seq.fire_tick();
+        assert!(!audio_rx.try_iter().any(|event| matches!(event,
+            AudioEvent::NoteOn { strip: 1, .. })));
+
+        assert!(project.resize_pr_bars("p2", 1));
+        seq.load_project(project);
+        seq.tick = TICKS_PER_BAR;
+        seq.fire_tick();
+        assert!(audio_rx.try_iter().any(|event| matches!(event,
+            AudioEvent::NoteOn { strip: 1, pitch: 38, .. })));
+    }
+
+    #[test]
     fn arrangement_slot_honors_len_bars() {
         let (mut seq, _, _) = make_sequencer();
         let mut p = crate::project::Project::default_project();
@@ -1782,6 +1889,31 @@ mod tests {
         assert!(evs.iter().any(|e| matches!(e,
             AudioEvent::LoadClapInstances { specs } if specs.len() == 1)),
             "apply_project must push CLAP slot specs");
+    }
+
+    #[test]
+    fn playing_update_forwards_controls_without_loading_new_plugin_state() {
+        let (mut seq, _, audio_rx) = make_sequencer();
+        let mut project = Project::default_project();
+        let track_id = project.tracks[0].id.clone();
+        let uid = project
+            .add_clap_fx(&track_id, "/x.clap", "test.gain")
+            .unwrap();
+        seq.load_project(project.clone());
+        audio_rx.try_iter().for_each(drop);
+
+        project.set_clap_param(&uid, 1, 0.4);
+        seq.update_playing_clap_params(&project);
+        assert!(matches!(audio_rx.try_recv(),
+            Ok(AudioEvent::LoadClapInstances { specs }) if specs[0].params == [(1, 0.4)]));
+        seq.update_playing_clap_params(&project);
+        assert!(audio_rx.is_empty());
+
+        project.set_clap_state(&uid, "AQID".into());
+        project.set_clap_param(&uid, 1, 0.8);
+        seq.update_playing_clap_params(&project);
+        assert!(audio_rx.is_empty());
+        assert_eq!(seq.clap_state[0].params, [(1, 0.4)]);
     }
 
     #[test]

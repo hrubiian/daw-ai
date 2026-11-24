@@ -20,6 +20,8 @@ pub struct UserConfig {
     pub guitar: GuitarConfig,
     /// Saved tones exclude interface routing and buffer size.
     pub guitar_presets: Vec<crate::guitar_presets::GuitarPreset>,
+    /// Use the desktop GUI's white color scheme.
+    pub light_theme: bool,
 }
 
 /// Settings for the low-latency instrument monitor. Monitoring itself is
@@ -28,6 +30,9 @@ pub struct UserConfig {
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default)]
 pub struct GuitarConfig {
+    /// Dedicated monitor input. Legacy configs inherit the recording default.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub input: Option<GuitarInput>,
     pub amp: daw_core::audio::amp::AmpSettings,
     /// Cached external tone, retained while the built-in rack is selected.
     pub ampforge: Option<daw_core::project::ClapSlot>,
@@ -42,6 +47,12 @@ pub struct GuitarConfig {
     pub cabinet: crate::cabinet::CabinetRecipe,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct GuitarInput {
+    pub device: Option<String>,
+    pub channel: u16,
+}
+
 impl GuitarConfig {
     pub fn active_ampforge(&self) -> anyhow::Result<Option<&daw_core::project::ClapSlot>> {
         if !self.ampforge_enabled { return Ok(None); }
@@ -53,7 +64,7 @@ impl GuitarConfig {
 
 impl Default for GuitarConfig {
     fn default() -> Self {
-        GuitarConfig { amp: Default::default(), ampforge: None, ampforge_enabled: false, buffer_frames: 128, output_same_as_input: true, ir_path: None, cabinet: Default::default() }
+        GuitarConfig { input: None, amp: Default::default(), ampforge: None, ampforge_enabled: false, buffer_frames: 128, output_same_as_input: true, ir_path: None, cabinet: Default::default() }
     }
 }
 
@@ -66,6 +77,7 @@ impl Default for UserConfig {
             latency_trim_ms: 12.0,
             guitar: GuitarConfig::default(),
             guitar_presets: Vec::new(),
+            light_theme: false,
         }
     }
 }
@@ -79,6 +91,15 @@ pub fn config_path() -> PathBuf {
 }
 
 impl UserConfig {
+    pub fn guitar_input(&self) -> GuitarInput {
+        self.guitar.input.clone().unwrap_or_else(|| GuitarInput {
+            device: self.input_device.clone(),
+            channel: match self.input_channels {
+                InputChannels::Mono(channel) | InputChannels::Stereo(channel, _) => channel,
+            },
+        })
+    }
+
     pub fn load_from(path: &Path) -> UserConfig {
         std::fs::read_to_string(path)
             .ok()
@@ -127,11 +148,13 @@ mod tests {
             count_in_bars: 2,
             latency_trim_ms: 20.0,
             guitar: GuitarConfig {
+                input: Some(GuitarInput { device: None, channel: 3 }),
                 amp: daw_core::audio::amp::AmpSettings { gain: 0.8, ..Default::default() },
                 buffer_frames: 64, output_same_as_input: true, ir_path: Some("cab.wav".into()),
                 ..Default::default()
             },
             guitar_presets: crate::guitar_presets::factory_presets(),
+            light_theme: true,
         };
         cfg.save_to(&path).unwrap();
         let loaded = UserConfig::load_from(&path);
@@ -139,11 +162,15 @@ mod tests {
         assert_eq!(loaded.count_in_bars, 2);
         assert_eq!(loaded.latency_trim_ms, 20.0);
         assert_eq!(loaded.guitar, cfg.guitar, "guitar amp settings persist");
+        assert_eq!(loaded.guitar_input(), GuitarInput { device: None, channel: 3 });
         assert_eq!(loaded.guitar_presets, cfg.guitar_presets, "named tones persist");
+        assert!(loaded.light_theme);
 
         // A config written before the guitar amp existed still loads.
         std::fs::write(&path, r#"{"count_in_bars":3}"#).unwrap();
         let old = UserConfig::load_from(&path);
+        assert!(!old.light_theme);
+        assert_eq!(old.guitar_input(), GuitarInput { device: None, channel: 0 });
         assert_eq!((old.count_in_bars, old.guitar), (3, GuitarConfig::default()));
 
         // Corrupt file → defaults, not a panic.

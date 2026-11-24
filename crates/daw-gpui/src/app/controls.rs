@@ -1,49 +1,108 @@
 use super::*;
 
+pub(super) enum SetupIcon {
+    Microphone,
+    Keyboard,
+}
+
+impl SetupIcon {
+    pub(super) fn render(self, color: u32) -> gpui::Div {
+        let color = rgb(color);
+        let mark = |x, y, width, height| {
+            div().absolute().left(px(x)).top(px(y)).w(px(width)).h(px(height))
+        };
+        let icon = div().relative().size(px(16.));
+        match self {
+            Self::Microphone => icon
+                .child(mark(5., 0., 6., 10.).rounded_full().bg(color))
+                .child(mark(3., 6., 10., 7.).border_b_1().border_l_1().border_r_1()
+                    .border_color(color).rounded_b(px(5.)))
+                .child(mark(7.5, 13., 1., 2.).bg(color))
+                .child(mark(5., 15., 6., 1.).bg(color)),
+            Self::Keyboard => icon
+                .child(mark(0., 2., 16., 12.).rounded_sm().border_1().border_color(color))
+                .children([4., 8., 12.].map(|x| mark(x - 0.5, 3., 1., 10.).bg(color)))
+                .children([4., 8.].map(|x| mark(x - 1., 3., 2., 6.).bg(color))),
+        }
+    }
+}
+
+impl Theme {
+    pub(super) fn cell_btn(
+        self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        on: bool,
+        on_color: u32,
+    ) -> gpui::Stateful<gpui::Div> {
+        let id = id.into();
+        let label = label.into();
+        let help = control_help(id.as_ref()).map(SharedString::from).unwrap_or_else(|| label.clone());
+        self.cell_btn_with_help(id, label, on, on_color, help)
+    }
+
+    pub(super) fn cell_btn_with_help(
+        self,
+        id: impl Into<SharedString>,
+        label: impl Into<SharedString>,
+        on: bool,
+        on_color: u32,
+        help: SharedString,
+    ) -> gpui::Stateful<gpui::Div> {
+        self.control(id.into(), on, on_color, help).child(label.into())
+    }
+
+    pub(super) fn control(
+        self,
+        id: SharedString,
+        on: bool,
+        on_color: u32,
+        help: SharedString,
+    ) -> gpui::Stateful<gpui::Div> {
+        div()
+            .id(id.clone())
+            .debug_selector(|| id.to_string())
+            .tooltip(move |_w, cx| cx.new(|_| TextTooltip { theme: self, text: help.clone() }).into())
+            .hover(|s| s.opacity(0.85))
+            .active(|s| s.opacity(0.7))
+            .flex_shrink_0()
+            .px_2()
+            .py_1()
+            .rounded_md()
+            .cursor_pointer()
+            .whitespace_nowrap()
+            .bg(rgb(if on { on_color } else { self.panel_alt }))
+            .text_color(rgb(if on { theme::contrast_text(on_color) } else { self.text }))
+            .on_click(|_, _, cx| cx.stop_propagation())
+    }
+
+    /// Centered placeholder child for dock tabs that aren't yet implemented.
+    pub(super) fn dock_hint(self, text: impl Into<SharedString>) -> gpui::Div {
+        div()
+            .flex_1()
+            .flex()
+            .items_center()
+            .justify_center()
+            .text_color(rgb(self.text_dim))
+            .child(text.into())
+    }
+
+    /// A panel header used atop the browser and mixer docks.
+    pub(super) fn section_title(self, text: impl Into<SharedString>) -> gpui::Div {
+        div().flex_shrink_0()
+            .px_3()
+            .py_2()
+            .text_color(rgb(self.text_dim))
+            .border_b_1()
+            .border_color(rgb(self.border))
+            .child(text.into())
+    }
+}
+
 /// Opaque to pointer hit-testing, including wheel events. A painted background
 /// alone does not prevent GPUI from dispatching to covered sibling controls.
 pub(super) fn overlay_surface() -> gpui::Div {
     div().occlude()
-}
-
-
-pub(super) fn cell_btn(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    on: bool,
-    on_color: u32,
-) -> gpui::Stateful<gpui::Div> {
-    let id = id.into();
-    let label = label.into();
-    let help = control_help(id.as_ref()).map(SharedString::from).unwrap_or_else(|| label.clone());
-    cell_btn_with_help(id, label, on, on_color, help)
-}
-
-pub(super) fn cell_btn_with_help(
-    id: impl Into<SharedString>,
-    label: impl Into<SharedString>,
-    on: bool,
-    on_color: u32,
-    help: SharedString,
-) -> gpui::Stateful<gpui::Div> {
-    let id = id.into();
-    let label = label.into();
-    div()
-        .id(id.clone())
-        .debug_selector(|| id.to_string())
-        .tooltip(move |_w, cx| cx.new(|_| TextTooltip { text: help.clone() }).into())
-        .hover(|s| s.opacity(0.85))
-        .active(|s| s.opacity(0.7))
-        .flex_shrink_0()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .cursor_pointer()
-        .whitespace_nowrap()
-        .bg(rgb(if on { on_color } else { PANEL_ALT }))
-        .text_color(rgb(if on { BG } else { TEXT }))
-        .on_click(|_, _, cx| cx.stop_propagation())
-        .child(label)
 }
 
 /// Readable pan position instead of an internal signed scalar.
@@ -61,10 +120,16 @@ pub(super) fn control_help(id: &str) -> Option<&'static str> {
         "add-wav" => "Import a WAV file at the playhead",
         "arr-left" => "Scroll four bars earlier",
         "arr-right" => "Scroll four bars later",
+        "arr-start" => "Scroll to the start",
+        "arr-end" => "Scroll to the end of the arrangement",
         "arr-fit" => "Reset timeline zoom and return to the start",
         "key-down" => "Transpose down one semitone",
         "key-up" => "Transpose up one semitone",
+        "sw-down" => "Decrease project swing",
+        "sw-up" => "Increase project swing",
         "humanize" => "Cycle note velocity variation",
+        "tm-down" => "Decrease note timing variation",
+        "tm-up" => "Increase note timing variation",
         "metro" => "Toggle the metronome",
         "punch-in" => "Start recording at the loop region start",
         "punch-out" => "Stop recording at the loop region end",
@@ -87,17 +152,6 @@ pub(super) fn control_help(id: &str) -> Option<&'static str> {
         _ => return None,
     };
     Some(help)
-}
-
-/// Centered placeholder child for dock tabs that aren't yet implemented.
-pub(super) fn dock_hint(text: impl Into<SharedString>) -> gpui::Div {
-    div()
-        .flex_1()
-        .flex()
-        .items_center()
-        .justify_center()
-        .text_color(rgb(TEXT_DIM))
-        .child(text.into())
 }
 
 /// Truncate a string to at most `n` chars.
@@ -166,17 +220,6 @@ pub(super) const GM_CATEGORIES: &[(&str, &[(&str, u8)])] = &[
     ("Synth Lead", &[("Square", 80), ("Saw", 81), ("Calliope", 82), ("Charang", 84)]),
     ("Synth Pad", &[("New Age", 88), ("Warm", 89), ("Sweep", 95), ("Halo", 94)]),
 ];
-
-/// A panel header used atop the browser and mixer docks.
-pub(super) fn section_title(text: impl Into<SharedString>) -> gpui::Div {
-    div().flex_shrink_0()
-        .px_3()
-        .py_2()
-        .text_color(rgb(TEXT_DIM))
-        .border_b_1()
-        .border_color(rgb(BORDER))
-        .child(text.into())
-}
 
 /// A small rounded pill used across the transport bar.
 pub(super) fn pill(text: impl Into<SharedString>, bg: u32, fg: u32) -> gpui::Div {

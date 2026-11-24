@@ -1,0 +1,14 @@
+[package]
+name = "daw-faust-drums"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+[workspace]
+
+[lib]
+crate-type = ["cdylib"]
+
+[dependencies]
+clack-plugin = "0.1"
+clack-extensions = { version = "0.1", features = ["clack-plugin", "audio-ports", "note-ports", "params", "state"] }

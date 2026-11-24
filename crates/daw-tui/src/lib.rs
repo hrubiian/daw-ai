@@ -74,14 +74,13 @@ fn event_loop(
                         app.pr_note_off_record(pitch);
                     }
                 }
+                crate::midi::MidiEvent::KeyLab(_) => {}
             }
         }
 
         if let Ok(buf) = app.vis_buf.try_lock() {
-            if !buf.is_empty() {
-                app.vis_snapshot.clear();
-                app.vis_snapshot.extend_from_slice(&buf);
-            }
+            app.vis_snapshot.clear();
+            app.vis_snapshot.extend(buf.recent_mono(4096));
         }
 
         terminal.draw(|frame| views::render(frame, app))?;

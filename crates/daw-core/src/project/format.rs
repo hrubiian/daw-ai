@@ -123,11 +123,8 @@ pub fn resolve_asset_path(value: &str, base: &Path, legacy_root: &Path) -> PathB
     }
 }
 
-/// Hash the actual runtime assets used by a render (paths should be resolved).
-pub fn asset_fingerprints(
-    project: &Project,
-    default_sf2: &Path,
-) -> Result<std::collections::BTreeMap<String, String>> {
+/// Paths referenced by a runtime project, after asset resolution.
+pub fn referenced_asset_paths(project: &Project, default_sf2: &Path) -> std::collections::BTreeSet<PathBuf> {
     let mut paths = std::collections::BTreeSet::new();
     for track in &project.tracks {
         match &track.instrument {
@@ -155,6 +152,14 @@ pub fn asset_fingerprints(
     }
     paths.extend(project.audio_clips.iter().map(|c| PathBuf::from(&c.path)));
     paths
+}
+
+/// Hash the actual runtime assets used by a render (paths should be resolved).
+pub fn asset_fingerprints(
+    project: &Project,
+    default_sf2: &Path,
+) -> Result<std::collections::BTreeMap<String, String>> {
+    referenced_asset_paths(project, default_sf2)
         .into_iter()
         .map(|path| {
             let hash =

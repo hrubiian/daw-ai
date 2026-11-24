@@ -6,10 +6,9 @@ smoke tests on a UMC404HD; **not yet confirmed by ear with a guitar**.
 
 ## Using it
 
-1. Press **Amp setup…** beside **🎸 Amp** in the transport bar (also available
-   under Settings → Guitar amp). It opens a separate resizable window; opening
-   it again focuses the existing window.
-2. Pick the interface and mono input the guitar is plugged into, then switch
+1. Press **Amp setup…** beside **🎸 Amp** in the transport bar. It opens a
+   separate resizable window. Pressing the button again focuses that window.
+2. Under **Guitar input**, pick the interface and mono input the guitar is plugged into, then switch
    **Monitoring: on**. **🎸 Amp** in the transport still toggles monitoring and
    shows the measured software latency while on.
 3. Use headphones, or keep the guitar away from the speakers: an open input
@@ -19,6 +18,8 @@ The setup window has input selection, refresh, input/output meters and the
 controls: Gain, Bass, Mid, Treble, Level, Noise
 gate (Shift+click for fine steps), Amp on/bypassed, Cabinet (built-in 4×12
 voicing / a loaded impulse response / off), Load IR…, Buffer, and Output.
+The guitar input is saved separately from **Settings → Default audio input**.
+**Use recording default** restores the link used by older configurations.
 Everything is saved in `~/.config/daw-ai/config.json`. Monitoring is never
 switched on automatically at startup.
 
@@ -26,11 +27,11 @@ switched on automatically at startup.
 
 Each track header has an **In: … ▾** button. Choose the interface, mono input
 or stereo pair, and the sound to record. The route is saved with that track
-in the project; **Use Settings input** restores the global input selection.
+in the project. **Use recording default** restores the global input selection.
 Audio input recording requires an **Audio** track (use **+ Audio**).
 
-- **Auto (follow amp)** prints the amp and cabinet when guitar monitoring is
-  on at arming time; otherwise it records dry.
+- **Auto (match guitar input)** prints the amp and cabinet when guitar
+  monitoring is active on the same mono input; other inputs record dry.
 - **Guitar rack (amp + cab)** always prints the current rack into the take WAV,
   including the selected/blended cabinet IR, even when monitoring is off.
 - **Dry input** records the unprocessed interface signal for later processing.
@@ -40,8 +41,22 @@ Press **Rec** to arm and meter the selected track's input, then **Rec** again
 to record. **Stop** while armed releases the input. Input routing is locked
 during a take, including loop passes. Rack tone changes also update the
 recording processor. Recording uses the same DSP as monitoring, at the capture
-stream's own sample rate. Track insert effects still apply during playback.
-Existing dry recordings stay dry; this changes newly recorded WAVs.
+stream's own sample rate. The audio track's **Monitor** switch sends its
+selected input through track inserts. The take still uses the chosen recording
+source. Existing dry recordings stay dry.
+
+### Voice, guitar and MIDI together
+
+Choose the mic's input under **In: …** on its audio track and enable **Monitor**.
+Choose a different mono input in **Amp setup… → Guitar input** and enable the
+guitar monitor. On one multichannel interface, use the physical jack numbers for
+the two mono selections. DAW‑AI rejects a second monitor on a channel already
+in use, including a channel included in a stereo pair.
+
+Choose the keyboard port in **Settings → MIDI keyboard**, then select the
+instrument track it should play. **Keyboard plays** shows its target. Selecting
+an audio track keeps the keyboard on the previous instrument. The desktop app
+arms and records one audio track at a time.
 
 Two bundled IR buttons are ready to compare: **Open-back 1×12** (bright/airy)
 and **Closed-back 4×12** (tight/darker). Clicking either immediately selects
@@ -137,7 +152,7 @@ saving the same name replaces it. Saved tones persist in the user config.
 Boost (gain 30%, tone 64%, level 60%) → amp (gain 74%, bass 54%, mids 24%,
 treble 67%, gate 48%, output 35%) → 90% closed-back 4×12 / 10% open-back 1×12,
 with 90 Hz low cut and 6.2 kHz high cut. Modulation, echo, and reverb are off
-to leave space between fast palm-muted notes. 
+to leave space between fast palm-muted notes.
 Start with the bridge pickup; adjust gain/gate for your guitar's output.
 Choose the track's **Guitar rack (amp + cab)** recording source to print the
 whole tone into new takes. Selecting the preset preserves input/output routing.

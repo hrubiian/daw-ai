@@ -5,6 +5,7 @@ use daw_core::audio::pedals::{
 };
 
 fn knob(
+    theme: Theme,
     id: &'static str,
     label: String,
     value: f32,
@@ -18,9 +19,9 @@ fn knob(
         .flex()
         .items_center()
         .gap_2()
-        .child(div().flex_1().text_color(rgb(TEXT_DIM)).child(label))
+        .child(div().flex_1().text_color(rgb(theme.text_dim)).child(label))
         .child(
-            cell_btn(format!("pedal-{id}-down"), "−", false, PANEL_ALT).on_click(cx.listener(
+            theme.cell_btn(format!("pedal-{id}-down"), "−", false, theme.panel_alt).on_click(cx.listener(
                 move |this, event: &gpui::ClickEvent, _, cx| {
                     let step = if event.modifiers().shift {
                         step / 5.
@@ -33,7 +34,7 @@ fn knob(
             )),
         )
         .child(
-            cell_btn(format!("pedal-{id}-up"), "+", false, PANEL_ALT).on_click(cx.listener(
+            theme.cell_btn(format!("pedal-{id}-up"), "+", false, theme.panel_alt).on_click(cx.listener(
                 move |this, event: &gpui::ClickEvent, _, cx| {
                     let step = if event.modifiers().shift {
                         step / 5.
@@ -47,37 +48,39 @@ fn knob(
         )
 }
 
-fn pedal_panel(title: &'static str) -> gpui::Div {
+fn pedal_panel(theme: Theme, title: &'static str) -> gpui::Div {
     div()
         .flex()
         .flex_col()
         .gap_2()
         .p_3()
-        .bg(rgb(PANEL))
-        .child(section_title(title))
+        .bg(rgb(theme.panel))
+        .child(theme.section_title(title))
 }
 
 impl DawView {
     pub(super) fn pedal_starting_points(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let current = self.config.guitar.amp.pedals;
-        pedal_panel("Pedal combinations")
+        pedal_panel(theme, "Pedal combinations")
             .child(div().flex().flex_wrap().gap_1().children([
                 (PedalPreset::Dry, "Dry"), (PedalPreset::TightRhythm, "Tight rhythm"),
                 (PedalPreset::WideClean, "Clean chorus"), (PedalPreset::LeadEcho, "Lead echo"),
                 (PedalPreset::JetFlange, "Jet flange"),
             ].into_iter().map(|(preset, label)| {
                 let settings = PedalSettings::preset(preset);
-                cell_btn(format!("pedal-preset-{preset:?}"), label, current == settings, self.accent())
+                theme.cell_btn(format!("pedal-preset-{preset:?}"), label, current == settings, self.accent())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.edit_amp(|a| a.pedals = settings); cx.notify();
                     }))
             })))
-            .child(div().text_color(rgb(TEXT_DIM)).child("Changes pedals only · save the whole sound under My presets · Shift + click for fine steps"))
+            .child(div().text_color(rgb(theme.text_dim)).child("Changes pedals only · save the whole sound under My presets · Shift + click for fine steps"))
     }
 
     pub(super) fn drive_pedals(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let s = self.config.guitar.amp.pedals.drive;
-        pedal_panel("Drive pedal · before the amp")
+        pedal_panel(theme, "Drive pedal · before the amp")
             .child(
                 div().flex().flex_wrap().gap_1().children(
                     [
@@ -89,7 +92,7 @@ impl DawView {
                     ]
                     .into_iter()
                     .map(|(mode, label)| {
-                        cell_btn(
+                        theme.cell_btn(
                             format!("pedal-drive-{mode:?}"),
                             label,
                             s.mode == mode,
@@ -103,6 +106,7 @@ impl DawView {
                 ),
             )
             .child(knob(
+                theme,
                 "drive-gain",
                 format!("Drive: {:.0}", s.gain * 100.),
                 s.gain,
@@ -113,6 +117,7 @@ impl DawView {
                 cx,
             ))
             .child(knob(
+                theme,
                 "drive-tone",
                 format!("Tone: {:.0}", s.tone * 100.),
                 s.tone,
@@ -123,6 +128,7 @@ impl DawView {
                 cx,
             ))
             .child(knob(
+                theme,
                 "drive-level",
                 format!("Pedal level: {:.0}", s.level * 100.),
                 s.level,
@@ -135,8 +141,9 @@ impl DawView {
     }
 
     pub(super) fn modulation_pedal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let s = self.config.guitar.amp.pedals.modulation;
-        let mut panel = pedal_panel("Modulation · after the cabinet")
+        let mut panel = pedal_panel(theme, "Modulation · after the cabinet")
             .child(
                 div().flex().flex_wrap().gap_1().children(
                     [
@@ -147,7 +154,7 @@ impl DawView {
                     ]
                     .into_iter()
                     .map(|(mode, label)| {
-                        cell_btn(
+                        theme.cell_btn(
                             format!("pedal-modulation-{mode:?}"),
                             label,
                             s.mode == mode,
@@ -184,6 +191,7 @@ impl DawView {
                 ),
             )
             .child(knob(
+                theme,
                 "mod-rate",
                 format!("Rate: {:.2} Hz", s.rate_hz),
                 s.rate_hz,
@@ -194,6 +202,7 @@ impl DawView {
                 cx,
             ))
             .child(knob(
+                theme,
                 "mod-depth",
                 format!("Depth: {:.0}%", s.depth * 100.),
                 s.depth,
@@ -205,6 +214,7 @@ impl DawView {
             ));
         if s.mode != ModulationMode::Tremolo {
             panel = panel.child(knob(
+                theme,
                 "mod-feedback",
                 format!("Feedback: {:.0}%", s.feedback * 100.),
                 s.feedback,
@@ -216,6 +226,7 @@ impl DawView {
             ));
         }
         panel.child(knob(
+            theme,
             "mod-mix",
             format!("Mix: {:.0}%", s.mix * 100.),
             s.mix,
@@ -228,8 +239,9 @@ impl DawView {
     }
 
     pub(super) fn echo_pedal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let s = self.config.guitar.amp.pedals.echo;
-        let mut panel = pedal_panel("Echo")
+        let mut panel = pedal_panel(theme, "Echo")
             .child(
                 div().flex().flex_wrap().gap_1().children(
                     [
@@ -240,7 +252,7 @@ impl DawView {
                     ]
                     .into_iter()
                     .map(|(mode, label)| {
-                        cell_btn(
+                        theme.cell_btn(
                             format!("pedal-echo-{mode:?}"),
                             label,
                             s.mode == mode,
@@ -275,6 +287,7 @@ impl DawView {
                 ),
             )
             .child(knob(
+                theme,
                 "echo-time",
                 format!("Time: {:.0} ms", s.time_ms),
                 s.time_ms,
@@ -290,6 +303,7 @@ impl DawView {
             ));
         if s.mode != GuitarEchoMode::Slapback {
             panel = panel.child(knob(
+                theme,
                 "echo-feedback",
                 format!("Feedback: {:.0}%", s.feedback * 100.),
                 s.feedback,
@@ -301,6 +315,7 @@ impl DawView {
             ));
         }
         panel.child(knob(
+            theme,
             "echo-mix",
             format!("Mix: {:.0}%", s.mix * 100.),
             s.mix,
@@ -313,8 +328,9 @@ impl DawView {
     }
 
     pub(super) fn reverb_pedal(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let s = self.config.guitar.amp.pedals.reverb;
-        pedal_panel("Reverb")
+        pedal_panel(theme, "Reverb")
             .child(
                 div().flex().flex_wrap().gap_1().children(
                     [
@@ -324,7 +340,7 @@ impl DawView {
                     ]
                     .into_iter()
                     .map(|(mode, label)| {
-                        cell_btn(
+                        theme.cell_btn(
                             format!("pedal-reverb-{mode:?}"),
                             label,
                             s.mode == mode,
@@ -354,6 +370,7 @@ impl DawView {
                 ),
             )
             .child(knob(
+                theme,
                 "reverb-size",
                 format!("Size / decay: {:.0}", s.size * 100.),
                 s.size,
@@ -364,6 +381,7 @@ impl DawView {
                 cx,
             ))
             .child(knob(
+                theme,
                 "reverb-damping",
                 format!("Damping: {:.0}", s.damping * 100.),
                 s.damping,
@@ -374,6 +392,7 @@ impl DawView {
                 cx,
             ))
             .child(knob(
+                theme,
                 "reverb-mix",
                 format!("Mix: {:.0}%", s.mix * 100.),
                 s.mix,

@@ -5,6 +5,9 @@ between track inserts/sends and the two shared spaces. Bus edits affect every
 track sending to that bus. Presets preserve its fader and mute. Shift+click
 steppers for smaller adjustments.
 
+**Project groove** contains Swing, Humanize and Timing. These controls affect
+the whole project.
+
 ## Built-in effects
 
 Every track type exposes insert delay, saturation, low-pass filtering,

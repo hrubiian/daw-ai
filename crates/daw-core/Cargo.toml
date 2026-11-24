@@ -1,6 +1,6 @@
 [package]
 name = "daw-core"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 license = "MIT OR Apache-2.0"
 
@@ -13,10 +13,13 @@ crossbeam-channel = "0.5"
 rustysynth     = "1"
 anyhow         = "1"
 hound          = "3"
-clack-host       = "0.1"
-clack-extensions = { version = "0.1", features = ["clack-host", "audio-ports", "params", "state", "note-ports", "gui", "timer"] }
+clack-host       = { version = "0.1", features = ["clack-plugin"] }
+clack-plugin     = "0.1"
+clack-extensions = { version = "0.1", features = ["clack-host", "clack-plugin", "audio-ports", "params", "state", "note-ports", "gui", "timer"] }
 base64           = "0.22"
+flate2          = "1"
 rustfft        = "6"
+wasmi          = { version = "0.46", default-features = false, features = ["std"] }
 
 sha2 = "0.10"
 

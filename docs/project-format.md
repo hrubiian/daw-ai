@@ -154,7 +154,7 @@ the track to its saved value. Use MCP `set_modulators(track_id, modulators)`.
 ## Per-track recording input
 
 Tracks may include an optional `input` object. Omitting it inherits the user's
-Settings input device/channel and uses `auto` recording mode. This keeps older
+recording default device/channel and uses `auto` recording mode. This keeps older
 project files compatible. The route affects recording on Audio tracks.
 
 ```json
@@ -168,6 +168,6 @@ project files compatible. The route affects recording on Audio tracks.
 `device: null` selects the system default input. Channel indices are zero-based;
 `{"stereo": [0, 1]}` records a stereo pair. `source` is `dry` (unprocessed),
 `guitar` (print the current amp/cabinet into the WAV), or `auto` (the default:
-print the rack if monitoring is enabled when armed). Device/channel changes
+print the rack when guitar monitoring is active on the same mono input). Device/channel changes
 require finishing the current take. Unavailable named devices or channels
 produce an error instead of silently recording another input.

@@ -11,9 +11,11 @@ pub mod audio {
     pub mod clap;
     pub mod engine;
     pub mod export;
+    pub mod flow;
     pub mod input;
     pub mod mixer;
     pub mod monitor;
+    pub mod track_monitor;
     pub mod live_plugin;
     pub mod pedals;
 

@@ -5,12 +5,16 @@ mod arrangement;
 mod browser;
 mod editors;
 mod effects;
+mod fx_library;
+mod output_analyzer;
 mod guitar;
 mod inputs;
 mod mixing;
 mod menus;
+mod model_m_midi;
 mod window_frame;
 mod layout;
+mod theme;
 
 use crate::state::{AudioDragKind, DockTab, HeadlessState, RenameTarget};
 use daw_core::project::Project;
@@ -23,15 +27,8 @@ use gpui::{
 use std::path::PathBuf;
 use std::sync::atomic::Ordering;
 
-// Ableton-flat theme: muted neutral greys, hairline separators, one warm accent.
-const BG: u32 = 0x16161a; // app background (canvas)
-const PANEL: u32 = 0x212126; // surfaces (transport, docks, headers)
-const PANEL_ALT: u32 = 0x2e2e35; // raised / selected / control fills
-const BORDER: u32 = 0x0e0e11; // hairline separators between panels & lanes
-const TEXT: u32 = 0xd6d6db;
-const TEXT_DIM: u32 = 0xa0a0ab;
-const ACCENT: u32 = 0xff9d4d; // warm selection/playhead accent (= ACCENTS[0])
-const ACCENTS: [u32; 3] = [0xff9d4d, 0x4dd0ff, 0x6ee87a]; // orange, cyan, green
+use theme::{Theme, ON_CLIP};
+
 const RECORD: u32 = 0xff4d47;
 const METER_WARN: u32 = 0xe8c84a;
 
@@ -47,15 +44,25 @@ fn track_color(track_idx: usize) -> u32 {
 const TRACK_H: f32 = 72.0;
 const STEP_W: f32 = 22.0;
 // Piano Roll cell dimensions.
-const PR_ROW_H: f32 = 12.0;
+const PR_ROW_H: f32 = 16.0;
+const PR_KEY_W: f32 = 88.0;
+const PR_KEYBOARD_GUTTER: f32 = PR_KEY_W + 4.0;
 const PR_COL_W: f32 = 18.0;
 // Two compact rows keep track controls visible while leaving room for the music.
 const TRACK_HEADER_W: f32 = 460.0;
+const HEADER_H: f32 = 32.0;
+const TRANSPORT_H: f32 = 44.;
+const TOOLS_H: f32 = 32.;
+const STATUS_H: f32 = 22.;
+const ARRANGE_HEADER_H: f32 = HEADER_H + TRANSPORT_H + TOOLS_H;
 const BAR_W: f32 = 64.0;
 const MIN_BAR_W: f32 = 8.0;
 const MAX_BAR_W: f32 = 200.0;
-const RULER_H: f32 = 20.0;
+const RULER_H: f32 = 32.0;
+const ARRANGE_SCROLLBAR_H: f32 = 16.0;
 const LOOP_LANE_H: f32 = 8.0;
+const SOUNDFONT_BANNER_H: f32 = 22.;
+const ARRANGE_CHROME_H: f32 = ARRANGE_HEADER_H + STATUS_H + RULER_H + LOOP_LANE_H + ARRANGE_SCROLLBAR_H;
 
 type PadPick = (String, u8, PathBuf, Option<(u8, u8)>);
 type DeviceScan = (Vec<daw_core::audio::input::InputDeviceInfo>, Vec<String>);
@@ -67,6 +74,7 @@ pub struct DawView {
     host: Host,
     playing: bool,
     last_session_poll: std::time::Instant,
+    live_status: Option<String>,
     /// Set by a background export thread; drained into `st.status` each frame.
     export_result: std::sync::Arc<std::sync::Mutex<Option<String>>>,
     export_control: Option<std::sync::Arc<daw_core::render_control::RenderControl>>,
@@ -91,10 +99,16 @@ pub struct DawView {
     sf2_missing: bool,
     /// Focus handle for the instrument-browser search input.
     search_focus: FocusHandle,
+    browser_scroll: gpui::ScrollHandle,
+    fx_library: fx_library::EffectLibrary,
+    fx_controls_group: Option<&'static str>,
+    fx_slot_details: Option<String>,
+    output_analyzer: output_analyzer::OutputAnalyzerView,
     /// Real-time MIDI → piano-roll recorder (records into the open pattern).
     recorder: daw_core::sequencer::MidiRecorder,
     /// True while armed/recording MIDI into the open piano-roll pattern.
     midi_recording: bool,
+    midi_track: Option<String>,
     /// Audio-input record session (armed / awaiting roll / recording).
     audio_rec: daw_core::audio::input::RecordingSession,
     /// Persisted user config (input device/channel, count-in, latency trim).
@@ -128,6 +142,7 @@ pub struct DawView {
     /// Whether the playhead was inside the visible timeline last frame
     /// (page-follow only when playback carries it out of view).
     playhead_was_visible: bool,
+    timeline_scroll_grab: Option<f32>,
     /// Latency text last drawn on the Amp button (repaint only when it changes).
     amp_readout_shown: Option<String>,
     ampforge_save_at: Option<std::time::Instant>,
@@ -138,6 +153,9 @@ pub struct DawView {
     /// Cached unsaved-changes flag for the title pill: (when computed, value).
     dirty_shown: std::cell::Cell<(Option<std::time::Instant>, bool)>,
     piano_scroll: gpui::ScrollHandle,
+    piano_scroll_grab: Option<f32>,
+    piano_scrolled_pattern: Option<String>,
+    piano_note_lights: [u64; 2],
     mix_scroll: gpui::ScrollHandle,
     mix_vertical_scroll: gpui::ScrollHandle,
     /// Snapshot undo/redo over `st.project`.
@@ -147,6 +165,7 @@ pub struct DawView {
     /// Filled once by the background CLAP discovery scan; drained in pump().
     clap_scan: std::sync::Arc<std::sync::Mutex<Option<Vec<daw_core::audio::clap::ClapPluginDesc>>>>,
     clap_scanning: std::sync::Arc<std::sync::atomic::AtomicBool>,
+    plugin_import: Option<std::sync::mpsc::Receiver<browser::PluginImportResult>>,
     /// Focus handle for the inline rename editor.
     rename_focus: FocusHandle,
     /// Result of a background ⚖ auto-balance run; drained in pump().
@@ -155,12 +174,15 @@ pub struct DawView {
 }
 
 impl DawView {
-    fn new(host: Host, project: Project, path: Option<PathBuf>, sf2_path: String, cx: &mut Context<Self>) -> Self {
-        Self {
+    fn new(mut host: Host, project: Project, path: Option<PathBuf>, sf2_path: String, cx: &mut Context<Self>) -> Self {
+        host.enable_keylab_controls();
+        let live_status = host.session.as_ref().map(|session| session.status_line());
+        let mut view = Self {
             st: HeadlessState::from_project(project, path),
             host,
             playing: false,
             last_session_poll: std::time::Instant::now(),
+            live_status,
             export_result: Default::default(),
             export_control: None,
             load_result: Default::default(),
@@ -172,8 +194,14 @@ impl DawView {
             sf2_path: sf2_path.clone(),
             sf2_missing: !std::path::Path::new(&sf2_path).exists(),
             search_focus: cx.focus_handle(),
+            browser_scroll: gpui::ScrollHandle::new(),
+            fx_library: fx_library::EffectLibrary::new(cx),
+            fx_controls_group: None,
+            fx_slot_details: None,
+            output_analyzer: Default::default(),
             recorder: daw_core::sequencer::MidiRecorder::new(),
             midi_recording: false,
+            midi_track: None,
             audio_rec: Default::default(),
             config: daw_io::config::UserConfig::load(),
             input_devices: Vec::new(),
@@ -196,6 +224,7 @@ impl DawView {
             audio_take_finishing: false,
             input_track: None,
             playhead_was_visible: true,
+            timeline_scroll_grab: None,
             ir_pick: Default::default(),
             cabinet_export_result: Default::default(),
             guitar_window: None,
@@ -203,6 +232,9 @@ impl DawView {
             ampforge_save_at: None,
             dirty_shown: Default::default(),
             piano_scroll: gpui::ScrollHandle::new(),
+            piano_scroll_grab: None,
+            piano_scrolled_pattern: None,
+            piano_note_lights: [0; 2],
             mix_scroll: gpui::ScrollHandle::new(),
             mix_vertical_scroll: gpui::ScrollHandle::new(),
             undo: daw_core::undo::UndoStack::new(),
@@ -212,21 +244,71 @@ impl DawView {
             balance_running: false,
             clap_scan: Default::default(),
             clap_scanning: Default::default(),
-        }
+            plugin_import: None,
+        };
+        view.sync_midi_strip();
+        view
     }
 
     fn timeline_width(&self, window: &Window) -> f32 {
-        let width = f32::from(window.viewport_size().width);
-        if self.st.arrange_full { return (width - TRACK_HEADER_W).max(1.); }
-        let layout = layout::PanelLayout::new(width, window_frame::content_height(window),
-            self.st.browser_open.then_some(self.st.browser_w), self.st.mixer_open.then_some(self.st.mixer_w),
-            self.st.dock_h, self.sf2_missing);
-        (width - TRACK_HEADER_W - layout.browser.map_or(0., |w| w + 5.)
-            - layout.mixer.map_or(0., |w| w + 5.)).max(1.)
+        (f32::from(window.viewport_size().width) - TRACK_HEADER_W).max(1.)
+    }
+
+    fn workspace_splitter(
+        &self,
+        panel: Splitter,
+        height: f32,
+        resizable: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme();
+        let id = match panel {
+            Splitter::Dock => "rz-dock",
+            Splitter::Mixer => "rz-mixer",
+        };
+        let splitter = div()
+            .id(id)
+            .debug_selector(move || id.into())
+            .h(px(layout::SPLITTER_H))
+            .flex_shrink_0()
+            .bg(rgb(theme.panel_alt));
+        if !resizable {
+            return splitter;
+        }
+        let accent = self.accent();
+        splitter
+            .cursor(gpui::CursorStyle::ResizeUpDown)
+            .hover(move |s| s.bg(rgb(accent)))
+            .on_drag(
+                ResizeDrag { panel, height, origin: std::cell::Cell::new(None) },
+                |drag, _, window, cx| {
+                    drag.origin.set(Some(window.mouse_position().y));
+                    cx.new(|_| EmptyDrag)
+                },
+            )
+            .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<ResizeDrag>, _, cx| {
+                let drag = e.drag(cx);
+                if drag.panel != panel { return; }
+                if let Some(origin) = drag.origin.get() {
+                    let height = (drag.height + f32::from(origin - e.event.position.y)).max(0.);
+                    match panel {
+                        Splitter::Dock => this.st.dock_h = height,
+                        Splitter::Mixer => this.st.mixer_h = height,
+                    }
+                    cx.notify();
+                }
+            }))
     }
 
     /// Current accent color (Appearance setting).
-    fn accent(&self) -> u32 { ACCENTS[self.st.accent_idx % ACCENTS.len()] }
+    fn accent(&self) -> u32 {
+        let accents = self.theme().accents;
+        accents[self.st.accent_idx % accents.len()]
+    }
+
+    fn theme(&self) -> Theme {
+        if self.config.light_theme { Theme::LIGHT } else { Theme::DARK }
+    }
 
     fn send_command(&self, command: SequencerCommand) -> Result<(), String> {
         if let Some(session) = &self.host.session {
@@ -273,19 +355,8 @@ impl DawView {
         self.push_live();
     }
 
-    /// Move the playhead to the start of `bar` (0-based).
-    fn seek_to_bar(&mut self, bar: u32) {
-        let tick = bar.saturating_mul(daw_core::sequencer::TICKS_PER_BAR);
-        if let Some(session) = &self.host.session {
-            if let Err(e) = session.transport(daw_core::session::Command::Seek { tick }) { self.st.set_status(e.to_string()); }
-        } else { let _ = self.send_command(SequencerCommand::Seek(tick)); }
-    }
-
-    /// Move the playhead to an absolute timeline position in seconds. Used when
-    /// clicking an audio clip, which is placed by seconds rather than bars, so
-    /// Play starts from exactly where the clip begins.
-    fn seek_to_sec(&mut self, sec: f64) {
-        let tick = daw_core::sequencer::engine::sec_to_tick(sec, self.st.project.project.bpm);
+    /// Move the playhead to an absolute timeline tick.
+    fn seek_to_tick(&mut self, tick: u32) {
         if let Some(session) = &self.host.session {
             if let Err(e) = session.transport(daw_core::session::Command::Seek { tick }) { self.st.set_status(e.to_string()); }
         } else { let _ = self.send_command(SequencerCommand::Seek(tick)); }
@@ -325,6 +396,7 @@ impl DawView {
 
     /// Send the whole project to the engine as a cycle-quantized live edit.
     fn push_live(&self) {
+        self.validate_track_monitor();
         if let Some(session) = &self.host.session {
             // A rejected submit leaves the local project differing from the
             // session; the session poll in `pump` reports it every 50 ms.
@@ -351,6 +423,7 @@ impl DawView {
     fn undo(&mut self) {
         if let Some(session) = &self.host.session {
             let result = session.history(false, &mut self.st.project);
+            self.validate_track_monitor();
             self.st.reconcile_selection();
             self.sync_midi_strip();
             self.st.set_status(match result { Ok(()) => "undo: shared session".into(), Err(e) => e.to_string() });
@@ -371,6 +444,7 @@ impl DawView {
     fn redo(&mut self) {
         if let Some(session) = &self.host.session {
             let result = session.history(true, &mut self.st.project);
+            self.validate_track_monitor();
             self.st.reconcile_selection();
             self.sync_midi_strip();
             self.st.set_status(match result { Ok(()) => "redo: shared session".into(), Err(e) => e.to_string() });
@@ -418,6 +492,7 @@ impl DawView {
     }
 
     fn panic_engine(&self) {
+        self.host.disable_track_monitor();
         let _ = self.send_command(SequencerCommand::Panic);
     }
 
@@ -441,14 +516,15 @@ impl DawView {
                     Some(fid) => self.st.select_track(&fid),
                     None => self.st.selected_track = None,
                 }
-                self.sync_midi_strip();
             }
+            self.sync_midi_strip();
             self.push_live();
         }
     }
 
     fn cycle_track_type(&mut self, id: &str) {
         self.edit("track type", |p| { p.cycle_track_type(id); });
+        self.sync_midi_strip();
     }
 
     fn add_pattern(&mut self, id: &str) {
@@ -515,17 +591,18 @@ impl DawView {
 
     /// The inline editor that replaces a name while it's being renamed.
     fn rename_editor(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme();
         let buf = self.st.rename_buf.clone();
         div()
             .id("rename-input")
             .key_context("RenameInput")
             .track_focus(&self.rename_focus)
             .px_1()
-            .bg(rgb(BG))
+            .bg(rgb(theme.bg))
             .border_1()
             .border_color(rgb(self.accent()))
             .rounded_sm()
-            .text_color(rgb(TEXT))
+            .text_color(rgb(theme.text))
             .whitespace_nowrap()
             .child(format!("{buf}▏"))
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, w, cx| {
@@ -598,16 +675,18 @@ impl DawView {
         self.set_loop_region_bars(ns, ne);
     }
 
-    fn add_clap_fx(&mut self, desc_path: String, desc_id: String) {
+    fn add_clap_fx(&mut self, desc_path: String, desc_id: String) -> bool {
         let Some(tid) = self.st.selected_track.clone() else {
             self.st.set_status("select a track first".to_string());
-            return;
+            return false;
         };
         self.undo.record("add clap fx", &self.st.project);
         if self.st.project.add_clap_fx(&tid, &desc_path, &desc_id).is_some() {
             self.push_live();
             self.st.set_status(format!("+ {desc_id}"));
+            return true;
         }
+        false
     }
 
     fn set_clap_instrument(&mut self, desc_path: String, desc_id: String) {
@@ -649,6 +728,40 @@ impl DawView {
         let _ = self.send_command(SequencerCommand::SetClapParam { uid, param_id, value });
     }
 
+    fn open_flow_editor(&mut self, uid: &str, path: &str, id: &str) {
+        let imported = id.starts_with(daw_core::audio::flow::ID_PREFIX);
+        let launch = || -> anyhow::Result<()> {
+            let session = self.host.session.as_ref()
+                .ok_or_else(|| anyhow::anyhow!("The plugin editor needs a running session"))?;
+            let path = session.project_directory().join(path).canonicalize()?;
+            let path = path.to_str().ok_or_else(|| anyhow::anyhow!("invalid plugin path"))?;
+            anyhow::ensure!(daw_core::audio::clap::is_available_plugin_path(path),
+                "The plugin is outside the installed plugin directories");
+            let plugin = std::path::Path::new(path);
+            anyhow::ensure!(imported || (plugin.with_extension("editor.html").is_file()
+                && plugin.with_extension("editor.json").is_file()),
+                "Model-M editor assets are missing. Rebuild the local CLAP bundle.");
+            let mut command = std::process::Command::new("python3");
+            command
+                .args(["-c", include_str!("../../../plugins/flow-model-m/editor.py")])
+                .arg("--session").arg(&session.socket)
+                .args(["--slot", uid, "--plugin", path, "--open", "--parent"])
+                .arg(std::process::id().to_string());
+            if imported {
+                command.args(["--flow-id", id, "--javascript", include_str!("app/flow_editor.js")]);
+            } else {
+                command.args(["--javascript", include_str!("../../../plugins/flow-model-m/editor.js")]);
+            }
+            let mut child = command.spawn()?;
+            std::thread::spawn(move || { let _ = child.wait(); });
+            Ok(())
+        };
+        match launch() {
+            Ok(()) => self.st.set_status("Opening the plugin editor in a new browser window."),
+            Err(error) => self.st.set_status(format!("Plugin editor: {error}")),
+        }
+    }
+
     /// One CLAP slot section for the FX dock: header (name + remove) and
     /// generic param stepper rows from the relay-shipped metadata.
     fn clap_slot_section(
@@ -657,22 +770,47 @@ impl DawView {
         removable: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let theme = self.theme();
         let uid = slot.uid.clone();
-        let (name, params) = match self.st.clap_meta.get(&uid) {
-            Some((n, p)) => (n.clone(), p.clone()),
-            None => (format!("{} (loading…)", slot.id), Vec::new()),
-        };
+        let metadata = self.st.clap_meta.get(&uid);
+        let name = metadata.map(|(name, _)| name.as_str())
+            .or_else(|| self.st.clap_plugins.iter()
+                .find(|plugin| plugin.id == slot.id && plugin.path == slot.path)
+                .map(|plugin| plugin.name.as_str()))
+            .unwrap_or(&slot.id);
+        let params = metadata.map_or(&[][..], |(_, params)| params.as_slice());
+        let expanded = self.fx_slot_details.as_ref() == Some(&uid);
 
         let mut header = div()
             .flex()
             .items_center()
-            .gap_2()
-            .h(px(22.))
-            .child(div().text_color(rgb(TEXT)).child(format!("⌁ {name}")));
+            .gap_1()
+            .children((!params.is_empty()).then(|| {
+                let uid = uid.clone();
+                theme.cell_btn_with_help(format!("fx-details-{uid}"), if expanded { "▾" } else { "▸" },
+                    expanded, self.accent(), "Plugin parameters".into())
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.fx_slot_details = (!expanded).then(|| uid.clone());
+                        cx.notify();
+                    }))
+            }))
+            .child(div().flex_1().min_w_0().truncate().text_color(rgb(theme.text)).child(name.to_owned()));
+        if slot.id == model_m_midi::PLUGIN_ID || slot.id.starts_with(daw_core::audio::flow::ID_PREFIX) {
+            let editor_uid = uid.clone();
+            let editor_path = slot.path.clone();
+            let editor_id = slot.id.clone();
+            header = header.child(
+                theme.cell_btn(format!("editor-{uid}"), "Open editor", false, theme.panel_alt)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.open_flow_editor(&editor_uid, &editor_path, &editor_id);
+                        cx.notify();
+                    })),
+            );
+        }
         if removable {
             let uid_x = uid.clone();
             header = header.child(
-                cell_btn(format!("clapx-{uid}"), "✕", false, PANEL_ALT).on_click(cx.listener(
+                theme.cell_btn(format!("clapx-{uid}"), "✕", false, theme.panel_alt).on_click(cx.listener(
                     move |this, _e, _w, cx| {
                         this.remove_clap_fx(&uid_x);
                         cx.notify();
@@ -681,7 +819,7 @@ impl DawView {
             );
         }
 
-        let rows = params.into_iter().map(|info| {
+        let rows = params.iter().filter(|_| expanded).map(|info| {
             let cur = slot
                 .params
                 .get(&info.id.to_string())
@@ -690,39 +828,40 @@ impl DawView {
             let stepped=info.stepped;
             let step=if stepped {((info.max-info.min)/20.).round().max(1.)} else {((info.max-info.min)/20.).max(1e-6)};
             let (uid_d, uid_i, uid_r) = (uid.clone(), uid.clone(), uid.clone());
-            let (lo, hi, id) = (info.min, info.max, info.id);
+            let (lo, hi, id, default) = (info.min, info.max, info.id, info.default);
             if info.readonly {
-                return div().flex().gap_2().h(px(26.)).flex_shrink_0().text_color(rgb(TEXT_DIM)).child(info.name).child("Read only");
+                return div().flex().gap_2().h(px(26.)).flex_shrink_0().text_color(rgb(theme.text_dim)).child(info.name.clone()).child("Read only");
             }
             div()
                 .flex()
                 .items_center()
                 .gap_2()
                 .h(px(26.)).flex_shrink_0()
-                .child(div().w(px(72.)).flex_shrink_0().whitespace_nowrap().overflow_hidden().text_color(rgb(TEXT_DIM)).child(info.name.clone()))
-                .child(cell_btn(format!("cp-{uid}-{id}"), "−", false, PANEL_ALT).on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
+                .child(div().w(px(72.)).flex_shrink_0().whitespace_nowrap().overflow_hidden().text_color(rgb(theme.text_dim)).child(info.name.clone()))
+                .child(theme.cell_btn(format!("cp-{uid}-{id}"), "−", false, theme.panel_alt).on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
                     let d=if e.modifiers().shift && !stepped {step/10.} else {step};
                     let value=if stepped {(cur-d).round()} else {cur-d};
                     this.nudge_clap_param(uid_d.clone(), id, value.clamp(lo, hi));
                     cx.notify();
                 })))
-                .child(div().w(px(64.)).flex_shrink_0().whitespace_nowrap().text_color(rgb(TEXT)).child(format!("{cur:.2}")))
-                .child(cell_btn(format!("cp+{uid}-{id}"), "+", false, PANEL_ALT).on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
+                .child(div().w(px(64.)).flex_shrink_0().whitespace_nowrap().text_color(rgb(theme.text)).child(format!("{cur:.2}")))
+                .child(theme.cell_btn(format!("cp+{uid}-{id}"), "+", false, theme.panel_alt).on_click(cx.listener(move |this, e: &gpui::ClickEvent, _w, cx| {
                     let d=if e.modifiers().shift && !stepped {step/10.} else {step};
                     let value=if stepped {(cur+d).round()} else {cur+d};
                     this.nudge_clap_param(uid_i.clone(), id, value.clamp(lo, hi));
                     cx.notify();
                 })))
-                .child(cell_btn(format!("cp-reset-{uid}-{id}"),"Reset",false,PANEL_ALT).on_click(cx.listener(move |this,_,_,cx| {
-                    this.nudge_clap_param(uid_r.clone(),id,info.default); cx.notify();
+                .child(theme.cell_btn(format!("cp-reset-{uid}-{id}"),"Reset",false,theme.panel_alt).on_click(cx.listener(move |this,_,_,cx| {
+                    this.nudge_clap_param(uid_r.clone(), id, default); cx.notify();
                 })))
         });
 
-        div().flex().flex_col().gap_1().child(header).children(rows)
+        div().flex().flex_col().gap_1().p_1().rounded_md().bg(rgb(theme.bg)).child(header).children(rows)
     }
 
     /// Clickable chips for the selected track's patterns; highlights the open one.
     fn pattern_picker(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let sel = self.st.selected_pattern_id();
         let chips = self.st.track_pattern_ids().into_iter().map(|pid| {
             let name = self
@@ -742,8 +881,8 @@ impl DawView {
                 .rounded_md()
                 .cursor_pointer()
                 .whitespace_nowrap()
-                .bg(rgb(if is_sel { PANEL_ALT } else { PANEL }))
-                .text_color(rgb(if is_sel { TEXT } else { TEXT_DIM }))
+                .bg(rgb(if is_sel { theme.panel_alt } else { theme.panel }))
+                .text_color(rgb(if is_sel { theme.text } else { theme.text_dim }))
                 .child(name.clone())
                 .on_click(cx.listener(move |this, e: &gpui::ClickEvent, w, cx| {
                     if e.click_count() >= 2 {
@@ -760,8 +899,8 @@ impl DawView {
         let editor = matches!(&self.st.renaming, Some(RenameTarget::Pattern(_)))
             .then(|| self.rename_editor(cx));
         div().flex_shrink_0().child(div().id("pattern-picker-scroll")
-            .overflow_x_scroll().flex().gap_1().px_2().py_1().bg(rgb(BG))
-            .border_b_1().border_color(rgb(BORDER)).children(editor).children(chips))
+            .overflow_x_scroll().flex().gap_1().px_2().py_1().bg(rgb(theme.bg))
+            .border_b_1().border_color(rgb(theme.border)).children(editor).children(chips))
     }
 
     /// Push a track's *effective* mute (own flag OR solo-silenced) to the engine.
@@ -861,9 +1000,11 @@ impl DawView {
     }
 
     fn new_project(&mut self) {
+        self.host.disable_track_monitor();
         if self.playing || self.midi_recording { self.stop(); }
         self.undo.record("new project", &self.st.project);
         self.st.project = daw_core::project::Project::default_project();
+        self.midi_track = None;
         self.st.project_path = None;
         self.st.file_revision = None;
         // An untouched new project is not "unsaved work".
@@ -874,6 +1015,7 @@ impl DawView {
         self.st.selected_return = None;
         self.st.arrange_scroll_x = 0.;
         self.st.arrange_scroll_y = 0.;
+        self.piano_scrolled_pattern = None;
         self.st.peaks_cache.clear();
         self.st.peaks_dur_cache.clear();
         self.waveform_failed.clear();
@@ -1039,6 +1181,7 @@ impl DawView {
     fn load_project(&mut self, path: std::path::PathBuf) {
         match daw_core::project::format::load(&path) {
             Ok(project) => {
+                self.host.disable_track_monitor();
                 // A loaded file is a new document with its own history. Keeping
                 // the old steps let Ctrl+Z put the previous song under the new
                 // file's path, where Ctrl+S would overwrite the wrong file.
@@ -1050,14 +1193,16 @@ impl DawView {
                     let _ = self.send_command(SequencerCommand::LoadProject(project.clone()));
                 }
                 self.playing = false;
+                self.piano_scrolled_pattern = None;
                 // Keep the musician's workspace (layout, zoom, JAM, accent).
                 let old = std::mem::replace(&mut self.st, HeadlessState::from_project(project, Some(path.clone())));
-                self.st.browser_w = old.browser_w; self.st.mixer_w = old.mixer_w; self.st.dock_h = old.dock_h;
-                self.st.browser_open = old.browser_open; self.st.mixer_open = old.mixer_open;
+                self.st.mixer_h = old.mixer_h; self.st.dock_h = old.dock_h;
+                self.st.mixer_open = old.mixer_open;
                 self.st.arrange_zoom = old.arrange_zoom; self.st.arrange_full = old.arrange_full;
                 self.st.accent_idx = old.accent_idx; self.st.jam_mode = old.jam_mode;
                 self.st.active_dock = old.active_dock; self.st.browser_category = old.browser_category;
                 self.st.clap_plugins = old.clap_plugins;
+                self.midi_track = None;
                 self.jam_reported = None;
                 self.sync_midi_strip();
                 self.waveform_failed.clear();
@@ -1075,14 +1220,18 @@ impl DawView {
     fn pump(&mut self) -> bool {
         let mut changed = self.pump_ampforge();
         if let Some(session) = &self.host.session {
+            let playing = session.playing();
             if self.last_session_poll.elapsed() >= std::time::Duration::from_millis(50) {
             self.last_session_poll = std::time::Instant::now();
+            let live_status = Some(session.status_line());
+            changed |= self.live_status != live_status;
+            self.live_status = live_status;
             match session.sync(&mut self.st.project) {
                 Ok(updated) => {
                     changed |= updated;
                     // An agent's edit must not yank the musician's selection
                     // back to the first track; only repair what vanished.
-                    if updated { self.st.reconcile_selection(); self.sync_midi_strip(); }
+                    if updated { self.validate_track_monitor(); self.st.reconcile_selection(); self.sync_midi_strip(); }
                 }
                 Err(e) => {
                     let text = format!("{e} — press Sync session to accept the shared version");
@@ -1090,7 +1239,6 @@ impl DawView {
                 }
             }
             }
-            let playing = session.playing();
             changed |= self.playing != playing;
             self.playing = playing;
         }
@@ -1257,14 +1405,15 @@ impl DawView {
         }
 
         // 0d. CLAP discovery results (once) + per-instance param metadata.
-        if let Some(found) = self.clap_scan.lock().ok().and_then(|mut s| s.take()) {
-            // Only announce CLAP discovery when something turned up — most
-            // users have no CLAP plugins, and "0 plugins found" reads like an error.
-            if !found.is_empty() {
-                self.st.set_status(format!("CLAP: {} plugins found", found.len()));
+        if !self.clap_scanning.load(Ordering::Acquire) {
+            if let Some(found) = self.clap_scan.lock().ok().and_then(|mut s| s.take()) {
+                if !found.is_empty() {
+                    self.st.set_status(format!("{} plugins found", found.len()));
+                }
+                self.st.clap_plugins = found;
+                changed = true;
             }
-            self.st.clap_plugins = found;
-            changed = true;
+            changed |= self.pump_plugin_import();
         }
         while let Ok((uid, name, params)) = self.host.clap_meta_rx.try_recv() {
             self.st.clap_meta.insert(uid, (name, params));
@@ -1272,15 +1421,12 @@ impl DawView {
         }
 
         // 1. MIDI input → preview the selected track / route CC.
+        let mut model_m_updates = std::collections::BTreeMap::new();
         while let Ok(ev) = self.host.midi_ev_rx.try_recv() {
             changed = true;
             match ev {
                 daw_io::midi::MidiEvent::NoteOn { pitch, velocity } => {
-                    if let Some(tid) = self.st.selected_track.clone() {
-                        let _ = self.send_command(SequencerCommand::PreviewNote {
-                            track_id: tid, pitch, velocity,
-                        });
-                    }
+                    // The MIDI input callback has already sent the note to the selected strip.
                     if self.midi_recording {
                         if let Some((_, len)) = self.open_pr_pattern() {
                             let ph = self.st.playhead();
@@ -1289,11 +1435,6 @@ impl DawView {
                     }
                 }
                 daw_io::midi::MidiEvent::NoteOff { pitch } => {
-                    if let Some(tid) = self.st.selected_track.clone() {
-                        let _ = self.send_command(SequencerCommand::PreviewNoteOff {
-                            track_id: tid, pitch,
-                        });
-                    }
                     if self.midi_recording {
                         if let Some((idx, len)) = self.open_pr_pattern() {
                             let ph = self.st.playhead();
@@ -1304,10 +1445,24 @@ impl DawView {
                     }
                 }
                 daw_io::midi::MidiEvent::ControlChange { cc, value } => {
+                    if model_m_midi::Control::midi_cc(cc, value).is_some_and(
+                        |control| self.collect_model_m_control(control, &mut model_m_updates)
+                    ) { continue; }
                     let ch = self.host.midi_channel.load(std::sync::atomic::Ordering::Relaxed);
                     let _ = self.send_command(SequencerCommand::RawCC { channel: ch, cc, value });
                 }
+                daw_io::midi::MidiEvent::KeyLab(control) => {
+                    if let Some(control) = model_m_midi::Control::keylab(control) {
+                        self.collect_model_m_control(control, &mut model_m_updates);
+                    }
+                }
             }
+        }
+        self.apply_model_m_controls(model_m_updates);
+        if self.st.active_dock == DockTab::PianoRoll && !self.st.arrange_full {
+            let pressed = self.piano_pressed_keys();
+            changed |= self.piano_note_lights != pressed;
+            self.piano_note_lights = pressed;
         }
 
         // 2. JAM hot-reload: reload the project file when its mtime changes.
@@ -1386,6 +1541,7 @@ impl DawView {
 
     /// Transport master-bus meter (post-limiter, from the engine mixer).
     fn viz_meter(&self) -> gpui::Div {
+        let theme = self.theme();
         let accent = self.accent();
         let peak = self.host.master_meter.read().0.min(1.0);
         let bars = 12usize;
@@ -1394,7 +1550,7 @@ impl DawView {
             let on = i < lit;
             let color = if i >= bars - 2 { RECORD } else if i >= bars - 5 { METER_WARN } else { accent };
             div().w(px(4.)).h(px(12.)).rounded_sm()
-                .bg(rgb(if on { color } else { PANEL_ALT }))
+                .bg(rgb(if on { color } else { theme.panel_alt }))
         });
         div().flex().items_center().gap_1().children(cells)
     }
@@ -1429,20 +1585,18 @@ pub(crate) enum ConfirmThen { Close, New, Open }
 
 /// Top menu-bar dropdown identity.
 #[derive(Clone, Copy, PartialEq, Eq)]
-pub enum TopMenu { File, Settings }
+pub enum TopMenu { File, Settings, AgentSession, Microphone, Midi }
 
-/// Marker payload for a panel-splitter drag (resizing, not drop). Shared by all
-/// Which panel splitter a resize drag belongs to. `on_drag_move` fires for every
-/// `ResizeDrag` handler regardless of which splitter was grabbed, so the payload
-/// must carry identity and each handler gates on it — otherwise dragging one
-/// splitter would also resize the other panels.
+/// Identify the splitter being dragged, since both receive drag-move events.
 #[derive(Clone, Copy, PartialEq)]
-enum Splitter { Dock, Browser, Mixer }
+enum Splitter { Dock, Mixer }
 
-#[derive(Clone)]
-struct ResizeDrag(Splitter);
+struct ResizeDrag {
+    panel: Splitter,
+    height: f32,
+    origin: std::cell::Cell<Option<gpui::Pixels>>,
+}
 
-/// Invisible drag preview for splitter drags (we only use the move stream).
 /// Mark rects (x, y, w, h in px) previewing `pattern` inside a clip that is
 /// `clip_w`×`clip_h` px and covers `span_ticks` of timeline; the pattern
 /// loops at its natural period. Capped at 256 marks.
@@ -1478,15 +1632,15 @@ fn clip_preview_marks_in(
     'reps: while (rep_start as f32) < span_ticks {
         match pattern {
             Pattern::PianoRoll(pr) => {
-                if pr.notes.is_empty() {
+                let Some(lo) = pr.active_notes().map(|n| n.pitch).min() else {
                     break;
-                }
-                let lo = pr.notes.iter().map(|n| n.pitch).min().unwrap() as f32;
-                let hi = pr.notes.iter().map(|n| n.pitch).max().unwrap() as f32;
+                };
+                let lo = f32::from(lo);
+                let hi = pr.active_notes().map(|n| f32::from(n.pitch)).fold(lo, f32::max);
                 let range = (hi - lo).max(1.0);
                 let mark_h = 2.0f32;
                 let usable = (clip_h - mark_h - 2.0).max(1.0);
-                for n in &pr.notes {
+                for n in pr.active_notes() {
                     if out.len() >= CAP {
                         break 'reps;
                     }
@@ -1532,6 +1686,10 @@ fn clip_preview_marks_in(
     out
 }
 
+fn scrollbar_thumb(width: f32, max_scroll: f32) -> f32 {
+    (width * width / (width + max_scroll)).clamp(24_f32.min(width), width)
+}
+
 /// A stationary clipping window for manually scrolled track content.
 fn track_viewport() -> gpui::Div {
     div().relative().flex_1().min_h(px(0.)).min_w(px(0.)).overflow_hidden()
@@ -1546,18 +1704,20 @@ fn scroll_document(width: f32, height: f32, x: f32, y: f32) -> gpui::Div {
 
 /// One-line hover tooltip (clip names etc.).
 struct TextTooltip {
+    theme: Theme,
     text: SharedString,
 }
 impl Render for TextTooltip {
     fn render(&mut self, _window: &mut Window, _cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme;
         div()
             .px_2()
             .py_1()
             .rounded_md()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme.panel))
             .border_1()
-            .border_color(rgb(BORDER))
-            .text_color(rgb(TEXT))
+            .border_color(rgb(theme.border))
+            .text_color(rgb(theme.text))
             .whitespace_nowrap()
             .child(self.text.clone())
     }
@@ -1626,36 +1786,42 @@ impl Render for ClipDragPreview {
             .py_1()
             .rounded_md()
             .bg(rgb(self.color))
-            .text_color(rgb(BG))
+            .text_color(rgb(ON_CLIP))
             .whitespace_nowrap()
             .child(self.name.clone())
     }
 }
 
-/// A small clickable cell button used in track headers (toggle or stepper).
-/// `on` highlights it with `on_color`; the caller chains `.on_click(...)`.
+fn header_group() -> gpui::Div {
+    div().flex().flex_shrink_0().items_center().gap_1()
+}
+
+impl Theme {
+    fn header_divider(self) -> gpui::Div {
+        div().w(px(1.)).h(px(15.)).flex_shrink_0().bg(rgb(self.border))
+    }
+}
+
 impl Render for DawView {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.theme();
         // `render` is side-effect free: engine polling + the playhead mirror run on
         // the repaint timer (see `run`), which only re-renders when playing or when
         // something changed — so an idle window doesn't rebuild the UI 60×/second.
 
         // Window width — a conservative bound for timeline virtualization.
         let vis_w = f32::from(window.viewport_size().width);
-        let layout = layout::PanelLayout::new(vis_w, window_frame::content_height(window),
-            self.st.browser_open.then_some(self.st.browser_w),
-            self.st.mixer_open.then_some(self.st.mixer_w), self.st.dock_h, self.sf2_missing);
-        self.st.dock_h = layout.dock_height;
+        let content_h = window_frame::content_height(window);
+        let layout = layout::PanelLayout::new(content_h, &self.st, self.sf2_missing);
         let timeline_width = self.timeline_width(window);
-        self.st.arrange_scroll_x = self.st.arrange_scroll_x.clamp(0.,
-            (self.st.project.song_bars() as f32 * self.bar_w() - timeline_width).max(0.));
+        let max_x = self.timeline_max_scroll(timeline_width);
+        self.st.arrange_scroll_x = self.st.arrange_scroll_x.clamp(0., max_x);
         // Page-follow: when playback carries the playhead out of the visible
         // timeline, bring it back one bar from the left edge. A playhead the
         // musician scrolled away from is left alone until it re-enters view.
         {
             let bw = self.bar_w();
             let x = self.st.playhead() as f32 / daw_core::sequencer::TICKS_PER_BAR as f32 * bw;
-            let max_x = (self.st.project.song_bars() as f32 * bw - timeline_width).max(0.);
             let mut visible = x >= self.st.arrange_scroll_x && x <= self.st.arrange_scroll_x + timeline_width;
             if self.playing && !visible && self.playhead_was_visible {
                 self.st.arrange_scroll_x = (x - bw).clamp(0., max_x);
@@ -1665,7 +1831,7 @@ impl Render for DawView {
         }
         // Re-clamp vertical track scroll so a window resize, dock drag, or removed
         // track can never leave the view scrolled past the last track.
-        let max_scroll_y = self.tracks_max_scroll_y(window_frame::content_height(window));
+        let max_scroll_y = self.tracks_max_scroll_y(content_h);
         if self.st.arrange_scroll_y > max_scroll_y {
             self.st.arrange_scroll_y = max_scroll_y;
         }
@@ -1676,10 +1842,10 @@ impl Render for DawView {
         let tick = self.st.playhead();
         let bar = tick / daw_core::sequencer::TICKS_PER_BAR + 1;
         let beat = (tick % daw_core::sequencer::TICKS_PER_BAR) / daw_core::sequencer::TICKS_PER_BEAT + 1;
-        let live_status = self.host.session.as_ref().map(|s| s.status_line());
+        let live_status = self.live_status.clone();
         let engine_error = self.engine_error_shown.clone();
         let status_text = if self.st.status.is_empty() {
-            live_status.unwrap_or_else(|| "Select a clip to edit · Wheel: timeline scroll · Ctrl+wheel: zoom · Shift+wheel: tracks".to_string())
+            live_status.unwrap_or_else(|| "Select a clip to edit · Wheel: tracks · Shift+wheel: timeline · Ctrl+wheel: zoom".to_string())
         } else {
             live_status.map(|s| format!("{} · {s}", self.st.status)).unwrap_or_else(|| self.st.status.clone())
         };
@@ -1689,34 +1855,18 @@ impl Render for DawView {
             _ => status_text,
         };
 
-        let transport = div()
-            .id("transport")
-            .overflow_x_scroll()
-            .whitespace_nowrap()
-            .flex()
-            .items_center()
-            .gap_2()
-            .px_4()
-            .h(px(48.))
-            .flex_shrink_0()
-            .bg(rgb(PANEL))
-            .text_color(rgb(TEXT))
-            .border_b_1()
-            .border_color(rgb(BORDER))
-            .children(self.host.session.as_ref().map(|_| {
-                cell_btn("sync-session", "Sync session", false, PANEL_ALT)
-                    .on_click(cx.listener(|this, _, _, cx| { this.reconcile_session(); cx.notify(); }))
-            }))
+        let playback = header_group()
             // Play / Pause toggle.
             .child(
                 div()
                     .id("transport-play").flex_shrink_0()
-                    .px_4()
+                    .px_3()
                     .py_1()
-                    .rounded_md()
+                    .rounded_sm()
+                    .debug_selector(|| "transport-play".into())
                     .cursor_pointer()
                     .bg(rgb(accent))
-                    .text_color(rgb(BG))
+                    .text_color(rgb(theme::contrast_text(accent)))
                     .active(|s| s.opacity(0.8))
                     .child(if playing { "⏸ Pause" } else { "▶ Play" })
                     .on_click(cx.listener(|this, _ev, _window, cx| {
@@ -1724,7 +1874,7 @@ impl Render for DawView {
                         cx.notify();
                     })),
             )
-            .child(pill("⏹ Stop", PANEL_ALT, TEXT).id("transport-stop").cursor_pointer().on_click(
+            .child(pill("■ Stop", theme.panel_alt, theme.text).id("transport-stop").debug_selector(|| "transport-stop".into()).cursor_pointer().on_click(
                 cx.listener(|this, _ev, _window, cx| {
                     this.stop();
                     cx.notify();
@@ -1735,17 +1885,17 @@ impl Render for DawView {
                 use daw_core::audio::input::RecordPhase;
                 let audio_sel = self.selected_track_is_audio();
                 let (label, bg, fg) = if self.audio_take_active && self.audio_rec.phase != RecordPhase::AwaitingRoll {
-                    ("⏺ REC", RECORD, BG)
+                    ("⏺ REC", RECORD, ON_CLIP)
                 } else if audio_sel {
                     match self.audio_rec.phase {
-                        RecordPhase::Idle => ("⏺ Rec", PANEL_ALT, TEXT),
-                        RecordPhase::Armed => ("⏺ Armed", METER_WARN, BG),
-                        RecordPhase::AwaitingRoll => ("⏺ …", RECORD, BG),
-                        RecordPhase::Recording => ("⏺ REC", RECORD, BG),
+                        RecordPhase::Idle => ("⏺ Rec", theme.panel_alt, theme.text),
+                        RecordPhase::Armed => ("⏺ Armed", METER_WARN, ON_CLIP),
+                        RecordPhase::AwaitingRoll => ("⏺ …", RECORD, ON_CLIP),
+                        RecordPhase::Recording => ("⏺ REC", RECORD, ON_CLIP),
                     }
                 } else {
-                    ("⏺ Rec", if recording { RECORD } else { PANEL_ALT },
-                     if recording { BG } else { rgb_record_fg(playing) })
+                    ("⏺ Rec", if recording { RECORD } else { theme.panel_alt },
+                     if recording { ON_CLIP } else { theme.record_text })
                 };
                 pill(label, bg, fg)
                     .id("transport-rec")
@@ -1755,186 +1905,148 @@ impl Render for DawView {
                         cx.notify();
                     }))
             })
-            .children(self.input_meter())
-            .child(self.amp_pill(cx))
-            .child(self.amp_setup_button(cx))
             .child(
                 div()
+                    .debug_selector(|| "transport-position".into())
                     .flex()
-                    .items_center()
-                    .gap_1()
-                    .child(
-                        pill("−", PANEL_ALT, TEXT).id("bpm-down").cursor_pointer().on_click(
-                            cx.listener(|this, _e, _w, cx| {
-                                this.nudge_bpm(-1.0);
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(div().min_w(px(70.)).text_color(rgb(TEXT)).child(format!("{bpm:.0} BPM")))
-                    .child(
-                        pill("+", PANEL_ALT, TEXT).id("bpm-up").cursor_pointer().on_click(
-                            cx.listener(|this, _e, _w, cx| {
-                                this.nudge_bpm(1.0);
-                                cx.notify();
-                            }),
-                        ),
-                    ),
-            )
-            .child(
-                div()
-                    .ml_auto()
-                    .flex()
-                    .items_center()
-                    .gap_2()
-                    .child(div().text_color(rgb(TEXT_DIM)).child(format!("{bar}.{beat}  ·  tick {tick}")))
-                    .child(self.viz_meter())
-                    .child(pill(format!("{}{}", self.project_name(), if self.is_dirty_for_display() { " · unsaved" } else { "" }), PANEL_ALT, TEXT))
-                    .child(pill(if self.st.jam_mode { "JAM ●" } else { "JAM" }, PANEL_ALT,
-                                if self.st.jam_mode { accent } else { TEXT }).id("jam").cursor_pointer()
-                        .on_click(cx.listener(|this, _e, _w, cx| { this.st.toggle_jam(); cx.notify(); })))
-                    .child(pill("Browser", PANEL_ALT, if layout.browser.is_some() { accent } else { TEXT })
-                        .id("toggle-browser").cursor_pointer().on_click(cx.listener(|this, _, _, cx| {
-                            this.st.browser_open = !this.st.browser_open; cx.notify();
-                        })))
-                    .child(
-                        pill("Mixing", PANEL_ALT, if self.st.active_dock == DockTab::Mixing { accent } else { TEXT })
-                            .id("toggle-mixer")
-                            .debug_selector(|| "toggle-mixer".into())
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _ev, _w, cx| {
-                                this.st.active_dock = DockTab::Mixing;
-                                this.st.arrange_full = false;
-                                cx.notify();
-                            })),
-                    )
-                    .child(
-                        pill("Arrange ⛶", PANEL_ALT, if self.st.arrange_full { accent } else { TEXT })
-                            .id("toggle-arrange")
-                            .cursor_pointer()
-                            .on_click(cx.listener(|this, _ev, _w, cx| {
-                                this.st.arrange_full = !this.st.arrange_full;
-                                cx.notify();
-                            })),
-                    )
-                    .child(pill(
-                        match &self.host.midi_device {
-                            Some(d) => format!("🎹 {}", trunc(d, 14)),
-                            None => "🎹 —".to_string(),
-                        },
-                        PANEL_ALT, TEXT_DIM,
-                    )),
-            );
-
-        let main_row = if self.st.active_dock == DockTab::Mixing && !self.st.arrange_full {
-            div().flex_1().min_h_0().min_w_0().flex().flex_col()
-                .child(self.editor_tabs(cx))
-                .child(self.mixing_workspace(vis_w, cx))
-        } else if self.st.arrange_full {
-            // Full-window Arrange mode: just track-headers + timeline, no browser/dock/mixer.
-            div()
-                .flex_1()
-                .flex()
-                .min_h(px(0.))
-                .child(self.track_headers(cx))
-                .child(self.timeline(cx, timeline_width))
-        } else {
-            // Normal layout: browser | center[track_headers+timeline / dock / editor_dock] [| mixer].
-            // Center: track/arrange canvas above the editor dock.
-            // Horizontal splitter above the editor dock (drag to set dock height).
-            let dock_rz = div()
-                .id("rz-dock")
-                .h(px(5.))
-                .flex_shrink_0()
-                .bg(rgb(PANEL_ALT))
-                .cursor_pointer()
-                .on_drag(ResizeDrag(Splitter::Dock), |_, _, _, cx| cx.new(|_| EmptyDrag))
-                .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ResizeDrag>, window, cx| {
-                    if e.drag(cx).0 != Splitter::Dock { return; }
-                    let vh = f32::from(window.viewport_size().height);
-                    this.st.dock_h = (vh - f32::from(e.event.position.y)).clamp(80.0, (vh - 160.0).max(80.0));
-                    cx.notify();
-                }));
-
-            let center = div()
-                .flex_1()
-                .flex()
-                .flex_col()
-                .min_h(px(0.))
-                // Allow center to shrink below its content width so the mixer dock
-                // (a flex_shrink_0 sibling) isn't pushed off the right edge; the
-                // timeline clips via overflow_hidden.
-                .min_w(px(0.))
-                .child(
-                    div()
-                        .flex_1()
-                        .flex()
-                        .min_h(px(0.))
-                        .min_w(px(0.))
-                        .child(self.track_headers(cx))
-                        .child(self.timeline(cx, timeline_width)),
-                )
-                .child(dock_rz)
-                .child(self.editor_dock(cx));
-
-            let browser = layout.browser.map(|width| self.browser(cx, width));
-            // Vertical splitter between browser and center (drag to set browser width).
-            let browser_rz = div()
-                .id("rz-browser")
-                .w(px(5.))
-                .flex_shrink_0()
-                .bg(rgb(PANEL_ALT))
-                .cursor_pointer()
-                .on_drag(ResizeDrag(Splitter::Browser), |_, _, _, cx| cx.new(|_| EmptyDrag))
-                .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ResizeDrag>, _w, cx| {
-                    if e.drag(cx).0 != Splitter::Browser { return; }
-                    this.st.browser_w = f32::from(e.event.position.x).clamp(120.0, 520.0);
-                    cx.notify();
-                }));
-            let mut row = div()
-                .flex_1()
-                .flex()
-                .min_h(px(0.))
-                .children(browser)
-                .children(layout.browser.map(|_| browser_rz))
-                .child(center);
-            if let Some(width) = layout.mixer {
-                // Vertical splitter between center and mixer (drag to set mixer width).
-                let mixer_rz = div()
-                    .id("rz-mixer")
-                    .w(px(5.))
+                    .flex_col()
+                    .justify_center()
                     .flex_shrink_0()
-                    .bg(rgb(PANEL_ALT))
-                    .cursor_pointer()
-                    .on_drag(ResizeDrag(Splitter::Mixer), |_, _, _, cx| cx.new(|_| EmptyDrag))
-                    .on_drag_move(cx.listener(|this, e: &DragMoveEvent<ResizeDrag>, window, cx| {
-                        if e.drag(cx).0 != Splitter::Mixer { return; }
-                        let vw = f32::from(window.viewport_size().width);
-                        this.st.mixer_w = (vw - f32::from(e.event.position.x)).clamp(140.0, 520.0);
-                        cx.notify();
-                    }));
-                row = row.child(mixer_rz).child(self.mixer(cx, width));
-            }
-            row
-        };
+                    .min_w(px(110.))
+                    .px_2()
+                    .rounded_sm()
+                    .bg(rgb(theme.bg))
+                    .child(div().font_family("monospace").text_size(px(15.)).line_height(px(18.)).text_color(rgb(theme.text))
+                        .child(transport::playhead_time(tick, bpm)))
+                    .child(div().font_family("monospace").text_size(px(10.)).line_height(px(12.)).text_color(rgb(theme.text_dim))
+                        .child(format!("{bar}.{beat}  ·  tick {tick}"))),
+            );
+        let tempo = header_group()
+            .child(theme.cell_btn("bpm-down", "−", false, theme.panel_alt)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.nudge_bpm(-1.0);
+                    cx.notify();
+                })))
+            .child(div().min_w(px(59.)).font_family("monospace").text_center()
+                .text_color(rgb(theme.text)).child(format!("{bpm:.0} BPM")))
+            .child(theme.cell_btn("bpm-up", "+", false, theme.panel_alt)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.nudge_bpm(1.0);
+                    cx.notify();
+                })));
+        let workspace = header_group()
+            .child(theme.cell_btn("jam", "JAM", self.st.jam_mode, accent)
+                .on_click(cx.listener(|this, _, _, cx| {
+                    this.st.toggle_jam();
+                    cx.notify();
+                })))
+            .child(theme.cell_btn_with_help(
+                "toggle-mixer", "Mixer", self.st.mixer_open && !self.st.arrange_full, accent,
+                "Show or hide the mixer below the arrangement".into(),
+            ).on_click(cx.listener(|this, _, _, cx| {
+                this.st.mixer_open = this.st.arrange_full || !this.st.mixer_open;
+                this.st.arrange_full = false;
+                cx.notify();
+            })))
+            .child(theme.cell_btn_with_help(
+                "toggle-arrange", "Arrange ⛶", self.st.arrange_full, accent,
+                "Expand the arrangement or restore the lower panels".into(),
+            ).on_click(cx.listener(|this, _, _, cx| {
+                this.st.arrange_full = !this.st.arrange_full;
+                cx.notify();
+            })));
+
+        let transport = div()
+            .id("transport")
+            .flex()
+            .items_center()
+            .h(px(TRANSPORT_H))
+            .gap_2()
+            .px_2()
+            .flex_shrink_0()
+            .bg(rgb(theme.panel))
+            .text_size(px(12.))
+            .line_height(px(16.))
+            .text_color(rgb(theme.text))
+            .border_b_1()
+            .border_color(rgb(theme.border))
+            .child(div().id("transport-scroll").flex_1().min_w_0().h_full()
+                .overflow_x_scroll().whitespace_nowrap()
+                .flex().items_center().gap_2()
+                .child(playback)
+                .child(theme.header_divider())
+                .child(tempo)
+                .child(self.cycle_controls(cx))
+                .child(theme.header_divider())
+                .child(self.key_controls(cx))
+                .children(self.host.session.as_ref().map(|_| {
+                    theme.cell_btn("sync-session", "Sync", false, theme.panel_alt)
+                        .on_click(cx.listener(|this, _, _, cx| {
+                            this.reconcile_session();
+                            cx.notify();
+                        }))
+                })))
+            .child(theme.header_divider())
+            .child(workspace);
+
+        let arrangement = div()
+            .debug_selector(|| "arrangement".into())
+            .flex_1()
+            .flex()
+            .min_h_0()
+            .min_w_0()
+            .child(self.track_headers(cx))
+            .child(self.timeline(cx, timeline_width));
+        let mixer = layout.mixer_height.map(|height| {
+            div().h(px(height)).flex_shrink_0().overflow_hidden().flex().flex_col()
+                .child(self.mixing_workspace(vis_w, cx))
+        });
+        let editor = layout.editor_height.map(|height| self.editor_dock(height, cx));
+        let main_row = div().flex_1().min_h_0().min_w_0().flex().flex_col()
+            .child(arrangement)
+            .children(layout.mixer_height.map(|height| {
+                self.workspace_splitter(Splitter::Mixer, height, layout.editor_height.is_some(), cx)
+            }))
+            .children(mixer)
+            .children(layout.editor_height.map(|height| {
+                self.workspace_splitter(Splitter::Dock, height, true, cx)
+            }))
+            .children(editor)
+            .children((layout.mixer_height.is_some() && layout.editor_height.is_none())
+                .then(|| self.editor_tabs(true, cx)));
 
         let toolbar = self.song_toolbar(cx);
 
-        let status = div().h(px(18.)).px_4().flex_shrink_0().bg(rgb(BG)).text_color(rgb(TEXT_DIM))
-            .whitespace_nowrap().overflow_hidden()
-            .child(SharedString::from(status_text));
+        let project_name = self.project_name();
+        let dirty = self.is_dirty_for_display();
+        let status = div()
+            .h(px(STATUS_H)).px_2().flex_shrink_0().flex().items_center().gap_2()
+            .bg(rgb(theme.panel)).border_t_1().border_color(rgb(theme.border)).text_size(px(11.)).line_height(px(16.))
+            .text_color(rgb(theme.text_dim))
+            .child(div().id("status-project").max_w(px(200.)).min_w_0().truncate().text_color(rgb(theme.text))
+                .child(if dirty { format!("{project_name} · unsaved") } else { project_name.to_string() })
+                .tooltip(move |_, cx| cx.new(|_| TextTooltip { theme, text: project_name.clone() }).into()))
+            .child(theme.header_divider())
+            .child(div().flex_1().min_w_0().truncate().child(SharedString::from(status_text)))
+            .child(header_group()
+                .child(div().whitespace_nowrap().child(match &self.host.midi_device {
+                    Some(device) => format!("MIDI · {}", trunc(device, 20)),
+                    None => "MIDI · —".into(),
+                }))
+                .child(self.viz_meter()));
 
-        let menu_bar = self.menu_bar(cx);
+        let menu_bar = self.menu_bar(cx, vis_w);
+        let instrument_browser = self.instrument_browser(cx, window);
         // Loud, actionable banner when the soundfont is absent (audio disabled).
         let sf2_banner = self.sf2_missing.then(|| {
             div()
-                .h(px(22.))
+                .h(px(SOUNDFONT_BANNER_H))
                 .flex_shrink_0()
                 .flex()
                 .items_center()
                 .px_3()
                 .bg(rgb(RECORD))
-                .text_color(rgb(0xffffff))
+                .text_color(rgb(ON_CLIP))
                 .child("No soundfont — audio is disabled. Run  ./fetch-assets.sh  then restart.")
         });
         let overlay = self.menu_overlay(cx);
@@ -1947,7 +2059,7 @@ impl Render for DawView {
             .relative()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
+            .bg(rgb(theme.bg))
             .track_focus(&self.root_focus)
             .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, w, _| {
                 this.root_focus.focus(w);
@@ -1968,12 +2080,29 @@ impl Render for DawView {
                     cx.stop_propagation();
                     return;
                 }
-                if (ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform) && ev.keystroke.key == "s" && this.st.open_menu.is_none() {
+                let command = ev.keystroke.modifiers.control || ev.keystroke.modifiers.platform;
+                if command && ev.keystroke.key == "k" && this.st.open_menu.is_none() && !this.st.fx_window_open {
+                    this.focus_instrument_browser(w);
+                    cx.stop_propagation(); cx.notify(); return;
+                }
+                if command && ev.keystroke.key == "s" && this.st.open_menu.is_none() {
                     this.save_project(); cx.stop_propagation(); cx.notify(); return;
+                }
+                if ev.keystroke.key == "escape" && this.st.open_menu.is_none() && this.fx_library.open
+                    && (this.st.fx_window_open || this.fx_library.focus.is_focused(w))
+                {
+                    this.close_effect_library(w);
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
                 }
                 if ev.keystroke.key == "escape" && (this.st.open_menu.is_some() || this.st.fx_window_open) {
                     if this.st.open_menu.take().is_none() { this.st.fx_window_open = false; }
                     this.root_focus.focus(w);
+                    cx.stop_propagation();
+                    cx.notify();
+                } else if ev.keystroke.key == "escape" && this.st.browser_open {
+                    this.dismiss_instrument_browser(w);
                     cx.stop_propagation();
                     cx.notify();
                 } else if this.st.open_menu.is_some() {
@@ -1983,11 +2112,27 @@ impl Render for DawView {
                 }
             }))
             .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
-                if this.search_focus.is_focused(w) || this.rename_focus.is_focused(w) || this.focus.is_focused(w) { return; }
+                if this.search_focus.is_focused(w) || this.fx_library.focus.is_focused(w)
+                    || this.rename_focus.is_focused(w) || this.focus.is_focused(w) { return; }
                 let m = &ev.keystroke.modifiers;
                 if ev.keystroke.key == "space" && !m.control { this.toggle_play(); cx.notify(); return; }
                 if m.control && ev.keystroke.key == "s" { this.save_project(); cx.notify(); return; }
-                if ev.keystroke.key == "home" && !m.control { this.seek_to_bar(0); cx.notify(); return; }
+                if !m.control {
+                    match ev.keystroke.key.as_str() {
+                        "home" => {
+                            this.seek_to_tick(0);
+                            this.scroll_timeline_to(0., w);
+                            cx.notify();
+                            return;
+                        }
+                        "end" => {
+                            this.scroll_timeline_to(this.arrangement_end_offset(w), w);
+                            cx.notify();
+                            return;
+                        }
+                        _ => {}
+                    }
+                }
                 if !m.control {
                     return;
                 }
@@ -2004,30 +2149,17 @@ impl Render for DawView {
             .children(sf2_banner)
             .child(transport)
             .child(toolbar)
-            .child(status)
             .child(main_row)
+            .child(status)
+            .child(instrument_browser)
             .children(fx_overlay)
             .children(overlay)
             .children(input_overlay)
             .children(close_overlay);
-        window_frame::frame(content, window, cx.listener(|this, _, w, cx| {
+        window_frame::frame(theme, content, window, cx.listener(|this, _, w, cx| {
             if this.confirm_close(w, cx) { w.remove_window(); }
         }))
     }
-}
-
-/// Record pill text color: dim normally; this spike has no record state yet.
-fn rgb_record_fg(_playing: bool) -> u32 {
-    RECORD
-}
-
-/// One-pole low-pass filter magnitude at frequency `f` Hz given a normalised
-/// cutoff (0..1 → quadratic scale over [0, sr/2]).
-/// `|H(f)| = 1 / sqrt(1 + (f/fc)^2)`
-fn lp_magnitude(cutoff01: f32, f: f32, sr: u32) -> f32 {
-    let fc = cutoff01.clamp(0.0, 1.0).powi(2) * (sr as f32 / 2.0);
-    if fc <= 0.0 { return 0.0; }
-    1.0 / (1.0 + (f / fc).powi(2)).sqrt()
 }
 
 /// Entry point called from `src/main.rs` under `--gui`.
@@ -2068,9 +2200,6 @@ pub fn run(host: Host, project: Project, path: Option<PathBuf>, sf2_path: String
                 // Focus the root so window-level shortcuts (Ctrl+Z/Y) work
                 // before any input field is clicked.
                 view.read(cx).root_focus.clone().focus(window);
-                // Route live MIDI to the initially-selected track's strip.
-                view.read(cx).sync_midi_strip();
-
                 // Engine/IO poll loop (~60 Hz). Polling is cheap and always runs, but
                 // we only request a repaint (`cx.notify`) when the transport is playing
                 // (the playhead is moving) or `pump`/the playhead changed something —
@@ -2086,6 +2215,9 @@ pub fn run(host: Host, project: Project, path: Option<PathBuf>, sf2_path: String
                             .await;
                         let r = weak.update(cx, |v, cx| {
                             let mut repaint = v.pump();
+                            if v.st.fx_window_open {
+                                repaint |= v.output_analyzer.poll(&v.host);
+                            }
                             let tick = v.host.playback_tick.load(Ordering::Relaxed);
                             if tick != last_tick {
                                 v.st.set_playhead(tick);
@@ -2173,6 +2305,7 @@ mod tests {
     }
     impl Render for OverlayProbe {
         fn render(&mut self, _: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+            let theme = Theme::DARK;
             div().size_full().relative()
                 .child(div().id("covered-track").absolute().inset_0()
                     .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.track_presses += 1))
@@ -2185,7 +2318,7 @@ mod tests {
                         })))
                     .child(overlay_surface().id("probe-panel").absolute().left(px(40.)).top(px(40.)).w(px(180.)).h(px(120.))
                         .on_scroll_wheel(cx.listener(|this, _, _, _| this.effect_scrolls += 1))
-                        .child(cell_btn("probe-fx", "+", false, PANEL_ALT).w(px(60.)).h(px(40.))
+                        .child(theme.cell_btn("probe-fx", "+", false, theme.panel_alt).w(px(60.)).h(px(40.))
                             .on_click(cx.listener(|this, _, _, _| this.effect_clicks += 1)))))
         }
     }
@@ -2272,6 +2405,111 @@ mod tests {
     }
 
     #[gpui::test]
+    fn instrument_browser_opens_from_header_without_shifting_the_timeline(cx: &mut gpui::TestAppContext) {
+        let (host, commands, _audio) = Host::headless();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, Project::default_project(), None, String::new(), cx);
+            view.sf2_missing = false;
+            for (name, id) in [("Model-M Modular Synth", model_m_midi::PLUGIN_ID), ("Other Synth", "example.other")] {
+                view.st.clap_plugins.push(daw_core::audio::clap::ClapPluginDesc {
+                    path: "/tmp/daw-browser-test.clap".into(), id: id.into(), name: name.into(),
+                    vendor: "Example".into(), is_instrument: true, is_effect: false,
+                    features: Vec::new(),
+                });
+            }
+            view
+        });
+        cx.simulate_resize(size(px(800.), px(480.)));
+        cx.run_until_parked();
+        let search = cx.debug_bounds("browser-search").expect("search is visible");
+        assert_eq!(search.center().x, px(400.));
+        assert!(cx.debug_bounds("instrument-results").is_none());
+        let timeline_width = cx.update(|window, cx| view.read(cx).timeline_width(window));
+
+        cx.simulate_mouse_move(search.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        let results = cx.debug_bounds("instrument-results").expect("hover opens the library");
+        assert!(results.bottom() <= px(480.));
+        assert!(cx.debug_bounds("import-plugin").is_some());
+        cx.simulate_mouse_move(results.center(), None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(view.st.browser_open));
+        assert_eq!(cx.update(|window, cx| view.read(cx).timeline_width(window)), timeline_width);
+
+        let outside = gpui::point(px(30.), px(280.));
+        cx.simulate_mouse_move(outside, None, gpui::Modifiers::default());
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert!(!view.st.browser_open));
+        cx.simulate_click(outside, gpui::Modifiers::default());
+        cx.simulate_keystrokes("ctrl-k m o o g space m");
+        cx.run_until_parked();
+        view.read_with(cx, |view, _| assert_eq!(view.st.browser_search, "moog m"));
+        let model = cx.debug_bounds("clap-/tmp/daw-browser-test.clap-local.daw-ai.flow.model-m-v4").unwrap();
+        let filtered = cx.debug_bounds("instrument-results").unwrap();
+        assert!(filtered.bottom() - model.bottom() < px(18.), "only Model-M matches");
+        cx.simulate_click(model.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.st.pending_instrument.as_ref().map(|(_, _, id, _)| id.as_str()), Some(model_m_midi::PLUGIN_ID));
+        });
+        cx.simulate_click(model.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert!(matches!(&view.st.project.tracks[0].instrument,
+                daw_core::project::Instrument::Clap(slot) if slot.id == model_m_midi::PLUGIN_ID));
+        });
+        assert!(!commands.try_iter().any(|cmd| matches!(cmd, SequencerCommand::Play)));
+        cx.simulate_mouse_move(outside, None, gpui::Modifiers::default());
+        view.read_with(cx, |view, _| assert!(view.st.browser_open));
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| assert!(!view.st.browser_open));
+        cx.simulate_keystrokes("space");
+        assert!(commands.try_iter().any(|cmd| matches!(cmd, SequencerCommand::Play)));
+        for width in [800., 1280., 1440.] {
+            cx.simulate_resize(size(px(width), px(600.)));
+            cx.run_until_parked();
+            let search = cx.debug_bounds("browser-search").unwrap();
+            let settings = cx.debug_bounds("menu-settings").unwrap();
+            let effects = cx.debug_bounds("menu-audio-effects").unwrap();
+            assert!(settings.right() < search.left() && search.right() < effects.left(),
+                "header width {width}: settings {settings:?}, search {search:?}, effects {effects:?}");
+        }
+    }
+
+    #[gpui::test]
+    fn imported_instrument_is_available_without_replacing_the_track(cx: &mut gpui::TestAppContext) {
+        let (host, _commands, _audio) = Host::headless();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, Project::default_project(), None, String::new(), cx);
+            view.sf2_missing = false;
+            view
+        });
+        let id = format!("{}test", daw_core::audio::flow::ID_PREFIX);
+        let path = "/tmp/imported.fmx";
+        let (send, receive) = std::sync::mpsc::channel();
+        send.send(Some(Ok(daw_core::audio::clap::ClapPluginDesc {
+            path: path.into(), id: id.clone(), name: "Imported Synth".into(),
+            vendor: "Flow Music".into(), is_instrument: true, is_effect: false,
+            features: Vec::new(),
+        }))).unwrap();
+        view.update(cx, |view, cx| {
+            view.plugin_import = Some(receive);
+            assert!(view.pump());
+            assert!(matches!(view.st.project.tracks[0].instrument, daw_core::project::Instrument::Soundfont { .. }));
+            assert_eq!(view.st.browser_search, "Imported Synth");
+            cx.notify();
+        });
+        cx.update(|window, cx| view.read(cx).root_focus.focus(window));
+        cx.simulate_keystrokes("ctrl-k");
+        cx.run_until_parked();
+        let row = cx.debug_bounds("clap-/tmp/imported.fmx-local.daw-ai.fmx.test").unwrap();
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        cx.simulate_click(row.center(), gpui::Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert!(matches!(&view.st.project.tracks[0].instrument,
+                daw_core::project::Instrument::Clap(slot) if slot.id == id && slot.path == path));
+        });
+    }
+
+    #[gpui::test]
     fn whole_gui_renders_docks_menus_and_effects_after_resize(cx: &mut gpui::TestAppContext) {
         let (host, _commands, _audio) = Host::headless();
         let mut project = Project::default_project();
@@ -2299,14 +2537,14 @@ mod tests {
                     v.st.active_dock = tab; v.st.mixer_open = true;
                     if tab == DockTab::PianoRoll { v.st.selected_pattern = Some("review-piano".into()); }
                     else { v.st.selected_pattern = v.st.project.tracks[0].patterns.first().cloned(); }
-                    v.st.browser_w = 520.; v.st.mixer_w = 520.; v.st.dock_h = 1000.;
+                    v.st.browser_open = true; v.st.mixer_h = 520.; v.st.dock_h = 1000.;
                     v.st.browser_search = "a".into();
                     v.st.open_menu = None; v.st.fx_window_open = false;
                     cx.notify();
                 });
                 cx.run_until_parked();
             }
-            for menu in [TopMenu::File, TopMenu::Settings] {
+            for menu in [TopMenu::File, TopMenu::Settings, TopMenu::AgentSession] {
                 view.update(cx, |v, cx| { v.st.open_menu = Some(menu); cx.notify(); });
                 cx.run_until_parked();
             }
@@ -2344,7 +2582,8 @@ mod tests {
         // A mute button in the second header must not select that track or reset
         // the musician's selected pattern through the parent row click handler.
         let selected = view.read_with(cx, |v, _| v.st.selected_track.clone());
-        cx.simulate_click(gpui::point(px(305.), px(120. + RULER_H + LOOP_LANE_H + TRACK_H + 18.)), gpui::Modifiers::default());
+        let mute = cx.debug_bounds("m-t2").expect("second track mute button");
+        cx.simulate_click(mute.center(), gpui::Modifiers::default());
         view.read_with(cx, |v, _| { assert_eq!(v.st.selected_track, selected); assert!(v.st.project.tracks[1].muted, "mute button must still act"); });
     }
 
@@ -2365,13 +2604,13 @@ mod tests {
             v
         });
         view.update(cx, |v, cx| {
-            v.piano_scroll.set_offset(gpui::point(px(0.), px(-200.)));
+            v.piano_scroll.set_offset(gpui::point(px(0.), px(-300.)));
             cx.notify();
         });
         cx.run_until_parked();
         let position = view.read_with(cx, |v, _| {
             let origin = v.piano_scroll.bounds().origin;
-            origin + gpui::point(px(8. + 44. + 2. * PR_COL_W + 9.),
+            origin + gpui::point(px(8. + PR_KEYBOARD_GUTTER + 2. * PR_COL_W + 9.),
                 px(8. + 28. * (PR_ROW_H + 1.) + 6.) + v.piano_scroll.offset().y)
         });
         cx.simulate_click(position, gpui::Modifiers { shift: true, ..Default::default() });
@@ -2380,12 +2619,265 @@ mod tests {
             let daw_core::project::Pattern::PianoRoll(pr)=pattern else { panic!("piano") };
             assert_eq!((pr.notes[0].tick,pr.notes[0].duration,pr.notes[0].vel),(62,55,96));
         });
+        let empty_cell = position + gpui::point(px(2. * PR_COL_W), px(0.));
+        cx.simulate_click(empty_cell, gpui::Modifiers::default());
         cx.simulate_click(position, gpui::Modifiers::default());
         view.read_with(cx, |v, _| {
             let pattern = v.st.project.patterns.iter().find(|p| p.id() == "offgrid").unwrap();
             let daw_core::project::Pattern::PianoRoll(pattern) = pattern else { panic!("piano pattern") };
-            assert!(pattern.notes.is_empty(), "remove the original tick 62 rather than create a snapped duplicate");
+            assert_eq!(pattern.notes.len(), 1);
+            assert_eq!(pattern.notes[0].tick, 120, "keep only the note created in the empty cell");
         });
+    }
+
+    #[gpui::test]
+    fn setup_icons_open_their_device_controls_at_minimum_width(cx: &mut gpui::TestAppContext) {
+        let (host, _commands, _audio) = Host::headless();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, Project::default_project(), None, String::new(), cx);
+            view.config.light_theme = true;
+            view.input_scan_running = true;
+            view.midi_ports = vec!["Test keyboard".into()];
+            view
+        });
+        cx.simulate_resize(size(px(800.), px(480.)));
+        cx.run_until_parked();
+        let mic = cx.debug_bounds("mic-setup").unwrap();
+        let midi = cx.debug_bounds("midi-setup").unwrap();
+        let amp = cx.debug_bounds("amp-setup").unwrap();
+        assert!(mic.right() <= midi.left() && midi.right() <= amp.left());
+        assert!(amp.right() <= px(800.));
+        assert!(cx.debug_bounds("arr-end").unwrap().right() <= mic.left());
+
+        cx.simulate_click(mic.center(), gpui::Modifiers::default());
+        assert!(cx.debug_bounds("in-dev-0").is_some());
+        assert!(cx.debug_bounds("in-channel-0").is_some());
+        assert!(cx.debug_bounds("midip-0").is_none());
+
+        cx.simulate_click(midi.center(), gpui::Modifiers::default());
+        assert!(cx.debug_bounds("midip-0").is_some());
+        view.read_with(cx, |view, _| assert!(view.st.open_menu == Some(TopMenu::Midi)));
+        cx.simulate_keystrokes("escape");
+        view.read_with(cx, |view, _| {
+            assert!(view.st.open_menu.is_none());
+            assert_eq!(view.theme().bg, 0xffffff);
+        });
+
+        let settings = cx.debug_bounds("menu-settings").unwrap();
+        cx.simulate_click(settings.center(), gpui::Modifiers::default());
+        assert!(cx.debug_bounds("theme-light").is_some());
+        assert!(cx.debug_bounds("theme-dark").is_some());
+    }
+
+    #[gpui::test]
+    fn arrangement_navigation_keeps_the_ruler_and_tracks_in_sync(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TouchPhase};
+
+        let (host, commands, _audio) = Host::headless();
+        let mut project = Project::default_project();
+        for _ in 0..8 {
+            project.add_track(daw_core::project::TrackType::Melodic);
+        }
+        project.arrangement[0].len_bars = Some(48);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, project, None, String::new(), cx);
+            view.sf2_missing = false;
+            view.st.arrange_full = true;
+            view
+        });
+        cx.simulate_resize(size(px(1000.), px(600.)));
+        cx.run_until_parked();
+        let beat_one = cx.debug_bounds("timeline-beat-0-0").unwrap();
+        let beat_four = cx.debug_bounds("timeline-beat-0-3").unwrap();
+        assert_eq!(beat_four.left() - beat_one.left(), px(48.));
+        let area = cx.debug_bounds("arrangement").unwrap();
+        let position = point(beat_four.center().x, area.center().y);
+        let wheel = |modifiers| ScrollWheelEvent {
+            position,
+            delta: ScrollDelta::Lines(point(0., -1.)),
+            modifiers,
+            touch_phase: TouchPhase::Moved,
+        };
+
+        cx.simulate_event(wheel(Modifiers::default()));
+        view.read_with(cx, |view, _| {
+            assert_eq!((view.st.arrange_scroll_x, view.st.arrange_scroll_y), (0., 48.));
+        });
+        cx.simulate_event(wheel(Modifiers { shift: true, ..Default::default() }));
+        view.read_with(cx, |view, _| {
+            assert_eq!((view.st.arrange_scroll_x, view.st.arrange_scroll_y), (48., 48.));
+        });
+
+        let end = cx.debug_bounds("arr-end").unwrap();
+        cx.simulate_click(end.center(), Modifiers::default());
+        let end_offset = cx.update(|window, cx| view.read(cx).arrangement_end_offset(window));
+        assert!(end_offset > 0.);
+        view.read_with(cx, |view, _| assert_eq!(view.st.arrange_scroll_x, end_offset));
+        assert!(cx.debug_bounds("timeline-beat-47-0").is_some());
+
+        let start = cx.debug_bounds("arr-start").unwrap();
+        cx.simulate_click(start.center(), Modifiers::default());
+        view.read_with(cx, |view, _| assert_eq!(view.st.arrange_scroll_x, 0.));
+        assert!(!commands.try_iter().any(|command| matches!(command, SequencerCommand::Seek(_))));
+
+        let rail = cx.debug_bounds("timeline-scrollbar").unwrap();
+        let thumb = cx.debug_bounds("timeline-scrollbar-thumb").unwrap().center();
+        let finish = point(rail.right() - px(1.), thumb.y);
+        cx.simulate_mouse_down(thumb, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(thumb + point(px(10.), px(0.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(finish, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(finish, MouseButton::Left, Modifiers::default());
+        let max_offset = cx.update(|window, cx| {
+            let view = view.read(cx);
+            view.timeline_max_scroll(view.timeline_width(window))
+        });
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.st.arrange_scroll_x, max_offset);
+            assert!(max_offset > end_offset);
+            assert_eq!(view.st.arrange_scroll_y, 48.);
+        });
+    }
+
+    #[gpui::test]
+    fn arrangement_clicks_seek_to_the_pointer_at_any_zoom_and_scroll(cx: &mut gpui::TestAppContext) {
+        use daw_core::project::{AudioClip, TrackType};
+        use daw_core::sequencer::{TICKS_PER_BAR, TICKS_PER_BEAT};
+        use gpui::{point, Modifiers};
+
+        let (host, commands, _audio) = Host::headless();
+        let mut project = Project::default_project();
+        project.arrangement[0].len_bars = Some(4);
+        let track = project.add_track(TrackType::Audio);
+        project.audio_clips.push(AudioClip {
+            track,
+            path: "test.wav".into(),
+            start_sec: 3.5,
+            offset_sec: 0.,
+            len_sec: 2.5,
+            gain: 1.,
+        });
+        let (_, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, project, None, String::new(), cx);
+            view.sf2_missing = false;
+            view.st.arrange_full = true;
+            view.st.arrange_zoom = 2.;
+            view.st.arrange_scroll_x = 192.;
+            view
+        });
+        cx.simulate_resize(size(px(1000.), px(600.)));
+        cx.run_until_parked();
+
+        let ruler = cx.debug_bounds("timeline-beat-2-1").unwrap();
+        let x = ruler.center().x;
+        let midi = cx.debug_bounds("clip-t1-0").unwrap();
+        let audio = cx.debug_bounds("aclip-0").unwrap();
+        let expected = 2 * TICKS_PER_BAR + 3 * TICKS_PER_BEAT / 2;
+        for y in [ruler.center().y, midi.center().y, audio.center().y] {
+            cx.simulate_click(point(x, y), Modifiers::default());
+            let seeks: Vec<_> = commands.try_iter().filter_map(|command| match command {
+                SequencerCommand::Seek(tick) => Some(tick),
+                _ => None,
+            }).collect();
+            assert_eq!(seeks, [expected]);
+        }
+
+        cx.simulate_keystrokes("space");
+        let mut commands = commands.try_iter();
+        assert!(matches!(commands.next(), Some(SequencerCommand::Play)));
+        assert!(!commands.any(|command| matches!(command, SequencerCommand::Seek(_))));
+    }
+
+    #[gpui::test]
+    fn piano_roll_scrollbar_reaches_the_end_of_a_100_bar_pattern(cx: &mut gpui::TestAppContext) {
+        use gpui::{Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TouchPhase, point};
+
+        let (host, _commands, _audio) = Host::headless();
+        let mut project = Project::default_project();
+        project.patterns.push(daw_core::project::Pattern::PianoRoll(daw_core::project::PianoRollPattern {
+            id: "long-scroll".into(), name: "Long part".into(), bars: 100, ticks_per_bar: 480,
+            legato: false, notes: vec![],
+        }));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, project, None, String::new(), cx);
+            view.sf2_missing = false;
+            view.st.active_dock = DockTab::PianoRoll;
+            view.st.selected_pattern = Some("long-scroll".into());
+            view.st.dock_h = 300.;
+            view
+        });
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.run_until_parked();
+        let grid = cx.debug_bounds("piano-scroll-viewport").unwrap();
+        let initial = view.read_with(cx, |view, _| view.piano_scroll.offset());
+        cx.simulate_event(ScrollWheelEvent {
+            position: grid.center(), delta: ScrollDelta::Lines(point(0., -2.)),
+            modifiers: Modifiers { shift: true, ..Default::default() },
+            touch_phase: TouchPhase::Moved,
+        });
+        let shifted = view.read_with(cx, |view, _| view.piano_scroll.offset());
+        assert!(shifted.x < initial.x && shifted.y == initial.y);
+        cx.simulate_event(ScrollWheelEvent {
+            position: grid.center(), delta: ScrollDelta::Pixels(point(px(0.), px(-29.))),
+            modifiers: Modifiers::default(), touch_phase: TouchPhase::Moved,
+        });
+        let wheeled = view.read_with(cx, |view, _| view.piano_scroll.offset());
+        assert!(wheeled.y < shifted.y && wheeled.x == shifted.x);
+        cx.simulate_event(ScrollWheelEvent {
+            position: grid.center(), delta: ScrollDelta::Pixels(point(px(-30.), px(0.))),
+            modifiers: Modifiers::default(), touch_phase: TouchPhase::Moved,
+        });
+        assert!(view.read_with(cx, |view, _| view.piano_scroll.offset().x) < wheeled.x);
+
+        let rail = cx.debug_bounds("piano-time-scrollbar").unwrap();
+        let start = point(rail.left() + px(8.), rail.center().y);
+        let finish = point(rail.right() - px(1.), rail.center().y);
+        cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(start + point(px(10.), px(0.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(finish, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(finish, MouseButton::Left, Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.piano_scroll.offset().x, -view.piano_scroll.max_offset().width);
+            assert_eq!(view.piano_scroll.offset().y, wheeled.y);
+        });
+        cx.simulate_click(start, Modifiers::default());
+        assert_eq!(view.read_with(cx, |view, _| view.piano_scroll.offset().x), px(0.));
+    }
+
+    #[gpui::test]
+    fn piano_keyboard_stays_visible_on_horizontal_scroll_and_auditions_sharps(cx: &mut gpui::TestAppContext) {
+        let (host, commands, _audio) = Host::headless();
+        let mut project = Project::default_project();
+        project.patterns.push(daw_core::project::Pattern::PianoRoll(daw_core::project::PianoRollPattern {
+            id: "keyboard.1".into(), name: "Keys".into(), bars: 8, ticks_per_bar: 480, legato: false,
+            notes: vec![daw_core::project::Note { pitch: 60, tick: 0, duration: 120, vel: 88 }],
+        }));
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, project, None, String::new(), cx);
+            view.sf2_missing = false;
+            view.st.active_dock = DockTab::PianoRoll;
+            view.st.selected_pattern = Some("keyboard.1".into());
+            view.st.dock_h = 350.;
+            view
+        });
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.run_until_parked();
+        let natural = cx.debug_bounds("piano-key-60").expect("view opens around the authored note");
+        let sharp = cx.debug_bounds("piano-key-61").unwrap();
+        assert!(sharp.size.width < natural.size.width);
+        view.update(cx, |view, cx| {
+            let offset = view.piano_scroll.offset();
+            view.piano_scroll.set_offset(gpui::point(px(-350.), offset.y));
+            cx.notify();
+        });
+        cx.run_until_parked();
+        let scrolled = cx.debug_bounds("piano-key-61").unwrap();
+        assert_eq!(sharp.origin.x, scrolled.origin.x);
+        cx.simulate_click(scrolled.center(), gpui::Modifiers::default());
+        let notes: Vec<_> = commands.try_iter().filter_map(|cmd| match cmd {
+            SequencerCommand::Audition { notes, .. } => Some(notes),
+            _ => None,
+        }).flatten().map(|note| note.pitch).collect();
+        assert_eq!(notes, [61]);
     }
 
     #[gpui::test]
@@ -2427,12 +2919,12 @@ mod tests {
         other.project.bpm = 141.;
         daw_core::project::format::save_if_unchanged(&other, &path, None).unwrap();
         view.update(cx, |v, _| {
-            v.st.browser_w = 333.;
+            v.st.mixer_h = 333.;
             v.undo.record("edit", &v.st.project.clone());
             v.load_project(path.clone());
             assert_eq!(v.st.project.project.bpm, 141.);
             assert!(!v.undo.can_undo());
-            assert_eq!(v.st.browser_w, 333., "layout survives opening a file");
+            assert_eq!(v.st.mixer_h, 333., "layout survives opening a file");
             v.undo();
             assert_eq!(v.st.project.project.bpm, 141.);
         });
@@ -2467,17 +2959,26 @@ mod tests {
     #[gpui::test]
     #[ignore = "benchmark: prints milliseconds per frame"]
     fn frame_cost_on_a_large_song(cx: &mut gpui::TestAppContext) {
+        let project = std::env::var_os("DAW_GUI_BENCH_PROJECT");
+        let (width, height, dock) = if project.is_some() {
+            (1648., 927., 445.)
+        } else {
+            (1280., 800., 200.)
+        };
+        let project = project.map_or_else(heavy_project, |path| daw_core::project::format::load(std::path::PathBuf::from(path)).unwrap());
         let (host, _commands, _audio) = Host::headless();
         let (view, cx) = cx.add_window_view(|_, cx| {
-            let mut v = DawView::new(host, heavy_project(), None, String::new(), cx);
+            let mut v = DawView::new(host, project, None, String::new(), cx);
             v.sf2_missing = false;
+            v.st.dock_h = dock;
             v
         });
-        cx.simulate_resize(size(px(1280.), px(800.)));
+        cx.simulate_resize(size(px(width), px(height)));
         cx.run_until_parked();
-        for tab in [DockTab::Sequencer, DockTab::PianoRoll, DockTab::Mixing] {
+        for (tab, mixer_open) in [(DockTab::Sequencer, false), (DockTab::PianoRoll, false), (DockTab::PianoRoll, true)] {
             view.update(cx, |v, cx| {
                 v.st.active_dock = tab;
+                v.st.mixer_open = mixer_open;
                 let first = v.st.project.tracks[0].id.clone();
                 v.st.select_track(&first);
                 v.playing = true;
@@ -2490,7 +2991,7 @@ mod tests {
                 view.update(cx, |v, cx| { v.pump(); v.st.set_playhead(i * 40); cx.notify(); });
                 cx.run_until_parked();
             }
-            println!("{:?}: {:.2} ms/frame while playing", tab, started.elapsed().as_secs_f64() * 1000. / frames as f64);
+            println!("{tab:?} (mixer {mixer_open}): {:.2} ms/frame while playing", started.elapsed().as_secs_f64() * 1000. / frames as f64);
         }
     }
 
@@ -2562,6 +3063,7 @@ mod tests {
             notes: vec![
                 Note { pitch: 60, tick: 0, duration: 240, vel: 100 },
                 Note { pitch: 72, tick: 240, duration: 120, vel: 100 },
+                Note { pitch: 42, tick: 600, duration: 120, vel: 100 },
             ], legato: false,
         });
         let marks = clip_preview_marks(&pr, 120.0, 40.0, 960);

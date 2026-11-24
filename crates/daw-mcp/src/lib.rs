@@ -3,8 +3,10 @@
 
 pub mod analysis;
 pub mod arrangement;
+pub mod audition;
 pub mod diff;
 pub mod groove;
+pub mod groove_compare;
 pub mod mix_analysis;
 pub mod snapshot;
 pub mod sound_design;

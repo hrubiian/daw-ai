@@ -24,7 +24,9 @@ use clack_host::events::Match;
 use clack_host::utils::Cookie;
 use clack_host::prelude::*;
 use std::ffi::CString;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
+
+use super::flow;
 
 /// Max frames per process call — matches the mixer's block cap.
 const CLAP_MAX_FRAMES: u32 = 8192;
@@ -123,15 +125,27 @@ pub struct ClapPluginDesc {
     pub id: String,
     pub name: String,
     pub vendor: String,
+    pub features: Vec<String>,
     pub is_instrument: bool,
     pub is_effect: bool,
 }
 
-/// Standard CLAP search paths (Linux) + `$CLAP_PATH`.
+/// Standard CLAP locations (Linux), explicit overrides, and known builds
+/// in the checkout that produced daw-ai.
 pub fn standard_paths() -> Vec<PathBuf> {
     let mut v = Vec::new();
     if let Ok(p) = std::env::var("CLAP_PATH") {
         v.extend(std::env::split_paths(&p));
+    }
+    if let Ok(executable) = std::env::current_exe() {
+        for location in [checkout_model_m_root(&executable), checkout_faust_kit(&executable)]
+            .into_iter()
+            .flatten()
+        {
+            if !v.contains(&location) {
+                v.push(location);
+            }
+        }
     }
     if let Some(home) = std::env::var_os("HOME") {
         v.push(PathBuf::from(home).join(".clap"));
@@ -141,12 +155,64 @@ pub fn standard_paths() -> Vec<PathBuf> {
     v
 }
 
+fn checkout_model_m_root(executable: &std::path::Path) -> Option<PathBuf> {
+    // The executable, not the project file or working directory, selects the
+    // checkout. This is the dedicated output of the local Model-M builder.
+    let checkout = development_checkout(executable)?;
+    if !checkout.join("plugins/flow-model-m/build.py").is_file() {
+        return None;
+    }
+    let root = checkout.join("outputs/model-m/clap").canonicalize().ok()?;
+    (root.starts_with(checkout) && root.join("Model-M.clap").is_file()).then_some(root)
+}
+
+fn checkout_faust_kit(executable: &Path) -> Option<PathBuf> {
+    let checkout = development_checkout(executable)?;
+    if !checkout.join("plugins/faust-drums/build.sh").is_file() {
+        return None;
+    }
+    let bundle = checkout.join("outputs/faust-drums/West-African-Drum-Kit.clap");
+    (bundle.is_file() && bundle.canonicalize().ok()? == bundle).then_some(bundle)
+}
+
+fn development_checkout(executable: &Path) -> Option<&Path> {
+    let profile = executable.parent()?;
+    let target = profile.parent()?;
+    if target.file_name()? != "target"
+        || !matches!(profile.file_name()?.to_str()?, "debug" | "release")
+    {
+        return None;
+    }
+    target.parent()
+}
+
 pub fn discover() -> Vec<ClapPluginDesc> {
-    discover_in(&standard_paths())
+    let mut plugins = discover_in(&standard_paths());
+    if let Some(root) = flow::library_dir() {
+        if let Ok(entries) = std::fs::read_dir(&root) {
+            for file in entries.flatten().map(|entry| entry.path()) {
+                if flow::is_fmx(&file)
+                    && file.to_str().is_some_and(|p| is_trusted_plugin_path(p, std::slice::from_ref(&root)))
+                {
+                    scan_bundle(&file, &mut plugins);
+                }
+            }
+        }
+    }
+    sort_and_deduplicate(&mut plugins);
+    plugins
+}
+
+pub fn is_available_plugin_path(path: &str) -> bool {
+    if flow::is_fmx(Path::new(path)) {
+        return flow::library_dir().is_some_and(|root| is_trusted_plugin_path(path, &[root]));
+    }
+    is_trusted_plugin_path(path, &standard_paths())
 }
 
 /// True if `path` resolves (symlinks followed) to a file inside one of
-/// `roots`. Project files are shareable and LLM-editable, so a slot's `path`
+/// `roots`, which may also name individual allowed files. Project files are
+/// shareable and LLM-editable, so a slot's `path`
 /// is untrusted input: loading it unchecked would `dlopen` (and run the
 /// constructors of) any shared library named in a downloaded song.
 pub fn is_trusted_plugin_path(path: &str, roots: &[PathBuf]) -> bool {
@@ -160,11 +226,17 @@ pub fn is_trusted_plugin_path(path: &str, roots: &[PathBuf]) -> bool {
         .any(|root| real.starts_with(root))
 }
 
-/// Scan directories recursively for `.clap`/`.so` bundles and enumerate
-/// their descriptors. Unloadable files are skipped silently.
+/// Scan explicit bundles and search directories for their plugin descriptors.
+/// Unloadable files are skipped silently.
 pub fn discover_in(paths: &[PathBuf]) -> Vec<ClapPluginDesc> {
     let mut out = Vec::new();
     for root in paths {
+        if root.is_file() {
+            if is_clap_bundle(root) {
+                scan_bundle(root, &mut out);
+            }
+            continue;
+        }
         let mut stack = vec![root.clone()];
         while let Some(dir) = stack.pop() {
             let Ok(entries) = std::fs::read_dir(&dir) else { continue };
@@ -172,26 +244,39 @@ pub fn discover_in(paths: &[PathBuf]) -> Vec<ClapPluginDesc> {
                 let p = e.path();
                 if p.is_dir() {
                     stack.push(p);
-                } else if p.extension().is_some_and(|x| x == "clap" || x == "so") {
+                } else if is_clap_bundle(&p) {
                     scan_bundle(&p, &mut out);
                 }
             }
         }
     }
+    sort_and_deduplicate(&mut out);
+    out
+}
+
+fn is_clap_bundle(path: &Path) -> bool {
+    path.extension().is_some_and(|x| x == "clap" || x == "so")
+}
+
+fn sort_and_deduplicate(out: &mut Vec<ClapPluginDesc>) {
     // The same plugin can appear at several paths (e.g. a build dir and its
     // deps/ copies) — keep the first occurrence of each plugin id.
     out.sort_by(|a, b| a.name.cmp(&b.name));
     let mut seen = std::collections::HashSet::new();
     out.retain(|d| seen.insert(d.id.clone()));
-    out
 }
 
-fn scan_bundle(path: &std::path::Path, out: &mut Vec<ClapPluginDesc>) {
-    // Loading an arbitrary shared library runs its constructors — inherent
-    // to plugin hosting; the search paths are user-controlled.
+fn load_entry(path: &Path) -> Result<PluginEntry, String> {
+    if flow::is_fmx(path) {
+        return flow::load_entry(path).map_err(|error| format!("{error:#}"));
+    }
     // SAFETY: loading a plugin dylib runs its constructors — inherent to
     // CLAP hosting; paths come from the user's plugin directories.
-    let Ok(entry) = (unsafe { PluginEntry::load(path) }) else { return };
+    unsafe { PluginEntry::load(path) }.map_err(|error| error.to_string())
+}
+
+fn scan_bundle(path: &Path, out: &mut Vec<ClapPluginDesc>) {
+    let Ok(entry) = load_entry(path) else { return };
     let Some(factory) = entry.get_plugin_factory() else { return };
     for d in factory.plugin_descriptors() {
         let (Some(id), Some(name)) = (d.id(), d.name()) else { continue };
@@ -209,6 +294,7 @@ fn scan_bundle(path: &std::path::Path, out: &mut Vec<ClapPluginDesc>) {
                 .unwrap_or_default(),
             is_instrument: feats.iter().any(|f| f == "instrument"),
             is_effect: feats.iter().any(|f| f == "audio-effect" || f == "audio_effect"),
+            features: feats,
         });
     }
 }
@@ -356,9 +442,7 @@ impl ClapInstance {
     }
 
     fn load_with_editor(path: &str, plugin_id: &str, sample_rate: u32, max_frames: u32, allow_gui: bool) -> Result<Self, String> {
-        // SAFETY: see scan_bundle — dylib loading is inherent to hosting.
-        let entry =
-            unsafe { PluginEntry::load(path) }.map_err(|e| format!("load {path}: {e}"))?;
+        let entry = load_entry(Path::new(path)).map_err(|e| format!("load {path}: {e}"))?;
         // Display name from the bundle's descriptor (fall back to the id).
         let name = entry
             .get_plugin_factory()
@@ -464,9 +548,9 @@ impl ClapInstance {
     }
 
     fn from_spec_with_editor(spec: &ClapSlotSpec, sample_rate: u32, allow_gui: bool) -> Result<Self, String> {
-        if !is_trusted_plugin_path(&spec.path, &standard_paths()) {
+        if !is_available_plugin_path(&spec.path) {
             return Err(format!(
-                "refusing to load {}: not inside a CLAP search path ($CLAP_PATH, ~/.clap, /usr/lib/clap, /usr/local/lib/clap)",
+                "refusing to load {}: missing or outside the installed plugin directories",
                 spec.path
             ));
         }

@@ -4,13 +4,11 @@ use daw_core::sequencer::{TICKS_PER_BAR, TICKS_PER_BEAT};
 use std::collections::HashSet;
 use std::path::PathBuf;
 
-/// Workspace/editor tabs. Mixing uses the available workspace rather than the
-/// small pattern-editor dock.
+/// Editors in the bottom dock.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum DockTab {
     Sequencer,
     PianoRoll,
-    Mixing,
     Fx,
     Code,
 }
@@ -20,15 +18,13 @@ impl DockTab {
         match self {
             DockTab::Sequencer => "Sequencer",
             DockTab::PianoRoll => "Piano Roll",
-            DockTab::Mixing => "Mixing",
             DockTab::Fx => "FX",
             DockTab::Code => "Code",
         }
     }
-    pub const ALL: [DockTab; 5] = [
+    pub const ALL: [DockTab; 4] = [
         DockTab::Sequencer,
         DockTab::PianoRoll,
-        DockTab::Mixing,
         DockTab::Fx,
         DockTab::Code,
     ];
@@ -61,7 +57,7 @@ pub struct HeadlessState {
     /// Pattern currently shown in the editor dock (defaults to the selected
     /// track's first pattern; changed by the pattern picker or a clip click).
     pub selected_pattern: Option<String>,
-    /// Which GM category column is expanded in the browser sidebar.
+    /// Which GM category is selected in the instrument browser.
     pub browser_category: usize,
     /// JAM mode: hot-reload the project file when it changes on disk.
     pub jam_mode: bool,
@@ -71,10 +67,8 @@ pub struct HeadlessState {
     pub repl_buf: String,
     /// Last-seen project file mtime, for JAM change detection.
     pub project_mtime: Option<std::time::SystemTime>,
-    /// User-adjustable panel sizes (px): left browser width, right mixer width,
-    /// bottom editor-dock height. Dragged via the panel splitters.
-    pub browser_w: f32,
-    pub mixer_w: f32,
+    /// Preferred mixer and editor heights in pixels.
+    pub mixer_h: f32,
     pub dock_h: f32,
     /// Waveform peaks cached by WAV path (computed lazily on first render).
     pub peaks_cache: std::collections::HashMap<String, std::sync::Arc<Vec<f32>>>,
@@ -82,7 +76,7 @@ pub struct HeadlessState {
     pub peaks_dur_cache: std::collections::HashMap<String, f64>,
     /// Per-track lane heights (px), keyed by track id. Absent = default (TRACK_H).
     pub track_heights: std::collections::HashMap<String, f32>,
-    /// Full-window Arrange mode: arrangement fills the window (browser/dock/mixer hidden).
+    /// Full-window Arrange mode: arrangement fills the window below the header.
     pub arrange_full: bool,
     /// Arrangement zoom factor; effective bar width = BAR_W * arrange_zoom (clamped in app).
     pub arrange_zoom: f32,
@@ -200,15 +194,14 @@ impl HeadlessState {
             soloed: HashSet::new(),
             active_dock: DockTab::Sequencer,
             mixer_open: false,
-            browser_open: true,
+            browser_open: false,
             selected_pattern,
             browser_category: 0,
             jam_mode: false,
             status: String::new(),
             repl_buf: String::new(),
             project_mtime: None,
-            browser_w: 200.0,
-            mixer_w: 220.0,
+            mixer_h: 304.0,
             dock_h: 200.0,
             peaks_cache: std::collections::HashMap::new(),
             peaks_dur_cache: std::collections::HashMap::new(),

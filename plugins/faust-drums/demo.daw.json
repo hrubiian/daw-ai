@@ -1,0 +1,153 @@
+{
+  "version": "0.1",
+  "project": {
+    "name": "Faust Drum Kit Demo",
+    "bpm": 112,
+    "time_signature": [
+      4,
+      4
+    ],
+    "key": "C",
+    "scale": "minor",
+    "timing": 0.13
+  },
+  "tracks": [
+    {
+      "id": "kit",
+      "name": "West African Drum Kit",
+      "type": "drum",
+      "instrument": {
+        "type": "clap",
+        "uid": "c1",
+        "path": "West-African-Drum-Kit.clap",
+        "id": "local.daw-ai.faust-drums"
+      },
+      "volume": 0.85,
+      "pan": 0,
+      "muted": false,
+      "patterns": [
+        "call",
+        "reply"
+      ]
+    }
+  ],
+  "patterns": [
+    {
+      "type": "step",
+      "id": "call",
+      "name": "Call",
+      "bars": 2,
+      "steps": 32,
+      "rows": [
+        {
+          "name": "Djembe bass",
+          "pitch": 36,
+          "vel": 96,
+          "steps": [110, 0, 0, 0, 0, 0, 0, 0, 95, 0, 0, 0, 0, 76, 0, 0, 105, 0, 0, 0, 0, 0, 0, 0, 93, 0, 0, 75, 0, 0, 0, 0]
+        },
+        {
+          "name": "Djembe tone",
+          "pitch": 37,
+          "vel": 96,
+          "steps": [0, 0, 0, 96, 0, 0, 0, 76, 0, 0, 83, 0, 0, 0, 0, 91, 0, 0, 0, 96, 0, 0, 79, 0, 0, 0, 0, 0, 0, 87, 0, 0]
+        },
+        {
+          "name": "Djembe slap",
+          "pitch": 38,
+          "vel": 96,
+          "steps": [0, 0, 0, 0, 0, 0, 100, 0, 0, 0, 0, 0, 115, 0, 0, 0, 0, 0, 0, 0, 0, 91, 0, 0, 0, 82, 0, 0, 111, 0, 0, 84]
+        },
+        {
+          "name": "Dunun",
+          "pitch": 39,
+          "vel": 96,
+          "steps": [94, 0, 0, 0, 0, 0, 0, 0, 0, 0, 89, 0, 0, 0, 0, 0, 90, 0, 0, 0, 0, 0, 0, 0, 0, 0, 96, 0, 0, 0, 0, 0]
+        },
+        {
+          "name": "Bell",
+          "pitch": 40,
+          "vel": 96,
+          "steps": [82, 0, 0, 69, 0, 0, 79, 0, 0, 0, 77, 0, 71, 0, 0, 0, 83, 0, 0, 70, 0, 0, 78, 0, 0, 0, 77, 0, 73, 0, 0, 0]
+        },
+        {
+          "name": "Shekere",
+          "pitch": 41,
+          "vel": 96,
+          "steps": [80, 0, 48, 0, 68, 0, 47, 42, 75, 0, 51, 0, 64, 0, 47, 54, 80, 0, 48, 0, 68, 0, 47, 39, 75, 0, 51, 0, 64, 0, 47, 58]
+        }
+      ]
+    },
+    {
+      "type": "step",
+      "id": "reply",
+      "name": "Reply",
+      "bars": 2,
+      "steps": 32,
+      "rows": [
+        {
+          "name": "Djembe bass",
+          "pitch": 36,
+          "vel": 96,
+          "steps": [106, 0, 0, 0, 0, 0, 0, 83, 0, 0, 0, 96, 0, 0, 0, 0, 109, 0, 0, 0, 0, 0, 0, 0, 89, 0, 0, 0, 0, 0, 105, 0]
+        },
+        {
+          "name": "Djembe tone",
+          "pitch": 37,
+          "vel": 96,
+          "steps": [0, 0, 80, 0, 0, 92, 0, 0, 0, 69, 0, 0, 0, 0, 97, 0, 0, 0, 86, 0, 0, 92, 0, 0, 0, 0, 82, 0, 0, 103, 0, 0]
+        },
+        {
+          "name": "Djembe slap",
+          "pitch": 38,
+          "vel": 96,
+          "steps": [0, 0, 0, 0, 112, 0, 0, 0, 0, 0, 0, 0, 103, 0, 0, 0, 0, 0, 0, 0, 115, 0, 0, 0, 0, 78, 0, 91, 0, 0, 0, 118]
+        },
+        {
+          "name": "Dunun",
+          "pitch": 39,
+          "vel": 96,
+          "steps": [94, 0, 0, 0, 0, 0, 0, 0, 0, 0, 87, 0, 0, 0, 0, 0, 94, 0, 0, 0, 0, 0, 83, 0, 0, 0, 0, 0, 91, 0, 0, 0]
+        },
+        {
+          "name": "Bell",
+          "pitch": 40,
+          "vel": 96,
+          "steps": [81, 0, 0, 68, 0, 0, 79, 0, 0, 0, 77, 0, 71, 0, 0, 0, 84, 0, 0, 69, 0, 0, 78, 0, 0, 0, 74, 0, 86, 0, 0, 0]
+        },
+        {
+          "name": "Shekere",
+          "pitch": 41,
+          "vel": 96,
+          "steps": [81, 0, 47, 0, 69, 0, 49, 44, 77, 0, 51, 0, 65, 0, 46, 55, 81, 0, 47, 0, 69, 0, 49, 0, 77, 0, 51, 38, 65, 0, 46, 61]
+        }
+      ]
+    }
+  ],
+  "arrangement": [
+    {
+      "track": "kit",
+      "pattern": "call",
+      "bar": 0
+    },
+    {
+      "track": "kit",
+      "pattern": "call",
+      "bar": 2
+    },
+    {
+      "track": "kit",
+      "pattern": "reply",
+      "bar": 4
+    },
+    {
+      "track": "kit",
+      "pattern": "reply",
+      "bar": 6
+    }
+  ],
+  "loop_region": {
+    "enabled": true,
+    "start_bar": 0,
+    "end_bar": 8
+  }
+}

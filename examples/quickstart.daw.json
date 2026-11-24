@@ -1,0 +1,438 @@
+{
+  "version": "0.1",
+  "project": {
+    "name": "First Light",
+    "bpm": 104,
+    "time_signature": [
+      4,
+      4
+    ],
+    "key": "A",
+    "scale": "minor"
+  },
+  "tracks": [
+    {
+      "id": "drums",
+      "name": "Drum kit",
+      "type": "drum",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 0,
+        "bank": 128
+      },
+      "volume": 0.85,
+      "pan": 0,
+      "muted": false,
+      "patterns": [
+        "drums_phrase"
+      ],
+      "effects": {
+        "reverb": 0
+      }
+    },
+    {
+      "id": "bass",
+      "name": "Finger bass",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 33,
+        "bank": 0
+      },
+      "volume": 0.93,
+      "pan": 0,
+      "muted": false,
+      "patterns": [
+        "bass_phrase"
+      ],
+      "effects": {
+        "reverb": 0
+      }
+    },
+    {
+      "id": "keys",
+      "name": "Electric piano",
+      "type": "melodic",
+      "instrument": {
+        "type": "soundfont",
+        "preset": 4,
+        "bank": 0
+      },
+      "volume": 1.02,
+      "pan": -0.12,
+      "muted": false,
+      "patterns": [
+        "keys_phrase"
+      ],
+      "effects": {
+        "reverb": 0.14
+      }
+    }
+  ],
+  "patterns": [
+    {
+      "type": "step",
+      "id": "drums_phrase",
+      "name": "Pocket",
+      "bars": 2,
+      "steps": 32,
+      "gate": 0.5,
+      "rows": [
+        {
+          "name": "Kick",
+          "pitch": 36,
+          "vel": 108,
+          "steps": [
+            108,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            100,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            108,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            102,
+            0,
+            0,
+            0,
+            0,
+            0,
+            72,
+            0
+          ]
+        },
+        {
+          "name": "Snare",
+          "pitch": 38,
+          "vel": 91,
+          "steps": [
+            0,
+            0,
+            0,
+            0,
+            91,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            87,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            91,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            0,
+            88,
+            0,
+            0,
+            0
+          ]
+        },
+        {
+          "name": "Hat",
+          "pitch": 42,
+          "vel": 59,
+          "steps": [
+            0,
+            0,
+            58,
+            0,
+            0,
+            0,
+            49,
+            0,
+            0,
+            0,
+            63,
+            0,
+            0,
+            0,
+            50,
+            0,
+            0,
+            0,
+            57,
+            0,
+            0,
+            0,
+            48,
+            0,
+            0,
+            0,
+            64,
+            0,
+            0,
+            0,
+            51,
+            0
+          ]
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "bass_phrase",
+      "name": "Root and answer",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 45,
+          "tick": 0,
+          "duration": 170,
+          "vel": 95
+        },
+        {
+          "pitch": 45,
+          "tick": 240,
+          "duration": 105,
+          "vel": 91
+        },
+        {
+          "pitch": 52,
+          "tick": 370,
+          "duration": 78,
+          "vel": 75
+        },
+        {
+          "pitch": 41,
+          "tick": 480,
+          "duration": 170,
+          "vel": 95
+        },
+        {
+          "pitch": 41,
+          "tick": 720,
+          "duration": 105,
+          "vel": 91
+        },
+        {
+          "pitch": 48,
+          "tick": 850,
+          "duration": 78,
+          "vel": 75
+        },
+        {
+          "pitch": 48,
+          "tick": 960,
+          "duration": 170,
+          "vel": 95
+        },
+        {
+          "pitch": 48,
+          "tick": 1200,
+          "duration": 105,
+          "vel": 91
+        },
+        {
+          "pitch": 55,
+          "tick": 1330,
+          "duration": 78,
+          "vel": 75
+        },
+        {
+          "pitch": 43,
+          "tick": 1440,
+          "duration": 170,
+          "vel": 95
+        },
+        {
+          "pitch": 43,
+          "tick": 1680,
+          "duration": 105,
+          "vel": 91
+        },
+        {
+          "pitch": 50,
+          "tick": 1810,
+          "duration": 78,
+          "vel": 75
+        }
+      ]
+    },
+    {
+      "type": "piano_roll",
+      "id": "keys_phrase",
+      "name": "Night chords",
+      "bars": 4,
+      "ticks_per_bar": 480,
+      "notes": [
+        {
+          "pitch": 57,
+          "tick": 60,
+          "duration": 140,
+          "vel": 72
+        },
+        {
+          "pitch": 60,
+          "tick": 60,
+          "duration": 140,
+          "vel": 69
+        },
+        {
+          "pitch": 64,
+          "tick": 60,
+          "duration": 140,
+          "vel": 66
+        },
+        {
+          "pitch": 67,
+          "tick": 60,
+          "duration": 140,
+          "vel": 63
+        },
+        {
+          "pitch": 72,
+          "tick": 300,
+          "duration": 118,
+          "vel": 72
+        },
+        {
+          "pitch": 57,
+          "tick": 540,
+          "duration": 140,
+          "vel": 72
+        },
+        {
+          "pitch": 60,
+          "tick": 540,
+          "duration": 140,
+          "vel": 69
+        },
+        {
+          "pitch": 64,
+          "tick": 540,
+          "duration": 140,
+          "vel": 66
+        },
+        {
+          "pitch": 65,
+          "tick": 540,
+          "duration": 140,
+          "vel": 63
+        },
+        {
+          "pitch": 69,
+          "tick": 780,
+          "duration": 118,
+          "vel": 72
+        },
+        {
+          "pitch": 55,
+          "tick": 1020,
+          "duration": 140,
+          "vel": 72
+        },
+        {
+          "pitch": 60,
+          "tick": 1020,
+          "duration": 140,
+          "vel": 69
+        },
+        {
+          "pitch": 64,
+          "tick": 1020,
+          "duration": 140,
+          "vel": 66
+        },
+        {
+          "pitch": 67,
+          "tick": 1020,
+          "duration": 140,
+          "vel": 63
+        },
+        {
+          "pitch": 76,
+          "tick": 1260,
+          "duration": 118,
+          "vel": 72
+        },
+        {
+          "pitch": 55,
+          "tick": 1500,
+          "duration": 140,
+          "vel": 72
+        },
+        {
+          "pitch": 59,
+          "tick": 1500,
+          "duration": 140,
+          "vel": 69
+        },
+        {
+          "pitch": 62,
+          "tick": 1500,
+          "duration": 140,
+          "vel": 66
+        },
+        {
+          "pitch": 65,
+          "tick": 1500,
+          "duration": 140,
+          "vel": 63
+        },
+        {
+          "pitch": 74,
+          "tick": 1740,
+          "duration": 118,
+          "vel": 72
+        }
+      ]
+    }
+  ],
+  "arrangement": [
+    {
+      "track": "drums",
+      "pattern": "drums_phrase",
+      "bar": 0,
+      "len_bars": 8
+    },
+    {
+      "track": "bass",
+      "pattern": "bass_phrase",
+      "bar": 0,
+      "len_bars": 8
+    },
+    {
+      "track": "keys",
+      "pattern": "keys_phrase",
+      "bar": 0,
+      "len_bars": 8
+    }
+  ],
+  "loop_region": {
+    "start_bar": 0,
+    "end_bar": 8,
+    "enabled": false,
+    "punch_in": false,
+    "punch_out": false
+  }
+}

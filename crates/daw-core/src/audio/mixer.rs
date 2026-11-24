@@ -7,7 +7,7 @@
 //! construction.
 
 use std::f64::consts::PI;
-use std::sync::atomic::{AtomicBool, AtomicU32, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU64, Ordering};
 use std::sync::Arc;
 
 /// Strip index that routes to the utility synth (metronome, previews).
@@ -302,11 +302,17 @@ pub struct StripMeter {
     pub peak: AtomicU32,
     /// Latched at >= 0.999; the UI resets it.
     pub clipped: AtomicBool,
+    /// Pitches currently held on the strip, in MIDI order.
+    pressed_keys: [AtomicU64; 2],
 }
 
 impl StripMeter {
     pub fn new() -> Self {
-        StripMeter { peak: AtomicU32::new(0f32.to_bits()), clipped: AtomicBool::new(false) }
+        StripMeter {
+            peak: AtomicU32::new(0f32.to_bits()),
+            clipped: AtomicBool::new(false),
+            pressed_keys: Default::default(),
+        }
     }
     pub fn store(&self, peak: f32) {
         self.peak.store(peak.to_bits(), Ordering::Relaxed);
@@ -319,6 +325,27 @@ impl StripMeter {
     }
     pub fn reset_clip(&self) {
         self.clipped.store(false, Ordering::Relaxed);
+    }
+
+    pub fn pressed_keys(&self) -> [u64; 2] {
+        std::array::from_fn(|i| self.pressed_keys[i].load(Ordering::Relaxed))
+    }
+
+    fn set_key(&self, pitch: u8, pressed: bool) {
+        if let Some(keys) = self.pressed_keys.get(usize::from(pitch) / 64) {
+            let bit = 1 << (pitch % 64);
+            if pressed {
+                keys.fetch_or(bit, Ordering::Relaxed);
+            } else {
+                keys.fetch_and(!bit, Ordering::Relaxed);
+            }
+        }
+    }
+
+    fn set_keys(&self, active: [u64; 2]) {
+        for (keys, mask) in self.pressed_keys.iter().zip(active) {
+            keys.store(mask, Ordering::Relaxed);
+        }
     }
 }
 
@@ -627,6 +654,8 @@ pub enum AudioEvent {
     LoadAudioClips { specs: Vec<(u32, String)> }, // (clip_id, path)
     SetAudioClips  { clips: Vec<(u32, Arc<Vec<f32>>, Arc<Vec<f32>>)> },
     PreparedAudioClips { clips: std::collections::HashMap<u32, (Arc<Vec<f32>>, Arc<Vec<f32>>)> },
+    /// Connect the capture stream to an audio track's insert path.
+    SetTrackMonitor { track_id: String, input: Box<super::track_monitor::TrackMonitorInput> },
     /// Start clip `clip_id` on `strip` from `offset_sec` for `len_sec` at the
     /// clip's own gain (track volume/pan/mute are applied by the strip).
     TriggerAudioClip { strip: u8, clip_id: u32, offset_sec: f32, len_sec: f32, gain: f32 },
@@ -672,6 +701,8 @@ pub enum StripKind {
 
 #[derive(Debug, Clone)]
 pub struct StripSpec {
+    /// Stable track identity for live input routing on audio strips.
+    pub audio_track: Option<String>,
     pub kind:    StripKind,
     pub gain:    f32,
     pub pan:     f32,
@@ -693,6 +724,7 @@ impl StripSpec {
     pub fn from_project(project: &crate::project::Project) -> Vec<StripSpec> {
         use crate::project::{Instrument, TrackType};
         project.tracks.iter().map(|t| StripSpec {
+            audio_track: (t.track_type == TrackType::Audio).then(|| t.id.clone()),
             kind: match (&t.instrument, t.track_type) {
                 (Instrument::Sampler { pads }, _) => StripKind::Sampler {
                     pads: pads.clone(),
@@ -785,6 +817,7 @@ struct SampleVoice {
 
 /// One mixer channel. Built off the RT thread (relay), processed on it.
 pub struct Strip {
+    audio_track: Option<String>,
     /// Per-strip synthesizer; None for sampler/audio strips.
     pub synth: Option<rustysynth::Synthesizer>,
     /// GM channel inside this strip's synth: 9 for drums, else 0.
@@ -842,6 +875,7 @@ impl Strip {
     /// A synthless strip (sampler/audio) with bypass inserts at unity.
     pub fn new(sample_rate: u32) -> Self {
         Strip {
+            audio_track: None,
             synth: None,
             gm_channel: 0,
             pads: std::collections::HashMap::new(),
@@ -926,6 +960,7 @@ pub struct Mixer {
     pub clap: std::collections::HashMap<String, super::clap::ClapProcessor>,
     pub master_meter: Arc<StripMeter>,
     pub sample_rate: u32,
+    pub(super) track_monitor: Option<(String, Box<super::track_monitor::TrackMonitorInput>)>,
     scratch_l: Vec<f32>,
     scratch_r: Vec<f32>,
     bpm: f64,
@@ -967,6 +1002,7 @@ impl Mixer {
             clap: std::collections::HashMap::new(),
             master_meter,
             sample_rate,
+            track_monitor: None,
             scratch_l: vec![0.0; MAX_BLOCK],
             scratch_r: vec![0.0; MAX_BLOCK],
             bpm: 120.,
@@ -980,6 +1016,11 @@ impl Mixer {
 
     /// Extract a processor for teardown elsewhere (never drop on the RT thread).
     pub fn remove_clap(&mut self, uid: &str) -> Option<super::clap::ClapProcessor> {
+        for strip in &self.strips {
+            if strip.clap_instrument.as_deref() == Some(uid) {
+                strip.meter.set_keys([0; 2]);
+            }
+        }
         self.clap.remove(uid)
     }
 
@@ -1002,11 +1043,13 @@ impl Mixer {
                         // CLAP instrument strips: queue a plugin note event.
                         if let Some(p) = st.clap_instrument.as_ref().and_then(|u| clap.get_mut(u)) {
                             p.queue_note_on(pitch, velocity);
+                            st.meter.set_key(pitch, velocity != 0 && !st.muted);
                         } else if st.synth.is_none() && st.pads.contains_key(&pitch) {
                             // Sampler strips: a matching pad plays as a one-shot.
                             st.trigger_sample(pitch, velocity as f32 / 127.0);
                         } else if let Some(s) = st.synth.as_mut() {
                             s.note_on(st.gm_channel, pitch as i32, velocity as i32);
+                            st.meter.set_key(pitch, velocity != 0 && !st.muted);
                         }
                     }
                 }
@@ -1021,8 +1064,10 @@ impl Mixer {
                     if let Some(st) = strips.get_mut(strip as usize) {
                         if let Some(p) = st.clap_instrument.as_ref().and_then(|u| clap.get_mut(u)) {
                             p.queue_note_off(pitch);
+                            st.meter.set_key(pitch, false);
                         } else if let Some(s) = st.synth.as_mut() {
                             s.note_off(st.gm_channel, pitch as i32);
+                            st.meter.set_key(pitch, false);
                         } else {
                             st.release_sample(pitch, (self.sample_rate as f32 * 0.03) as usize);
                         }
@@ -1047,6 +1092,7 @@ impl Mixer {
                 if let Some(st) = strips.get_mut(strip as usize) {
                     st.muted = muted;
                     if muted {
+                        st.meter.set_keys([0; 2]);
                         st.synth_msg(0xB0, 123, 0); // All Notes Off, so unmute is clean
                         if let Some(p) = st.clap_instrument.as_ref().and_then(|u| clap.get_mut(u)) {
                             p.queue_all_notes_off();
@@ -1098,6 +1144,9 @@ impl Mixer {
                     }
                 } else if let Some(st) = self.strip_mut(strip) {
                     st.synth_msg(0xB0, cc as i32, value as i32);
+                    if st.synth.is_some() && matches!(cc, 120 | 123) {
+                        st.meter.set_keys([0; 2]);
+                    }
                 }
             }
             AudioEvent::Modulate { strip, cc, value } => {
@@ -1132,6 +1181,7 @@ impl Mixer {
                 }
             }
             AudioEvent::PreparedAudioClips { clips } => { self.audio_clips = clips; }
+            AudioEvent::SetTrackMonitor { track_id, input } => { self.track_monitor = Some((track_id, input)); }
             AudioEvent::SetAudioClips { clips } => {
                 self.audio_clips.clear();
                 for (id, l, r) in clips {
@@ -1166,6 +1216,7 @@ impl Mixer {
             }
             AudioEvent::Panic => {
                 for st in &mut self.strips {
+                    st.meter.set_keys([0; 2]);
                     st.synth_msg(0xB0, 120, 0); // All Sound Off
                     st.synth_msg(0xB0, 123, 0); // All Notes Off
                     st.sample_voices.clear();
@@ -1209,7 +1260,7 @@ impl Mixer {
         let release_frames = ((self.sample_rate as f32 * 0.03) as usize).max(1);
         // Fader glide ≈15 ms: inaudible as a delay, long enough not to click.
         let glide = 1.0 - (-1.0 / (self.sample_rate.max(1) as f32 * 0.015)).exp();
-        let Mixer { strips, utility, returns, clap, master_meter, scratch_l, scratch_r, .. } = self;
+        let Mixer { strips, utility, returns, clap, master_meter, scratch_l, scratch_r, track_monitor, sample_rate, .. } = self;
 
         for rb in returns.iter_mut() {
             rb.in_l[..frames].fill(0.0);
@@ -1233,6 +1284,7 @@ impl Mixer {
             }
 
             // Sampler one-shots (advance even while muted, so unmute stays in sync).
+            let mut sample_keys = [0u64; 2];
             st.sample_voices.retain_mut(|voice| {
                 let Some(pad) = st.pads.get(&voice.pitch) else { return false };
                 let take = match voice.layer {
@@ -1257,8 +1309,15 @@ impl Mixer {
                     sr[i] += r[k] * gain * env;
                 }
                 voice.position += frames;
-                !released && voice.release != Some(0) && voice.position < len
+                let playing = !released && voice.release != Some(0) && voice.position < len;
+                if playing && voice.release.is_none() && voice.pitch < 128 {
+                    sample_keys[usize::from(voice.pitch) / 64] |= 1 << (voice.pitch % 64);
+                }
+                playing
             });
+            if st.synth.is_none() && st.clap_instrument.is_none() && !st.pads.is_empty() {
+                st.meter.set_keys(if st.muted { [0; 2] } else { sample_keys });
+            }
 
             // Audio-clip voices (same advance-while-muted behavior).
             st.clip_voices.retain_mut(|(l, r, pos, end, gain, start)| {
@@ -1278,6 +1337,12 @@ impl Mixer {
                 *pos += frames;
                 *pos < *end
             });
+
+            if let Some((track_id, input)) = track_monitor.as_mut() {
+                if st.audio_track.as_deref() == Some(track_id.as_str()) {
+                    input.mix_into(sl, sr, *sample_rate);
+                }
+            }
 
             // Fader/pan/mute targets; LFO overrides replace the fader or pan.
             let fader = if st.muted { 0.0 } else { st.mod_gain.unwrap_or(st.gain) };
@@ -1426,6 +1491,7 @@ pub fn build_strips_report(specs: &[StripSpec], main_sf2: &std::path::Path, samp
     let mut meters = Vec::new();
     for spec in specs.iter().take(MAX_STRIPS) {
         let mut strip = Strip::new(sample_rate);
+        strip.audio_track.clone_from(&spec.audio_track);
         match &spec.kind {
             StripKind::Melodic { font, bank, preset } | StripKind::Drum { font, bank, preset } => {
                 let drum = matches!(spec.kind, StripKind::Drum { .. });
@@ -1890,6 +1956,41 @@ mod tests {
     }
 
     #[test]
+    fn live_input_uses_the_audio_tracks_clap_insert_and_stops_when_disabled() {
+        use crate::audio::{input::InputChannels, track_monitor::{self, MonitorSwitch}};
+        let Some(path) = testplug("libdaw_clap_testplug_gain.so") else { return };
+        let mut plugin = super::super::clap::ClapInstance::load(&path, "test.gain", 48_000, 8192).unwrap();
+        let param_id = plugin.handle.param_infos[0].id;
+        let mut vocals = Strip::new(48_000);
+        vocals.audio_track = Some("vocals".into());
+        vocals.clap_fx.push("c1".into());
+        let mut mixer = mixer_with(vec![Strip::new(48_000), vocals]);
+        mixer.handle_event(AudioEvent::AddClapInstance { uid: "c1".into(), processor: plugin.processor.take().unwrap() });
+        mixer.handle_event(AudioEvent::SetClapParam { uid: "c1".into(), param_id, value: 2.0 });
+
+        let switch = Arc::new(MonitorSwitch::default());
+        let (mut writer, input) = track_monitor::channel(48_000, switch.clone());
+        mixer.handle_event(AudioEvent::SetTrackMonitor { track_id: "vocals".into(), input: Box::new(input) });
+        switch.set_enabled(true);
+        let source = [0.25, 0.125].repeat(8);
+        for _ in 0..3 { writer.write(&source, 2, InputChannels::Stereo(0, 1)); }
+        let (mut left, mut right) = ([0.; 8], [0.; 8]);
+        mixer.render_block(&mut left, &mut right);
+        assert!((left[0] - master_limit(0.5)).abs() < 1e-6);
+        assert!((right[0] - master_limit(0.25)).abs() < 1e-6);
+        assert!(mixer.strips[0].meter.read().0 == 0.0);
+
+        mixer.strips.swap(0, 1);
+        mixer.render_block(&mut left, &mut right);
+        assert!((left[0] - master_limit(0.5)).abs() < 1e-6);
+        switch.set_enabled(false);
+        mixer.render_block(&mut left, &mut right);
+        assert_eq!(left, [0.0; 8]);
+        assert_eq!(right, [0.0; 8]);
+        plugin.handle.deactivate(mixer.remove_clap("c1").unwrap());
+    }
+
+    #[test]
     fn clap_instrument_strip_follows_notes() {
         let Some(path) = testplug("libdaw_clap_testplug_tone.so") else { return };
         let mut inst =
@@ -1905,9 +2006,15 @@ mod tests {
         let (mut l, mut r) = (vec![0f32; 8], vec![0f32; 8]);
         m.render_block(&mut l, &mut r);
         assert!((l[0] - 0.25).abs() < 1e-6, "tone instrument sounds, got {}", l[0]);
+        assert_eq!(m.strips[0].meter.pressed_keys(), [1 << 60, 0]);
         m.handle_event(AudioEvent::NoteOff { strip: 0, pitch: 60 });
         m.render_block(&mut l, &mut r);
         assert!(l[0].abs() < 1e-9, "silent after note off, got {}", l[0]);
+        assert_eq!(m.strips[0].meter.pressed_keys(), [0; 2]);
+        m.handle_event(AudioEvent::NoteOn { strip: 0, pitch: 72, velocity: 100 });
+        assert_eq!(m.strips[0].meter.pressed_keys(), [0, 1 << 8]);
+        m.handle_event(AudioEvent::Panic);
+        assert_eq!(m.strips[0].meter.pressed_keys(), [0; 2]);
         if let Some(p) = m.remove_clap("c9") {
             inst.handle.deactivate(p);
         }

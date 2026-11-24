@@ -183,10 +183,31 @@ fn find_output_device(host: &cpal::Host) -> Result<(cpal::Device, cpal::Supporte
     anyhow::bail!("no usable audio output device found ({last_err})")
 }
 
+/// Identify the output the engine would use, without opening a stream.
+pub fn probe_output_device() -> Result<(String, u32, u16)> {
+    let (device, config) = find_output_device(&cpal::default_host())?;
+    let name = device.name().unwrap_or_else(|_| "unnamed output".into());
+    Ok((name, config.sample_rate().0, config.channels()))
+}
+
+fn load_soundfont(path: &Path) -> Result<SoundFont> {
+    use anyhow::Context;
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("cannot open SF2 at {}", path.display()))?;
+    SoundFont::new(&mut file)
+        .with_context(|| format!("cannot read SF2 at {}", path.display()))
+}
+
+/// Parse a SoundFont using the same loader as live playback.
+pub fn probe_soundfont(path: &Path) -> Result<()> {
+    load_soundfont(path)?;
+    Ok(())
+}
+
 impl AudioEngine {
     pub fn new(
         sf2_path: &Path,
-        vis_buf: Option<Arc<Mutex<Vec<f32>>>>,
+        vis_buf: Option<Arc<Mutex<crate::dsp::output::OutputHistory>>>,
         master_meter: Arc<StripMeter>,
         return_meters: [Arc<StripMeter>; 2],
         clap_garbage: crossbeam_channel::Sender<(String, super::clap::ClapProcessor)>,
@@ -198,9 +219,7 @@ impl AudioEngine {
         clock.sample_rate.store(sample_rate, std::sync::atomic::Ordering::Release);
 
         // ── Utility synth (metronome/previews) on the main soundfont ─────
-        let mut sf2_file = std::fs::File::open(sf2_path)
-            .map_err(|e| anyhow::anyhow!("cannot open SF2 at {}: {e}", sf2_path.display()))?;
-        let sound_font = Arc::new(SoundFont::new(&mut sf2_file)?);
+        let sound_font = Arc::new(load_soundfont(sf2_path)?);
         let settings   = SynthesizerSettings::new(sample_rate as i32);
         let utility    = Synthesizer::new(&sound_font, &settings)?;
 
@@ -257,9 +276,8 @@ impl AudioEngine {
                 // Render oversized device buffers in `max_frames` chunks so the
                 // mixer stays in step with the device clock (no silent tail).
                 let mut done = 0;
-                let mut frames = 0; // last chunk's size (visualizer tail)
                 while done < total {
-                    frames = (total - done).min(max_frames);
+                    let frames = (total - done).min(max_frames);
                     render_scheduled_block(&mut mixer, &mut scheduled, device_frame + done as u64, generation,
                         &mut left_buf[..frames], &mut right_buf[..frames],
                         &mut retire_tx, &clap_garbage);
@@ -269,19 +287,14 @@ impl AudioEngine {
                             *sample = if ch == 0 { left_buf[i] } else if ch == 1 { right_buf[i] } else { 0.0 };
                         }
                     }
+                    if let Some(Ok(mut history)) = vis_write.as_ref().map(|history| history.try_lock()) {
+                        history.push(&left_buf[..frames], (channels > 1).then_some(&right_buf[..frames]));
+                    }
                     done += frames;
                 }
                 device_frame += total as u64;
                 clock.frame.store(device_frame, std::sync::atomic::Ordering::Release);
 
-                if let Some(ref vb) = vis_write {
-                    if let Ok(mut vis) = vb.try_lock() {
-                        let count = frames.min(vis.len());
-                        vis.rotate_left(count);
-                        let offset = vis.len() - count;
-                        for i in 0..count { vis[offset + i] = (left_buf[frames - count + i] + right_buf[frames - count + i]) * 0.5; }
-                    }
-                }
                 let elapsed = started.elapsed().as_nanos().min(u64::MAX as u128) as u64;
                 CALLBACK_MAX_NS.fetch_max(elapsed, std::sync::atomic::Ordering::Relaxed);
                 if elapsed > total as u64 * 1_000_000_000 / sample_rate as u64 {
@@ -412,6 +425,7 @@ mod tests {
         )
         .expect("audio engine init failed");
         let spec = super::super::mixer::StripSpec {
+            audio_track: None,
             kind: super::super::mixer::StripKind::Melodic { font: None, bank: 0, preset: 0 },
             gain: 1.0, pan: 0.0, muted: false,
             effects: crate::project::EffectChain::default(),
@@ -441,6 +455,11 @@ fn apply_callback_event(
                         AudioEvent::PreparedAudioClips { clips } => {
                             let old = std::mem::replace(&mut mixer.audio_clips, clips);
                             let _ = retire_tx.try_push(AudioEvent::PreparedAudioClips { clips: old });
+                        }
+                        AudioEvent::SetTrackMonitor { track_id, input } => {
+                            if let Some((track_id, input)) = mixer.track_monitor.replace((track_id, input)) {
+                                let _ = retire_tx.try_push(AudioEvent::SetTrackMonitor { track_id, input });
+                            }
                         }
                         // Retire a CLAP processor: extract it and return it
                         // to the relay for stop/deactivate off the RT thread.

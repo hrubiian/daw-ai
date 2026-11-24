@@ -2,8 +2,8 @@ use super::*;
 use daw_core::project::{EffectParam, ReturnParam};
 
 const STRIP_W: f32 = 136.;
-const STRIP_H: f32 = 480.;
-const LEVEL_H: f32 = 130.;
+const STRIP_H: f32 = 326.;
+const LEVEL_H: f32 = 82.;
 
 #[derive(Clone)]
 enum MixLevel {
@@ -19,7 +19,7 @@ fn db_label(gain: f32) -> String {
     }
 }
 
-fn level_meter(peak: f32, clipped: bool, height: f32) -> gpui::Div {
+fn level_meter(theme: Theme, peak: f32, clipped: bool, height: f32) -> gpui::Div {
     let fraction = if peak <= 0.00001 {
         0.
     } else {
@@ -39,13 +39,13 @@ fn level_meter(peak: f32, clipped: bool, height: f32) -> gpui::Div {
         .flex()
         .flex_col()
         .justify_end()
-        .bg(rgb(BG))
+        .bg(rgb(theme.bg))
         .rounded_sm()
         .overflow_hidden()
         .child(div().w_full().h(px(height * fraction)).bg(rgb(color)))
 }
 
-fn channel_surface(color: u32, selected: bool) -> gpui::Div {
+fn channel_surface(theme: Theme, color: u32, selected: bool) -> gpui::Div {
     div()
         .w(px(STRIP_W))
         .h(px(STRIP_H))
@@ -54,7 +54,7 @@ fn channel_surface(color: u32, selected: bool) -> gpui::Div {
         .flex_col()
         .gap_1()
         .p_2()
-        .bg(rgb(if selected { PANEL_ALT } else { PANEL }))
+        .bg(rgb(if selected { theme.panel_alt } else { theme.panel }))
         .border_t_4()
         .border_color(rgb(color))
 }
@@ -111,6 +111,7 @@ impl DawView {
         clipped: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let theme = self.theme();
         let id = match &target {
             MixLevel::Track(id) => id.clone(),
             MixLevel::Return(i) => format!("return-{i}"),
@@ -122,7 +123,40 @@ impl DawView {
             .flex_col()
             .items_center()
             .gap_1()
-            .child(div().text_color(rgb(TEXT_DIM)).child("Level"))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_1()
+                    .child(
+                        div()
+                            .text_color(rgb(theme.text))
+                            .text_size(px(11.))
+                            .child(db_label(gain)),
+                    )
+                    .child(
+                        theme.cell_btn(format!("mix-level-down-{id}"), "−", false, theme.panel_alt).on_click(
+                            cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                                this.mix_level_nudge(
+                                    &down,
+                                    if e.modifiers().shift { -0.005 } else { -0.05 },
+                                );
+                                cx.notify();
+                            }),
+                        ),
+                    )
+                    .child(
+                        theme.cell_btn(format!("mix-level-up-{id}"), "+", false, theme.panel_alt).on_click(
+                            cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
+                                this.mix_level_nudge(
+                                    &up,
+                                    if e.modifiers().shift { 0.005 } else { 0.05 },
+                                );
+                                cx.notify();
+                            }),
+                        ),
+                    ),
+            )
             .child(
                 div()
                     .id(SharedString::from(selector.clone()))
@@ -131,16 +165,18 @@ impl DawView {
                     .flex()
                     .items_end()
                     .gap_2()
-                    .tooltip(|_, cx| {
+                    .tooltip(move |_, cx| {
                         cx.new(|_| TextTooltip {
+                            theme,
                             text: "Wheel to adjust level · Shift for fine changes".into(),
                         })
                         .into()
                     })
                     .on_scroll_wheel(cx.listener(move |this, e: &gpui::ScrollWheelEvent, _, cx| {
-                        cx.stop_propagation();
-                        let dy = f32::from(e.delta.pixel_delta(px(16.)).y);
-                        if dy != 0. {
+                        let delta = e.delta.pixel_delta(px(16.));
+                        let dy = f32::from(delta.y);
+                        if dy.abs() > f32::from(delta.x).abs() {
+                            cx.stop_propagation();
                             this.mix_level_nudge(
                                 &wheel,
                                 dy.signum() * if e.modifiers.shift { 0.005 } else { 0.025 },
@@ -157,7 +193,7 @@ impl DawView {
                             .flex_col()
                             .justify_end()
                             .rounded_sm()
-                            .bg(rgb(BG))
+                            .bg(rgb(theme.bg))
                             .overflow_hidden()
                             .child(
                                 div()
@@ -172,38 +208,10 @@ impl DawView {
                                     .bottom(px(LEVEL_H / max))
                                     .w_full()
                                     .h(px(1.))
-                                    .bg(rgb(TEXT)),
+                                    .bg(rgb(theme.text)),
                             ),
                     )
-                    .child(level_meter(peak, clipped, LEVEL_H)),
-            )
-            .child(div().text_color(rgb(TEXT)).child(db_label(gain)))
-            .child(
-                div()
-                    .flex()
-                    .gap_2()
-                    .child(
-                        cell_btn(format!("mix-level-down-{id}"), "−", false, PANEL_ALT).on_click(
-                            cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                                this.mix_level_nudge(
-                                    &down,
-                                    if e.modifiers().shift { -0.005 } else { -0.05 },
-                                );
-                                cx.notify();
-                            }),
-                        ),
-                    )
-                    .child(
-                        cell_btn(format!("mix-level-up-{id}"), "+", false, PANEL_ALT).on_click(
-                            cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
-                                this.mix_level_nudge(
-                                    &up,
-                                    if e.modifiers().shift { 0.005 } else { 0.05 },
-                                );
-                                cx.notify();
-                            }),
-                        ),
-                    ),
+                    .child(level_meter(theme, peak, clipped, LEVEL_H)),
             )
     }
 
@@ -215,6 +223,7 @@ impl DawView {
         value: f32,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let theme = self.theme();
         let (down, up) = (id.to_string(), id.to_string());
         div()
             .flex()
@@ -225,11 +234,11 @@ impl DawView {
                     .flex_1()
                     .min_w_0()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child(format!("{label} {:.0}%", value * 100.)),
             )
             .child(
-                cell_btn(format!("mix-send-down-{label}-{id}"), "−", false, PANEL_ALT).on_click(
+                theme.cell_btn(format!("mix-send-down-{label}-{id}"), "−", false, theme.panel_alt).on_click(
                     cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                         this.undo.record("mix send", &this.st.project);
                         this.st.project.nudge_effect(
@@ -243,7 +252,7 @@ impl DawView {
                 ),
             )
             .child(
-                cell_btn(format!("mix-send-up-{label}-{id}"), "+", false, PANEL_ALT).on_click(
+                theme.cell_btn(format!("mix-send-up-{label}-{id}"), "+", false, theme.panel_alt).on_click(
                     cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                         this.undo.record("mix send", &this.st.project);
                         this.st.project.nudge_effect(
@@ -265,6 +274,7 @@ impl DawView {
         clipped: bool,
         cx: &mut Context<Self>,
     ) -> gpui::Div {
+        let theme = self.theme();
         let t = &self.st.project.tracks[index];
         let (select, mute, solo, left, right, fx) = (
             t.id.clone(),
@@ -279,18 +289,18 @@ impl DawView {
         let selected =
             self.st.selected_track.as_deref() == Some(&t.id) && self.st.selected_return.is_none();
         let selector = format!("mix-channel-{}", t.id);
-        channel_surface(track_color(index), selected)
+        channel_surface(theme, track_color(index), selected)
             .child(
                 div()
                     .id(SharedString::from(selector.clone()))
                     .debug_selector(move || selector.clone())
-                    .h(px(38.))
+                    .h(px(21.))
                     .flex_shrink_0()
-                    .overflow_hidden()
+                    .truncate()
                     .cursor_pointer()
-                    .text_color(rgb(TEXT))
+                    .text_color(rgb(theme.text))
                     .child(t.name.clone())
-                    .tooltip(move |_, cx| cx.new(|_| TextTooltip { text: name.clone() }).into())
+                    .tooltip(move |_, cx| cx.new(|_| TextTooltip { theme, text: name.clone() }).into())
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.st.select_track(&select);
                         this.st.selected_return = None;
@@ -305,10 +315,11 @@ impl DawView {
                     .overflow_hidden()
                     .whitespace_nowrap()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child(instrument_label(t))
                     .tooltip(move |_, cx| {
                         cx.new(|_| TextTooltip {
+                            theme,
                             text: instrument.clone(),
                         })
                         .into()
@@ -319,7 +330,7 @@ impl DawView {
                     .flex()
                     .gap_1()
                     .child(
-                        cell_btn(format!("mix-mute-{}", t.id), "Mute", t.muted, RECORD).on_click(
+                        theme.cell_btn(format!("mix-mute-{}", t.id), "Mute", t.muted, RECORD).on_click(
                             cx.listener(move |this, _, _, cx| {
                                 this.toggle_mute(&mute);
                                 cx.notify();
@@ -327,7 +338,7 @@ impl DawView {
                         ),
                     )
                     .child(
-                        cell_btn(
+                        theme.cell_btn(
                             format!("mix-solo-{}", t.id),
                             "Solo",
                             self.st.soloed.contains(&t.id),
@@ -339,13 +350,21 @@ impl DawView {
                         })),
                     ),
             )
+            .child(self.mix_level_control(
+                MixLevel::Track(t.id.clone()),
+                t.volume,
+                2.,
+                peak,
+                clipped,
+                cx,
+            ))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_1()
                     .child(
-                        cell_btn(format!("mix-pan-left-{}", t.id), "‹", false, PANEL_ALT).on_click(
+                        theme.cell_btn(format!("mix-pan-left-{}", t.id), "‹", false, theme.panel_alt).on_click(
                             cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                                 this.nudge_pan(
                                     &left,
@@ -359,11 +378,11 @@ impl DawView {
                         div()
                             .flex_1()
                             .text_size(px(11.))
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(theme.text_dim))
                             .child(pan_label(t.pan)),
                     )
                     .child(
-                        cell_btn(format!("mix-pan-right-{}", t.id), "›", false, PANEL_ALT)
+                        theme.cell_btn(format!("mix-pan-right-{}", t.id), "›", false, theme.panel_alt)
                             .on_click(cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                                 this.nudge_pan(
                                     &right,
@@ -387,17 +406,9 @@ impl DawView {
                 t.effects.send_delay,
                 cx,
             ))
-            .child(self.mix_level_control(
-                MixLevel::Track(t.id.clone()),
-                t.volume,
-                2.,
-                peak,
-                clipped,
-                cx,
-            ))
             .child(div().flex_1())
             .child(
-                cell_btn(format!("mix-fx-{}", t.id), "Effects…", false, PANEL_ALT).on_click(
+                theme.cell_btn(format!("mix-fx-{}", t.id), "Effects…", false, theme.panel_alt).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.st.select_track(&fx);
                         this.st.selected_return = None;
@@ -409,6 +420,7 @@ impl DawView {
     }
 
     fn mix_return_strip(&self, index: usize, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let (label, gain, muted) = if index == 0 {
             (
                 "Reverb",
@@ -423,10 +435,10 @@ impl DawView {
             )
         };
         let (peak, clipped) = self.host.return_meters[index].read();
-        channel_surface(self.accent(), self.st.selected_return == Some(index))
+        channel_surface(theme, self.accent(), self.st.selected_return == Some(index))
             .child(
                 div()
-                    .h(px(38.))
+                    .h(px(21.))
                     .flex_shrink_0()
                     .text_color(rgb(self.accent()))
                     .child(label),
@@ -435,26 +447,25 @@ impl DawView {
                 div()
                     .h(px(18.))
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child("Shared return"),
             )
             .child(
-                cell_btn(format!("mix-return-mute-{index}"), "Mute", muted, RECORD).on_click(
+                theme.cell_btn(format!("mix-return-mute-{index}"), "Mute", muted, RECORD).on_click(
                     cx.listener(move |this, _, _, cx| {
                         this.toggle_return_mute(index);
                         cx.notify();
                     }),
                 ),
             )
-            .child(div().h(px(96.)).flex_shrink_0())
             .child(self.mix_level_control(MixLevel::Return(index), gain, 1.25, peak, clipped, cx))
             .child(div().flex_1())
             .child(
-                cell_btn(
+                theme.cell_btn(
                     format!("mix-return-fx-{index}"),
                     "Effects…",
                     false,
-                    PANEL_ALT,
+                    theme.panel_alt,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.st.selected_return = Some(index);
@@ -465,33 +476,34 @@ impl DawView {
     }
 
     fn mix_master_strip(&self) -> gpui::Div {
+        let theme = self.theme();
         let (peak, clipped) = self.host.master_meter.read();
-        channel_surface(TEXT_DIM, false)
-            .child(div().h(px(38.)).text_color(rgb(TEXT)).child("Master"))
+        channel_surface(theme, theme.text_dim, false)
+            .child(div().h(px(21.)).text_color(rgb(theme.text)).child("Master"))
             .child(
                 div()
                     .h(px(18.))
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child("Output meter"),
             )
-            .child(div().h(px(96.)).flex_shrink_0())
+            .child(div().h(px(24.)).flex_shrink_0())
             .child(
                 div()
                     .flex()
                     .justify_center()
-                    .child(level_meter(peak, clipped, LEVEL_H + 70.)),
+                    .child(level_meter(theme, peak, clipped, LEVEL_H)),
             )
             .child(
                 div()
-                    .text_color(rgb(if clipped { RECORD } else { TEXT }))
+                    .text_color(rgb(if clipped { RECORD } else { theme.text }))
                     .child(db_label(peak)),
             )
             .child(div().flex_1())
             .child(
                 div()
                     .text_size(px(11.))
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child("Post limiter"),
             )
     }
@@ -501,6 +513,7 @@ impl DawView {
         width: f32,
         cx: &mut Context<Self>,
     ) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme();
         let pinned_returns = width >= 1100.;
         let peaks: Vec<_> = self
             .host
@@ -533,28 +546,29 @@ impl DawView {
             .child(self.mix_master_strip());
         div()
             .id("mixing-workspace")
+            .text_size(px(12.))
+            .line_height(px(17.))
             .debug_selector(|| "mixing-workspace".into())
             .flex_1()
             .min_h_0()
             .min_w_0()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
+            .bg(rgb(theme.bg))
             .child(
                 div()
                     .flex()
-                    .flex_wrap()
+                    .items_center()
                     .gap_2()
-                    .px_3()
-                    .py_2()
+                    .px_2()
+                    .py_1()
+                    .bg(rgb(theme.panel))
+                    .border_b_1()
+                    .border_color(rgb(theme.border))
                     .flex_shrink_0()
+                    .child(div().flex_1().text_color(rgb(theme.text)).child("Mixer"))
                     .child(
-                        div()
-                            .text_color(rgb(TEXT))
-                            .child(format!("Mixing · {} tracks", self.st.project.tracks.len())),
-                    )
-                    .child(
-                        cell_btn(
+                        theme.cell_btn(
                             "mix-balance",
                             if self.balance_running {
                                 "Balancing…"
@@ -562,18 +576,12 @@ impl DawView {
                                 "Auto balance"
                             },
                             false,
-                            PANEL_ALT,
+                            theme.panel_alt,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
                             this.start_mix_balance();
                             cx.notify();
                         })),
-                    )
-                    .child(
-                        div()
-                            .text_size(px(11.))
-                            .text_color(rgb(TEXT_DIM))
-                            .child("Shift: fine adjustment · Scroll sideways for more channels"),
                     ),
             )
             .child(
@@ -612,7 +620,7 @@ mod tests {
     use super::*;
 
     #[gpui::test]
-    fn mixing_tab_controls_only_the_target_and_keeps_transport_and_patterns(
+    fn mixer_controls_only_the_target_and_keeps_arrangement_and_editor(
         cx: &mut gpui::TestAppContext,
     ) {
         let (host, commands, _audio) = Host::headless();
@@ -629,11 +637,15 @@ mod tests {
         cx.simulate_resize(size(px(1280.), px(800.)));
         cx.run_until_parked();
         let button = cx
-            .debug_bounds("dock-tab-Mixing")
-            .expect("Mixing tab is visible");
+            .debug_bounds("toggle-mixer")
+            .expect("Mixer switch is visible");
         cx.simulate_click(button.center(), gpui::Modifiers::default());
         cx.run_until_parked();
-        assert!(cx.debug_bounds("mixing-workspace").is_some());
+        let arrange = cx.debug_bounds("arrangement").unwrap();
+        let mixer = cx.debug_bounds("mixing-workspace").unwrap();
+        let editor = cx.debug_bounds("editor-dock").unwrap();
+        assert!(arrange.bottom() < mixer.top());
+        assert!(mixer.bottom() < editor.top());
         let before = view.read_with(cx, |v, _| v.st.project.tracks[1].volume);
         let button = cx.debug_bounds("mix-level-up-t2").unwrap();
         cx.simulate_click(button.center(), gpui::Modifiers::default());
@@ -656,6 +668,12 @@ mod tests {
         });
         view.read_with(cx, |v, _| assert_eq!(v.st.project.tracks[1].volume, before));
         cx.run_until_parked();
+        view.update(cx, |v, cx| {
+            v.mix_vertical_scroll
+                .set_offset(gpui::point(px(0.), px(-10000.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
         let button = cx.debug_bounds("mix-send-up-Reverb-t2").unwrap();
         let send = view.read_with(cx, |v, _| v.st.project.tracks[1].effects.reverb);
         cx.simulate_click(button.center(), gpui::Modifiers::default());
@@ -664,20 +682,34 @@ mod tests {
             assert_eq!(v.st.selected_track.as_deref(), Some(first.as_str()));
         });
         cx.run_until_parked();
+        view.update(cx, |v, cx| {
+            v.mix_vertical_scroll
+                .set_offset(gpui::point(px(0.), px(0.)));
+            cx.notify();
+        });
+        cx.run_until_parked();
         let button = cx.debug_bounds("mix-level-up-return-1").unwrap();
         let gain = view.read_with(cx, |v, _| v.st.project.returns.delay.gain);
         cx.simulate_click(button.center(), gpui::Modifiers::default());
         view.read_with(cx, |v, _| {
             assert!((v.st.project.returns.delay.gain - gain - 0.05).abs() < 0.0001);
-            assert_eq!(v.st.active_dock, DockTab::Mixing);
+            assert_eq!(v.st.active_dock, DockTab::Sequencer);
+            assert!(v.st.mixer_open);
             assert!(!v.st.fx_window_open);
+        });
+        cx.run_until_parked();
+        view.update(cx, |v, cx| {
+            v.mix_vertical_scroll
+                .set_offset(gpui::point(px(0.), px(-10000.)));
+            cx.notify();
         });
         cx.run_until_parked();
         let button = cx.debug_bounds("mix-fx-t2").unwrap();
         cx.simulate_click(button.center(), gpui::Modifiers::default());
         view.read_with(cx, |v, _| {
             assert!(v.st.fx_window_open);
-            assert_eq!(v.st.active_dock, DockTab::Mixing);
+            assert_eq!(v.st.active_dock, DockTab::Sequencer);
+            assert!(v.st.mixer_open);
             assert_eq!(v.st.selected_track.as_deref(), Some(second.as_str()));
             assert!(v.st.selected_return.is_none());
         });
@@ -690,11 +722,71 @@ mod tests {
         cx.simulate_click(button.center(), gpui::Modifiers::default());
         view.read_with(cx, |v, _| {
             assert_eq!(v.st.active_dock, DockTab::PianoRoll);
+            assert!(v.st.mixer_open);
             assert!(v.playing);
             assert_eq!(
                 serde_json::to_value(&v.st.project.patterns).unwrap(),
                 patterns
             );
+        });
+    }
+
+    #[gpui::test]
+    fn mixer_splitter_resizes_the_panel_and_short_windows_keep_editor_tabs(
+        cx: &mut gpui::TestAppContext,
+    ) {
+        use gpui::{Modifiers, MouseButton, point};
+
+        let (host, _commands, _audio) = Host::headless();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, Project::default_project(), None, String::new(), cx);
+            view.sf2_missing = false;
+            view.st.mixer_open = true;
+            view
+        });
+        cx.simulate_resize(size(px(1280.), px(900.)));
+        cx.run_until_parked();
+        let mixer = cx.debug_bounds("mixing-workspace").unwrap();
+        let editor = cx.debug_bounds("editor-dock").unwrap();
+        let splitter = cx.debug_bounds("rz-mixer").unwrap().center();
+        cx.simulate_mouse_down(splitter, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(
+            splitter + point(px(0.), px(-12.)),
+            MouseButton::Left,
+            Modifiers::default(),
+        );
+        let finish = splitter + point(px(0.), px(-52.));
+        cx.simulate_mouse_move(finish, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(finish, MouseButton::Left, Modifiers::default());
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("mixing-workspace").unwrap().size.height > mixer.size.height);
+        assert_eq!(cx.debug_bounds("editor-dock").unwrap(), editor);
+
+        cx.simulate_resize(size(px(800.), px(480.)));
+        cx.run_until_parked();
+        assert!(cx.debug_bounds("arrangement").is_some());
+        assert!(cx.debug_bounds("mixing-workspace").is_some());
+        let compact_mixer = cx.debug_bounds("mixing-workspace").unwrap();
+        let tabs = cx.debug_bounds("editor-tabs").unwrap();
+        assert_eq!(compact_mixer.bottom(), tabs.top());
+        for id in [
+            "transport-play",
+            "transport-position",
+            "toggle-mixer",
+            "toggle-arrange",
+        ] {
+            let control = cx.debug_bounds(id).unwrap();
+            assert!(control.left() >= px(0.) && control.right() <= px(800.));
+        }
+        let piano = cx.debug_bounds("dock-tab-Piano Roll").unwrap();
+        cx.simulate_click(piano.center(), Modifiers::default());
+        cx.run_until_parked();
+        let editor = cx.debug_bounds("editor-dock").unwrap();
+        assert_eq!(editor.size.width, px(800.));
+        assert!(editor.top() < tabs.top());
+        view.read_with(cx, |v, _| {
+            assert!(!v.st.mixer_open);
+            assert_eq!(v.st.active_dock, DockTab::PianoRoll);
         });
     }
 
@@ -713,8 +805,7 @@ mod tests {
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut v = DawView::new(host, project, None, String::new(), cx);
             v.sf2_missing = false;
-            v.st.active_dock = DockTab::Mixing;
-            v.st.browser_open = true;
+            v.st.mixer_open = true;
             v
         });
         for (width, height) in [(800., 480.), (1280., 800.), (1920., 1080.), (800., 480.)] {
@@ -722,19 +813,28 @@ mod tests {
             view.update(cx, |v, cx| {
                 v.mix_scroll.set_offset(gpui::point(px(-10000.), px(0.)));
                 v.mix_vertical_scroll
-                    .set_offset(gpui::point(px(0.), px(-10000.)));
+                    .set_offset(gpui::point(px(0.), px(0.)));
                 cx.notify();
             });
             cx.run_until_parked();
-            let button = cx
-                .debug_bounds("mix-level-up-mix-extra-19")
-                .expect("last channel paints after scrolling");
-            assert!(button.center().x > px(0.) && button.center().x < px(width));
-            assert!(button.center().y > px(0.) && button.center().y < px(height));
+            let button = cx.debug_bounds("mix-level-up-mix-extra-19").unwrap();
+            let viewport = view.read_with(cx, |v, _| v.mix_vertical_scroll.bounds());
+            let offset = (viewport.center().y - button.center().y).min(px(0.));
+            view.update(cx, |v, cx| {
+                v.mix_vertical_scroll
+                    .set_offset(gpui::point(px(0.), offset));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let button = cx.debug_bounds("mix-level-up-mix-extra-19").unwrap();
+            assert!(viewport.contains(&button.center()));
             let before = view.read_with(cx, |v, _| v.st.project.tracks.last().unwrap().volume);
             cx.simulate_click(button.center(), gpui::Modifiers::default());
             view.read_with(cx, |v, _| {
-                assert!(v.st.project.tracks.last().unwrap().volume > before)
+                assert!(
+                    v.st.project.tracks.last().unwrap().volume > before,
+                    "last channel did not respond at {width} × {height}: {button:?}"
+                )
             });
             view.update(cx, |v, cx| {
                 v.mix_vertical_scroll
@@ -751,7 +851,8 @@ mod tests {
             cx.simulate_click(button.center(), gpui::Modifiers::default());
             view.read_with(cx, |v, _| {
                 assert_ne!(v.st.project.returns.delay.muted, before);
-                assert_eq!(v.st.active_dock, DockTab::Mixing);
+                assert_eq!(v.st.active_dock, DockTab::Sequencer);
+                assert!(v.st.mixer_open);
                 assert!(!v.st.fx_window_open);
             });
         }

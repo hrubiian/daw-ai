@@ -13,7 +13,10 @@ For revision-linked background jobs, cancellation and A/B artifacts, see [live c
 | Overall levels / clipping / spectral tilt of the whole mix | `listen` | yes |
 | **Which tracks** are muddy / **which tracks mask** each other | `analyze_mix` | yes (per-track solo) |
 | Does the piece **build** or is it a flat, static texture? | `analyze_arrangement` | yes (one mix render) |
-| Does the rhythm **feel human** or robotic/dead-on-grid? | `analyze_groove` | no (symbolic) |
+| How close are the written patterns to the grid? | `analyze_groove` | no (symbolic) |
+| Is a bass hit ahead of or behind the kick? | `compare_groove` | no (scheduled note events) |
+| Do the DAW's effects obscure the attacks? | `start_listen` with `dry: true` | yes |
+| Which revision works better to a listener? | `prepare_audition`, `record_audition_choice` | uses two completed renders |
 | Every track sitting at a sensible level? | `auto_balance` | yes (per-track solo) |
 | **What changed** between two versions? | `diff_project` | no (symbolic) |
 | **Did my last edit break the mix?** | `snapshot` / `check` | yes |
@@ -31,7 +34,41 @@ For revision-linked background jobs, cancellation and A/B artifacts, see [live c
   `no intro build` (all tracks from bar 1). Use to check the piece has *shape*.
 - **`analyze_groove`** — how notes sit against the 16th grid (on-grid % +
   micro-timing spread) plus `swing`/`humanize`/`timing`; flags `mechanical`.
-  Off-grid placement *or* swing both count as feel. Fast, no render.
+  This summarizes pattern definitions and settings.
+
+## Compare two parts
+
+Call `compare_groove` with arrangement bars and the sources you want to compare.
+For example, to compare bass onsets with MIDI kick pitch 36 on a drum track:
+
+```json
+{
+  "reference": {"track_id": "drums", "pitch": 36},
+  "target": {"track_id": "bass"},
+  "start_bar": 0,
+  "end_bar": 4,
+  "tolerance_ms": 40
+}
+```
+
+Bars are zero-based and the end is exclusive. A request covers up to 32 bars.
+The tool follows clip offsets, resized repeats, step swing and timing humanization.
+Each distinct onset tick counts once, including when several notes form a chord.
+It reports exact matches and matches within the chosen tolerance. Positive deltas
+mean the target follows a reference note. Negative deltas mean it leads. Each row
+shows the closest reference and the neighboring references within one beat, or
+farther when the tolerance is larger. The search can cross bar boundaries. Counts
+cover every hit, with up to 16 detailed offsets per bar.
+
+Use the offsets to check the groove you intended. Counter rhythms can sit apart
+on purpose. To hear whether attacks or echoes are changing the feel, submit paired
+`start_listen` jobs with the same `start_bar`, `end_bar` and `tracks`. Enable `dry`
+on one job to bypass track effects and shared returns in its snapshot. Instrument
+envelopes and internal plugin effects remain active. `compare_renders` links the
+two completed WAVs for audition.
+
+For short MCP audio excerpts and loudness-matched listener comparisons, see
+the [composition workflow](music-collaboration.md#listening-tools).
 
 ## Music CI (version + test)
 

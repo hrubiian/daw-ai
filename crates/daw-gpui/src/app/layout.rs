@@ -1,58 +1,85 @@
-//! Keep the arrangement usable when docks or the desktop window change size.
+//! Panel sizes shared by layout, splitter drags and arrangement scrolling.
 use super::*;
 
-const MIN_TIMELINE: f32 = 200.;
+pub(super) const SPLITTER_H: f32 = 5.;
+const MIN_TRACKS_H: f32 = 88.;
+const MIN_EDITOR_H: f32 = 124.;
+const MIN_MIXER_H: f32 = 184.;
+
+pub(super) fn instrument_browser_width(window_width: f32) -> f32 {
+    (window_width - 500.).clamp(260., 360.)
+}
 
 pub(super) struct PanelLayout {
-    pub browser: Option<f32>,
-    pub mixer: Option<f32>,
-    pub dock_height: f32,
+    pub mixer_height: Option<f32>,
+    pub editor_height: Option<f32>,
 }
 
 impl PanelLayout {
-    pub fn new(
-        width: f32,
-        height: f32,
-        browser: Option<f32>,
-        mixer: Option<f32>,
-        dock: f32,
-        banner: bool,
-    ) -> Self {
-        let mut budget = (width - TRACK_HEADER_W - MIN_TIMELINE).max(0.);
-        // Keep the mixer when requested; collapse the browser first on small screens.
-        let mixer = mixer.filter(|_| budget >= 145.).map(|w| {
-            let w = w.clamp(140., 520.).min(budget - 5.);
-            budget -= w + 5.;
-            w
-        });
-        let browser = browser
-            .filter(|_| budget >= 125.)
-            .map(|w| w.clamp(120., 520.).min(budget - 5.));
-        let chrome = 120. + if banner { 22. } else { 0. };
-        let max_dock = (height - chrome - RULER_H - LOOP_LANE_H - 100. - 5.).max(80.);
-        Self {
-            browser,
-            mixer,
-            dock_height: dock.clamp(80., max_dock),
+    pub fn new(height: f32, state: &HeadlessState, banner: bool) -> Self {
+        if state.arrange_full {
+            return Self {
+                mixer_height: None,
+                editor_height: None,
+            };
         }
+
+        let chrome = ARRANGE_CHROME_H + if banner { SOUNDFONT_BANNER_H } else { 0. };
+        let available =
+            (height - chrome - MIN_TRACKS_H - SPLITTER_H).max(0.);
+        if !state.mixer_open {
+            return Self {
+                mixer_height: None,
+                editor_height: Some(state.dock_h.clamp(80., available.max(80.))),
+            };
+        }
+
+        let pair = available - SPLITTER_H;
+        if pair >= MIN_MIXER_H + MIN_EDITOR_H {
+            let mixer = state.mixer_h.clamp(MIN_MIXER_H, pair - MIN_EDITOR_H);
+            return Self {
+                mixer_height: Some(mixer),
+                editor_height: Some(state.dock_h.clamp(MIN_EDITOR_H, pair - mixer)),
+            };
+        }
+
+        Self {
+            mixer_height: Some((available - editors::EDITOR_TABS_H).max(0.)),
+            editor_height: None,
+        }
+    }
+
+    pub fn bottom_height(&self) -> f32 {
+        let mixer = self.mixer_height.map_or(0., |height| height + SPLITTER_H);
+        let editor = match self.editor_height {
+            Some(height) => height + SPLITTER_H,
+            None if self.mixer_height.is_some() => editors::EDITOR_TABS_H,
+            None => 0.,
+        };
+        mixer + editor
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
     #[test]
-    fn docks_leave_room_for_timeline_and_tracks_after_resize() {
-        for width in [800., 900., 1280., 1920.] {
-            let layout = PanelLayout::new(width, 448., Some(520.), Some(520.), 700., true);
-            let used = layout.browser.map_or(0., |w| w + 5.) + layout.mixer.map_or(0., |w| w + 5.);
-            assert!(width - used - TRACK_HEADER_W >= MIN_TIMELINE);
-            assert!(layout.dock_height + 142. + RULER_H + LOOP_LANE_H + 105. <= 448.);
+    fn mixer_and_editor_leave_room_for_tracks_on_resize() {
+        let mut state = HeadlessState::from_project(Project::default_project(), None);
+        state.mixer_open = true;
+        state.mixer_h = 500.;
+        state.dock_h = 500.;
+        for (height, banner) in [(448., true), (600., false), (768., false), (1048., true)] {
+            let layout = PanelLayout::new(height, &state, banner);
+            assert!(layout.mixer_height.is_some());
+            assert_eq!(layout.editor_height.is_some(), height >= 600.);
+            let chrome = ARRANGE_CHROME_H + if banner { SOUNDFONT_BANNER_H } else { 0. };
+            assert!(
+                layout.bottom_height() + chrome + MIN_TRACKS_H <= height
+            );
         }
-        let small = PanelLayout::new(800., 448., Some(200.), Some(220.), 200., false);
-        assert!(small.mixer.is_none());
-        let mid = PanelLayout::new(900., 600., Some(200.), Some(220.), 200., false);
-        assert!(mid.browser.is_none());
-        assert!(mid.mixer.is_some());
+        state.arrange_full = true;
+        assert_eq!(PanelLayout::new(768., &state, false).bottom_height(), 0.);
     }
 }

@@ -464,7 +464,7 @@ pub enum TrackType {
     Audio,
 }
 
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum Instrument {
     Soundfont {
@@ -488,7 +488,7 @@ pub enum Instrument {
 pub struct ClapSlot {
     /// Stable identity — plugin instances are cached by this across edits.
     pub uid: String,
-    /// Path to the `.clap` bundle.
+    /// Path to the CLAP bundle or installed `.fmx` export.
     pub path: String,
     /// Plugin id within the bundle (e.g. "org.surge-synth-team.surge-xt").
     pub id: String,
@@ -703,6 +703,18 @@ pub struct PianoRollPattern {
     /// start). Off by default. Tuned for melodic lines.
     #[serde(default)]
     pub legato: bool,
+}
+
+impl PianoRollPattern {
+    pub fn length_ticks(&self) -> u32 {
+        self.ticks_per_bar * u32::from(self.bars)
+    }
+
+    /// Notes with onsets inside the current pattern length.
+    pub fn active_notes(&self) -> impl Iterator<Item = &Note> {
+        let length = self.length_ticks();
+        self.notes.iter().filter(move |note| note.tick < length)
+    }
 }
 
 #[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]

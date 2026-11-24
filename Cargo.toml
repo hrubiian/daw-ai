@@ -1,6 +1,6 @@
 [package]
 name = "daw-ai"
-version = "0.2.0"
+version = "0.2.1"
 edition = "2021"
 
 [workspace]
@@ -38,11 +38,11 @@ crossbeam-channel   = "0.5"
 # `cargo run` / ./run-gui.sh must be usable for real work: an unoptimized UI
 # toolkit and synth cost ~9x per frame (measured with the daw-gpui
 # `frame_cost_on_a_large_song` benchmark). Dependencies are built fully
-# optimized once; workspace crates get light optimization and keep line-level
-# debug info, so rust-gdb and backtraces still work.
+# optimized once; workspace crates get incremental builds, light optimization,
+# and line-level debug info for rust-gdb and backtraces.
 [profile.dev]
 debug = 1
-incremental = false
+incremental = true
 opt-level = 1
 
 [profile.dev.package."*"]

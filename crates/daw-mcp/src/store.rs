@@ -57,7 +57,8 @@ impl ProjectStore {
             let snapshot = self.inspect_live()?;
             let mut p = snapshot.project;
             let msg = op(&mut p)?;
-            let response = self.live_request(daw_core::session::Request { version: 1, operation_id: daw_io::session::operation_id(), expected_revision: Some(snapshot.revision), command: daw_core::session::Command::Batch { label: "agent edit".into(), edits: vec![daw_core::session::Edit::Replace { project: p }] } })?;
+            let action: String = msg.lines().next().unwrap_or("edit").chars().take(100).collect();
+            let response = self.live_request(daw_core::session::Request { version: 1, operation_id: daw_io::session::operation_id(), expected_revision: Some(snapshot.revision), command: daw_core::session::Command::Batch { label: format!("Agent: {action}"), edits: vec![daw_core::session::Edit::Replace { project: p }] } })?;
             if let Some(e) = response.error { return Err(format!("{}: {}", e.code, e.message)); }
             return Ok(format!("{msg} · revision {} · engine {}", response.revision, response.engine_status));
         }

@@ -1,4 +1,5 @@
 use anyhow::Result;
+use daw_core::audio::{export_mp3, export_wav, ExportFormat};
 use daw_core::project::{format as project_fmt, Project};
 use daw_io::Host;
 use daw_tui::app::App;
@@ -6,6 +7,8 @@ use std::{
     path::{Path, PathBuf},
     sync::Arc,
 };
+
+mod doctor;
 
 /// Make relative asset paths (`assets/GeneralUser.sf2`, `assets/samples/…`)
 /// resolve regardless of how the app was launched. A desktop-icon launch starts
@@ -33,22 +36,41 @@ fn ensure_asset_cwd() {
 struct LaunchOptions {
     gui: bool,
     project: Option<PathBuf>,
-    mp3: Option<PathBuf>,
+    export: Option<(ExportFormat, PathBuf)>,
+    doctor: bool,
+    headless: bool,
+    import_plugin: Option<PathBuf>,
 }
 
 fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions> {
     let mut options = LaunchOptions::default();
-    let mut args = args.into_iter();
+    let mut args = args.into_iter().peekable();
+    if args.peek().is_some_and(|arg| arg == "doctor") {
+        options.doctor = true;
+        args.next();
+    }
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "--gui" => options.gui = true,
-            "--export-mp3" => {
-                anyhow::ensure!(options.mp3.is_none(), "specify --export-mp3 only once");
+            "--headless" => options.headless = true,
+            "--import-plugin" => {
+                anyhow::ensure!(options.import_plugin.is_none(), "specify only one plugin to import");
+                let path = args.next().filter(|a| !a.starts_with("--"))
+                    .ok_or_else(|| anyhow::anyhow!("--import-plugin requires a Flow Music .fmx file"))?;
+                options.import_plugin = Some(PathBuf::from(path));
+            }
+            "--export-mp3" | "--export-wav" => {
+                anyhow::ensure!(options.export.is_none(), "specify only one export");
                 let path = args
                     .next()
                     .filter(|a| !a.starts_with("--"))
-                    .ok_or_else(|| anyhow::anyhow!("--export-mp3 requires an output filename"))?;
-                options.mp3 = Some(PathBuf::from(path));
+                    .ok_or_else(|| anyhow::anyhow!("{arg} requires an output filename"))?;
+                let format = if arg == "--export-wav" {
+                    ExportFormat::Wav
+                } else {
+                    ExportFormat::Mp3
+                };
+                options.export = Some((format, PathBuf::from(path)));
             }
             flag if flag.starts_with("--") => anyhow::bail!("unknown option: {flag}"),
             _ => {
@@ -58,25 +80,45 @@ fn parse_args(args: impl IntoIterator<Item = String>) -> Result<LaunchOptions> {
         }
     }
     anyhow::ensure!(
-        options.mp3.is_none() || options.project.is_some(),
-        "MP3 export requires a project file"
+        options.export.is_none() || options.project.is_some(),
+        "export requires a project file"
     );
     anyhow::ensure!(
-        !(options.gui && options.mp3.is_some()),
-        "use --export-mp3 without --gui, or choose File > Export MP3 in the app"
+        !(options.gui && options.export.is_some()),
+        "use CLI export without --gui, or export from the app's File menu"
+    );
+    anyhow::ensure!(
+        !options.headless || options.doctor,
+        "--headless requires doctor"
+    );
+    anyhow::ensure!(
+        !options.doctor || (!options.gui && options.export.is_none()),
+        "doctor accepts only a project path and --headless"
+    );
+    anyhow::ensure!(
+        options.import_plugin.is_none() || !(options.gui || options.project.is_some() || options.doctor),
+        "--import-plugin is a standalone command"
     );
     Ok(options)
 }
 
 fn main() -> Result<()> {
     let options = parse_args(std::env::args().skip(1))?;
+    if let Some(path) = options.import_plugin {
+        let plugin = daw_io::flow::import_plugin(&path)?;
+        println!("Imported {} ({})", plugin.name, plugin.path);
+        return Ok(());
+    }
     let gui = options.gui;
     let project_path = options
         .project
         .map(|p| project_fmt::absolute(&p))
         .transpose()?;
     // Resolve both paths before locating the soundfont changes the working directory.
-    let mp3_output = options.mp3.map(|p| project_fmt::absolute(&p)).transpose()?;
+    let export = options
+        .export
+        .map(|(format, path)| project_fmt::absolute(&path).map(|path| (format, path)))
+        .transpose()?;
 
     // Load the project relative to the launch directory (a relative path arg must
     // still resolve), then anchor the working directory to the asset root so the
@@ -87,7 +129,7 @@ fn main() -> Result<()> {
     };
     ensure_asset_cwd();
 
-    // 2. Boot the engine: audio thread + sequencer + MIDI input, project loaded.
+    // Resolve assets the same way for the frontends, diagnostics and exports.
     let sf2_path = PathBuf::from("assets/GeneralUser.sf2");
     let sf2_str = sf2_path.to_string_lossy().into_owned();
     let runtime_project = project_fmt::resolve_assets(
@@ -98,9 +140,20 @@ fn main() -> Result<()> {
             .unwrap_or(Path::new(".")),
         &std::env::current_dir()?,
     );
-    if let Some(output) = mp3_output {
-        daw_core::audio::export_mp3(&runtime_project, &sf2_path, &output)?;
-        println!("Exported MP3: {}", output.display());
+    if options.doctor {
+        return doctor::run(
+            project_path.as_deref(),
+            &runtime_project,
+            &sf2_path,
+            options.headless,
+        );
+    }
+    if let Some((format, output)) = export {
+        match format {
+            ExportFormat::Wav => export_wav(&runtime_project, &sf2_path, &output)?,
+            ExportFormat::Mp3 => export_mp3(&runtime_project, &sf2_path, &output)?,
+        }
+        println!("Exported {}: {}", format.label(), output.display());
         return Ok(());
     }
     let mut host = Host::start(&runtime_project, sf2_path);
@@ -112,7 +165,7 @@ fn main() -> Result<()> {
         }
     }
 
-    // 3. Dispatch to a frontend.
+    // Dispatch to a frontend.
     if gui {
         daw_gpui::run(host, project, project_path, sf2_str);
         return Ok(());
@@ -157,7 +210,10 @@ mod tests {
         ] {
             let options = args(&values).unwrap();
             assert_eq!(options.project, Some(PathBuf::from("song title.daw.json")));
-            assert_eq!(options.mp3, Some(PathBuf::from("output title.mp3")));
+            assert_eq!(
+                options.export,
+                Some((ExportFormat::Mp3, PathBuf::from("output title.mp3")))
+            );
             assert!(!options.gui);
         }
     }

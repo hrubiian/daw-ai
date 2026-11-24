@@ -1,5 +1,21 @@
 use super::*;
 
+pub(super) fn playhead_time(tick: u32, bpm: f64) -> String {
+    use daw_core::musical_time::{seconds_per_bar, TICKS_PER_BAR};
+
+    let seconds = f64::from(tick) * seconds_per_bar(bpm) / f64::from(TICKS_PER_BAR);
+    let millis = (seconds * 1000.).round() as u64;
+    let hours = millis / 3_600_000;
+    let minutes = millis / 60_000 % 60;
+    let seconds = millis / 1000 % 60;
+    let millis = millis % 1000;
+    if hours > 0 {
+        format!("{hours:02}:{minutes:02}:{seconds:02}.{millis:03}")
+    } else {
+        format!("{minutes:02}:{seconds:02}.{millis:03}")
+    }
+}
+
 impl DawView {
     pub(super) fn toggle_play(&mut self) {
         self.playing = !self.playing;
@@ -20,7 +36,10 @@ impl DawView {
             SequencerCommand::Pause
         };
         if let Some(session) = &self.host.session {
-            if let Err(e) = session.transport(if self.playing { daw_core::session::Command::Play } else { daw_core::session::Command::Pause }) { self.st.set_status(e.to_string()); }
+            if let Err(e) = session.transport(if self.playing { daw_core::session::Command::Play } else { daw_core::session::Command::Pause }) {
+                self.playing = session.playing();
+                self.st.set_status(e.to_string());
+            }
         } else { let _ = self.send_command(cmd); }
     }
 
@@ -115,8 +134,15 @@ impl DawView {
             return;
         };
         if !self.playing {
+            if let Some(session) = &self.host.session {
+                if let Err(e) = session.transport(daw_core::session::Command::Play) {
+                    self.st.set_status(e.to_string());
+                    return;
+                }
+            } else {
+                let _ = self.send_command(SequencerCommand::Play);
+            }
             self.playing = true;
-            let _ = self.send_command(SequencerCommand::Play);
         }
         self.undo.record("record MIDI", &self.st.project);
         let lr = self.st.project.loop_region.clone();
@@ -144,17 +170,18 @@ impl DawView {
     }
 
     /// Point live MIDI input at the selected track's mixer strip (the shared
-    /// atomic carries a strip index = track index). Audio tracks keep the
-    /// previous target — there's nothing for a keyboard to play there.
-    pub(super) fn sync_midi_strip(&self) {
-        if let Some(idx) = self.st.selected_track.as_deref()
-            .and_then(|id| self.st.project.tracks.iter().position(|t| t.id == id))
-        {
-            let is_audio = self.st.project.tracks[idx].track_type == daw_core::project::TrackType::Audio;
-            if !is_audio {
-                self.host.midi_channel.store(idx as u8, Ordering::Relaxed);
-            }
-        }
+    /// atomic carries a strip index = track index). Keep the previous musical
+    /// track by ID when an audio track is selected or tracks move.
+    pub(super) fn sync_midi_strip(&mut self) {
+        use daw_core::{audio::MAX_STRIPS, project::TrackType};
+        let playable = self.st.project.tracks.iter().take(MAX_STRIPS).enumerate()
+            .filter(|(_, track)| track.track_type != TrackType::Audio);
+        let target = playable.clone().find(|(_, track)| Some(&track.id) == self.st.selected_track.as_ref())
+            .or_else(|| playable.clone().find(|(_, track)| Some(&track.id) == self.midi_track.as_ref()))
+            .or_else(|| playable.into_iter().next());
+        self.midi_track = target.map(|(_, track)| track.id.clone());
+        // MAX_STRIPS is outside the mixer and distinct from the utility strip.
+        self.host.midi_channel.store(target.map_or(MAX_STRIPS, |(index, _)| index) as u8, Ordering::Relaxed);
     }
 
     pub(super) fn selected_track_is_audio(&self) -> bool {
@@ -185,17 +212,21 @@ impl DawView {
     /// First Rec press on an audio track: open the input stream, meter live.
     pub(super) fn arm_audio_record(&mut self) {
         let Some(track_id) = self.st.selected_track.clone() else { return };
-        let Some(input) = self.effective_track_input(&track_id) else { return };
+        self.arm_audio_track(&track_id);
+    }
+
+    pub(super) fn arm_audio_track(&mut self, track_id: &str) {
+        let Some(input) = self.effective_track_input(track_id) else { return };
         let mut cfg = self.config.clone();
         cfg.input_device = input.device.clone();
         cfg.input_channels = input.channels;
-        let guitar = input.source.uses_guitar(self.host.monitor.is_some());
-        match self.host.arm_input(&cfg, guitar) {
+        match self.host.arm_input(&cfg, input.source) {
             Ok(cs) => {
                 cs.reset_clip_latch();
                 let name = cs.device_name.clone();
+                let guitar = self.host.capture_uses_guitar(input.source);
                 self.audio_rec.arm();
-                self.armed_track = Some(track_id);
+                self.armed_track = Some(track_id.to_owned());
                 self.armed_input = Some(input);
                 self.capture_guitar = guitar;
                 self.st.set_status(format!("armed: {name} · {} — Rec to start, Stop to disarm", if guitar { if cfg.guitar.ampforge_enabled { "AmpForge" } else { "amp + cabinet" } } else { "dry input" }));
@@ -204,23 +235,18 @@ impl DawView {
         }
     }
 
-    /// Re-open the capture stream after a device/channel change (armed only —
-    /// never mid-take).
-    pub(super) fn reopen_capture_if_armed(&mut self) {
-        // The guitar amp follows the same input device and channel.
-        if self.host.monitor.is_some() { self.start_monitor(); }
-        self.rearm_capture_if_armed();
-    }
-
+    /// Re-open the capture stream after a device/channel change, never mid-take.
     pub(super) fn rearm_capture_if_armed(&mut self) {
         use daw_core::audio::input::RecordPhase;
         if !self.audio_take_active && !self.audio_take_finishing && self.host.capture.is_some() && self.audio_rec.phase == RecordPhase::Armed {
+            let Some(track) = self.armed_track.clone() else { return };
+            let monitoring = self.track_monitoring(&track);
             self.host.disarm_input();
             self.audio_rec.disarm();
-            let selection = self.st.selected_track.clone();
-            self.st.selected_track = self.armed_track.clone();
-            self.arm_audio_record();
-            self.st.selected_track = selection;
+            self.arm_audio_track(&track);
+            if monitoring && self.host.capture.is_some() {
+                self.enable_track_monitor(&track);
+            }
         }
     }
 
@@ -239,7 +265,7 @@ impl DawView {
             if self.audio_rec.phase != daw_core::audio::input::RecordPhase::Armed { return; }
         }
         if let Some(input) = self.effective_track_input(&track_id) {
-            self.capture_guitar = input.source.uses_guitar(self.host.monitor.is_some());
+            self.capture_guitar = self.host.capture_uses_guitar(input.source);
         }
         if let Err(e) = self.sync_capture_tone() {
             self.st.set_status(format!("cannot record guitar rack: {e}"));
@@ -263,12 +289,19 @@ impl DawView {
         if self.config.guitar.ampforge_enabled {
             if let Some(plugin) = self.host.monitor.as_mut().and_then(|m| m.plugin.as_mut()) { plugin.hide_editor(); }
         }
-        cs.begin_session(base);
+        let bars = if self.playing { 0 } else { self.config.count_in_bars };
+        if let Some(session) = &self.host.session {
+            if let Err(e) = session.start_recording(bars, || cs.begin_session(base)) {
+                self.st.set_status(e.to_string());
+                return;
+            }
+        } else {
+            cs.begin_session(base);
+            let _ = self.send_command(SequencerCommand::RecordStart { count_in_bars: bars });
+        }
         self.rec_track = Some(track_id.clone());
         self.audio_rec.begin();
         self.audio_take_active = true;
-        let bars = if self.playing { 0 } else { self.config.count_in_bars };
-        let _ = self.send_command(SequencerCommand::RecordStart { count_in_bars: bars });
         self.playing = true;
         self.st.set_status(if bars > 0 {
             format!("count-in: {bars} bar(s)…")
@@ -366,21 +399,36 @@ impl DawView {
 
     /// A small input-level meter, shown while the capture stream is open.
     pub(super) fn input_meter(&self) -> Option<gpui::Div> {
+        let theme = self.theme();
         let (peak, clipped) = self.host.capture.as_ref()?.meter();
         let bars = 12usize;
         let lit = (peak.min(1.0) * bars as f32).round() as usize;
         let cells = (0..bars).map(move |i| {
             let on = i < lit;
             let color = if i >= bars - 2 { RECORD } else if i >= bars - 5 { METER_WARN } else { 0x6ee87a };
-            div().w(px(4.)).h(px(12.)).rounded_sm().bg(rgb(if on { color } else { PANEL_ALT }))
+            div().w(px(4.)).h(px(12.)).rounded_sm().bg(rgb(if on { color } else { theme.panel_alt }))
         });
         Some(
             div()
                 .flex()
                 .items_center()
                 .gap_1()
-                .child(div().text_color(rgb(if clipped { RECORD } else { TEXT_DIM })).child(if clipped { "CLIP" } else { "IN" }))
+                .child(div().text_color(rgb(if clipped { RECORD } else { theme.text_dim })).child(if clipped { "CLIP" } else { "IN" }))
                 .children(cells),
         )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::playhead_time;
+
+    #[test]
+    fn playhead_time_displays_milliseconds_at_the_current_tempo() {
+        assert_eq!(playhead_time(0, 92.), "00:00.000");
+        assert_eq!(playhead_time(480, 92.), "00:02.609");
+        assert_eq!(playhead_time(14_399, 120.), "00:59.996");
+        assert_eq!(playhead_time(14_400, 120.), "01:00.000");
+        assert_eq!(playhead_time(864_000, 120.), "01:00:00.000");
     }
 }

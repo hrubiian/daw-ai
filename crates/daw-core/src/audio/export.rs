@@ -2,6 +2,7 @@ use super::engine::write_wav;
 use super::load_wav_stereo;
 use super::mixer::{build_strips_report, AudioEvent, Mixer, StripMeter, StripSpec};
 use crate::project::{Instrument, Pattern, Project, TrackType};
+use crate::sequencer::engine::arranged_track_patterns;
 use crate::sequencer::engine::{piano_note_duration, note_fire_tick, humanize_velocity, mod_base01, modulated_value, pattern_length_ticks, swung_step_tick, TICKS_PER_BAR, TICKS_PER_BEAT};
 use anyhow::Result;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
@@ -82,23 +83,6 @@ fn loop_total_ticks(project: &Project) -> u32 {
         .unwrap_or(TICKS_PER_BAR * 4)
 }
 
-/// Return (pattern, local_tick_within_pattern) for the arrangement slot that
-/// covers `tick` for `track_id`. Returns None if no slot is active at `tick`.
-fn arr_pat_tick<'a>(project: &'a Project, track_id: &str, tick: u32) -> Option<(&'a Pattern, u32)> {
-    for sl in &project.arrangement {
-        if sl.track != track_id { continue; }
-        let Some(pat) = project.patterns.iter().find(|p| p.id() == sl.pattern) else { continue };
-        let start = sl.bar * TICKS_PER_BAR + sl.offset_ticks;
-        let natural = pattern_length_ticks(pat).max(1);
-        // Resized clips loop the pattern to fill their length (same as live).
-        let len = sl.len_bars.map(|b| b * TICKS_PER_BAR).unwrap_or(natural);
-        if tick >= start && tick < start + len {
-            return Some((pat, (tick - start) % natural));
-        }
-    }
-    None
-}
-
 /// Return (pattern, local_tick) for loop mode (no arrangement).
 fn loop_pat_tick<'a>(project: &'a Project, track_id: &str, tick: u32) -> Option<(&'a Pattern, u32)> {
     let pid = project.tracks.iter().find(|t| t.id == track_id)?.patterns.first()?;
@@ -128,6 +112,9 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
     let spk   = spt * EXPORT_SR as f64;              // samples per tick
 
     let has_arr   = !project.arrangement.is_empty();
+    let placements: Vec<_> = project.tracks.iter()
+        .map(|track| arranged_track_patterns(project, &track.id))
+        .collect();
     let max_ticks = if has_arr { arrangement_total_ticks(project) } else { loop_total_ticks(project) };
     // Cover arranged audio clips that extend past the pattern timeline.
     // Whole-file `AudioFile` sources play once from t=0 (as live playback).
@@ -206,7 +193,9 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
             let is_sampler = matches!(track.instrument, Instrument::Sampler { .. });
 
             let Some((pat, pat_tick)) = (if has_arr {
-                arr_pat_tick(project, &track.id, tick)
+                placements[i].iter().find_map(|clip| {
+                    clip.local_tick_at(tick).map(|local| (clip.pattern, local))
+                })
             } else {
                 loop_pat_tick(project, &track.id, tick)
             }) else { continue };
@@ -245,7 +234,7 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
                     }
                 }
                 Pattern::PianoRoll(pr) => {
-                    for note in &pr.notes {
+                    for note in pr.active_notes() {
                         if note_fire_tick(note.pitch, note.tick, strip, project.project.timing, pattern_length_ticks(pat)) == pat_tick {
                             emit(note.pitch, note.vel, piano_note_duration(pr, note), &mut evs);
                         }
@@ -504,13 +493,15 @@ mod tests {
         p.tracks[0].effects = Default::default();
         p.tracks[0].patterns = vec!["pulse".into()];
         p.patterns.push(serde_json::from_value(serde_json::json!({
-            "type": "piano_roll", "id": "pulse", "name": "Pulse", "bars": 1, "ticks_per_bar": 480,
+            "type": "piano_roll", "id": "pulse", "name": "Pulse", "bars": 2, "ticks_per_bar": 480,
             "notes": [
                 {"pitch": 36, "tick": 1, "duration": 1, "vel": 100},
                 {"pitch": 36, "tick": 2, "duration": 1, "vel": 100},
-                {"pitch": 36, "tick": 7, "duration": 1, "vel": 100}
+                {"pitch": 36, "tick": 7, "duration": 1, "vel": 100},
+                {"pitch": 36, "tick": 480, "duration": 1, "vel": 100}
             ]
         })).unwrap());
+        assert!(p.resize_pr_bars("pulse", -1));
         let (audio, _) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
         let onsets: Vec<_> = audio.as_chunks::<2>().0.iter().enumerate()
             .filter(|(_, frame)| frame[0].abs() > 0.00001)
@@ -529,6 +520,22 @@ mod tests {
         let onsets: Vec<_> = audio.as_chunks::<2>().0.iter().enumerate()
             .filter(|(_, frame)| frame[0].abs() > 0.00001).map(|(index, _)| index).collect();
         assert_eq!(onsets, expected, "export must use live timing humanization");
+
+        p.project.timing = 0.;
+        let Pattern::PianoRoll(mut shadow) = p.patterns.last().unwrap().clone() else { unreachable!() };
+        shadow.id = "shadow".into();
+        shadow.notes.truncate(1);
+        shadow.notes[0].tick = 0;
+        p.patterns.push(Pattern::PianoRoll(shadow));
+        let track = p.tracks[0].id.clone();
+        p.arrangement = vec![
+            crate::project::ArrangementSlot { track: track.clone(), pattern: "shadow".into(), bar: 0, offset_ticks: 70, len_bars: None },
+            crate::project::ArrangementSlot { track, pattern: "pulse".into(), bar: 0, offset_ticks: 0, len_bars: None },
+        ];
+        let (audio, _) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
+        let onsets: Vec<_> = audio.as_chunks::<2>().0.iter().enumerate()
+            .filter(|(_, frame)| frame[0].abs() > 0.00001).map(|(index, _)| index).collect();
+        assert_eq!(onsets, vec![18375, 36750, 55125], "export should follow live precedence for overlapping clips");
         std::fs::remove_file(path).unwrap();
     }
 

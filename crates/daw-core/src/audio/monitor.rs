@@ -33,6 +33,8 @@ pub struct MonitorConfig {
     pub input_device: Option<String>,
     /// Zero-based input channel the instrument is plugged into.
     pub input_channel: u16,
+    /// Full physical channel count when the sound server reports it.
+    pub source_channels: Option<u16>,
     /// cpal output device name; `None` = system default output.
     pub output_device: Option<String>,
     /// Requested device buffer in frames (see `BUFFER_CHOICES`).
@@ -247,9 +249,18 @@ fn find_device(host: &cpal::Host, name: Option<&str>, input: bool) -> Result<cpa
         let found = if input { host.input_devices()?.find(|d| d.name().is_ok_and(|n| n == want)) }
                     else { host.output_devices()?.find(|d| d.name().is_ok_and(|n| n == want)) };
         if let Some(d) = found { return Ok(d); }
+        if input { anyhow::bail!("input device '{want}' is unavailable"); }
     }
     let d = if input { host.default_input_device() } else { host.default_output_device() };
     d.ok_or_else(|| anyhow::anyhow!("no {} device available", if input { "input" } else { "output" }))
+}
+
+pub(super) fn required_input_channel(selected: u16, source_channels: Option<u16>) -> Result<u16> {
+    let Some(count) = source_channels else { return Ok(selected); };
+    anyhow::ensure!(selected < count, "input channel {} is unavailable (device has {count} input(s))", u32::from(selected) + 1);
+    // Opening only stereo on a larger sound-server node can remix rear
+    // inputs into the front channels. Open the complete input bus instead.
+    Ok(count - 1)
 }
 
 /// An input config at exactly `rate` (no resampling, so no resampler delay
@@ -368,13 +379,15 @@ impl MonitorStream {
         // Through the sound server: the system default devices, each stream
         // pointed at its node. Otherwise the named devices (no sound server).
         let via_server = config.server_source.is_some() || config.server_sink.is_some();
-        let (out_name, in_name) = if via_server { (None, None) }
-            else { (config.output_device.as_deref(), config.input_device.as_deref()) };
+        let out_name = if via_server { None } else { config.output_device.as_deref() };
+        let in_name = if config.server_source.is_some() { None } else { config.input_device.as_deref() };
         let out_dev = find_device(&host, out_name, false)?;
         let in_dev = find_device(&host, in_name, true)?;
         let out_cfg = output_config(&out_dev)?;
         let rate = out_cfg.sample_rate().0;
-        let in_cfg = input_config_at(&in_dev, rate, config.input_channel)?;
+        let required = required_input_channel(config.input_channel, config.source_channels)?;
+        let in_cfg = input_config_at(&in_dev, rate, required)?;
+        anyhow::ensure!(required < in_cfg.channels(), "cannot open all {} required guitar input channels", u32::from(required) + 1);
 
         let mut sizes: Vec<cpal::BufferSize> = BUFFER_CHOICES.iter().copied()
             .filter(|b| *b >= config.buffer_frames.max(16)).map(cpal::BufferSize::Fixed).collect();
@@ -553,7 +566,7 @@ mod tests {
     fn monitor_smoke_reports_granted_buffers() {
         for buffer_frames in [128, 256] {
             // DAW_MONITOR_SOURCE / DAW_MONITOR_SINK: sound-server node names to test a specific interface.
-            let cfg = MonitorConfig { input_device: None, input_channel: 0, output_device: None, buffer_frames,
+            let cfg = MonitorConfig { input_device: None, input_channel: 0, source_channels: None, output_device: None, buffer_frames,
                 server_source: std::env::var("DAW_MONITOR_SOURCE").ok(), server_sink: std::env::var("DAW_MONITOR_SINK").ok() };
             let silent = AmpSettings { level: 0.0, ..AmpSettings::default() };
             match MonitorStream::open(&cfg, silent, None) {

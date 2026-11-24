@@ -2,9 +2,10 @@
 //! timeouts; never falls back to editing a file when the session disappears.
 use anyhow::{ensure, Result};
 use daw_core::{
-    project::{format, Project},
+    audio::input::TRANSPORT_STOPPED,
+    project::{format, ClapSlot, Instrument, Project},
     sequencer::SequencerCommand,
-    session::{Command, Edit, Request, Response, Session},
+    session::{Command, Edit, Request, Response, Session, SessionError},
 };
 use std::os::unix::{
     fs::{MetadataExt, PermissionsExt},
@@ -14,7 +15,7 @@ use std::{
     io::{BufRead, BufReader, Read, Write},
     path::{Path, PathBuf},
     sync::{
-        atomic::{AtomicU32, AtomicU64, AtomicU8, Ordering},
+        atomic::{AtomicBool, AtomicU32, AtomicU64, AtomicU8, Ordering},
         Arc, Mutex,
     },
     time::Duration,
@@ -99,22 +100,97 @@ struct Service {
     sample_rate: Arc<AtomicU32>,
     tick: Arc<AtomicU32>,
     transport: Arc<AtomicU8>,
+    play_requested: AtomicBool,
+    resources_pending_at: AtomicU64,
     error: Arc<Mutex<Option<String>>>,
+    master_scope: Arc<Mutex<daw_core::dsp::output::OutputHistory>>,
     base: Mutex<PathBuf>,
     legacy: PathBuf,
 }
-impl Service {
-    fn execute(&self, request: &Request) -> Result<Response> {
-        self.execute_at(request, None)
+
+// This comparison is deliberately conservative. The sequencer/relay can load
+// assets for any of these differences, even when a track is currently muted.
+fn changes_playback_resources(current: &Project, next: &Project) -> bool {
+    fn same_plugin(a: &ClapSlot, b: &ClapSlot) -> bool {
+        a.uid == b.uid && a.path == b.path && a.id == b.id && a.state == b.state
     }
-    fn execute_at(&self, request: &Request, base: Option<&Path>) -> Result<Response> {
+
+    current.tracks.len() != next.tracks.len()
+        || current.tracks.iter().zip(&next.tracks).any(|(a, b)| {
+            let same_instrument = match (&a.instrument, &b.instrument) {
+                (Instrument::Clap(a), Instrument::Clap(b)) => same_plugin(a, b),
+                (a, b) => a == b,
+            };
+            a.id != b.id
+                || a.track_type != b.track_type
+                || a.tuning_cents != b.tuning_cents
+                || !same_instrument
+                || a.clap_fx.len() != b.clap_fx.len()
+                || a.clap_fx
+                    .iter()
+                    .zip(&b.clap_fx)
+                    .any(|(a, b)| !same_plugin(a, b))
+        })
+        || current.audio_clips.len() != next.audio_clips.len()
+        || current
+            .audio_clips
+            .iter()
+            .zip(&next.audio_clips)
+            .any(|(a, b)| a.path != b.path)
+}
+
+impl Service {
+    fn resources_loading(&self) -> bool {
+        self.ack.load(Ordering::Acquire) < self.resources_pending_at.load(Ordering::Relaxed)
+    }
+
+    fn check_audio_ready(&self) -> std::result::Result<(), SessionError> {
+        if self.resources_loading() {
+            return Err(SessionError {
+                code: "resources_loading".into(),
+                message:
+                    "Wait for the audio engine to finish loading the latest edit before playing."
+                        .into(),
+            });
+        }
+        Ok(())
+    }
+
+    fn execute(&self, request: &Request) -> Result<Response> {
+        self.execute_at(request, None, false)
+    }
+    fn execute_at(
+        &self,
+        request: &Request,
+        base: Option<&Path>,
+        external: bool,
+    ) -> Result<Response> {
         let mut session = self
             .session
             .lock()
             .map_err(|_| anyhow::anyhow!("session lock poisoned"))?;
         let previous = session.revision;
         let duplicate = session.has_operation(&request.operation_id);
-        let mut response = session.execute(request);
+        let current_base = session.project_directory.clone();
+        let mut loads_resources = false;
+        let mut response = session.execute_checked(request, |current, candidate| {
+            if let Some((next, next_base)) = candidate {
+                loads_resources = base.or(next_base) != current_base.as_deref()
+                    || changes_playback_resources(current, next);
+                if external && loads_resources
+                    && (self.play_requested.load(Ordering::Relaxed)
+                        || self.transport.load(Ordering::Acquire) != TRANSPORT_STOPPED)
+                {
+                    return Err(SessionError {
+                        code: "resources_require_pause".into(),
+                        message: "Pause playback before applying changes that load instruments or audio assets.".into(),
+                    });
+                }
+            } else {
+                self.check_audio_ready()?;
+            }
+            Ok(())
+        });
         if response.error.is_none() && !duplicate {
             if let Some(base) = base {
                 session.project_directory = Some(base.to_path_buf());
@@ -123,6 +199,10 @@ impl Service {
                 *self.base.lock().unwrap() = base.clone();
             }
             let command = if session.revision != previous {
+                if loads_resources {
+                    self.resources_pending_at
+                        .store(session.revision, Ordering::Relaxed);
+                }
                 let runtime = format::resolve_assets(
                     &session.project,
                     &self.base.lock().unwrap(),
@@ -135,14 +215,24 @@ impl Service {
                 })
             } else {
                 match request.command {
-                    Command::Play => Some(SequencerCommand::Play),
-                    Command::Pause => Some(SequencerCommand::Pause),
+                    Command::Play => {
+                        self.play_requested.store(true, Ordering::Relaxed);
+                        Some(SequencerCommand::Play)
+                    }
+                    Command::Pause => {
+                        self.play_requested.store(false, Ordering::Relaxed);
+                        Some(SequencerCommand::Pause)
+                    }
                     Command::Stop => {
+                        self.play_requested.store(false, Ordering::Relaxed);
                         self.tx.send(SequencerCommand::Pause)?;
                         Some(SequencerCommand::Seek(0))
                     }
                     Command::Seek { tick } => Some(SequencerCommand::Seek(tick)),
-                    Command::Audition { ref track_id, ref notes } => Some(SequencerCommand::Audition {
+                    Command::Audition {
+                        ref track_id,
+                        ref notes,
+                    } => Some(SequencerCommand::Audition {
                         track_id: track_id.clone(),
                         notes: notes.clone(),
                     }),
@@ -156,8 +246,17 @@ impl Service {
             }
         }
         response.audio_diagnostics = Some(daw_core::audio::engine::diagnostics());
+        if matches!(request.command, Command::InspectScope) {
+            if let Ok(samples) = self.master_scope.try_lock() {
+                response.master_scope = Some(
+                    samples.recent_mono(1024).step_by(4).collect(),
+                );
+            }
+        }
         response.project_directory = Some(self.base.lock().unwrap().clone());
         response.applied_revision = self.ack.load(Ordering::Acquire);
+        response.loading_audio_resources =
+            response.applied_revision < self.resources_pending_at.load(Ordering::Relaxed);
         response.playback_tick = self.tick.load(Ordering::Relaxed);
         response.playing =
             self.transport.load(Ordering::Relaxed) == daw_core::audio::input::TRANSPORT_ROLLING;
@@ -210,7 +309,10 @@ impl LiveSession {
             sample_rate: host.sample_rate.clone(),
             tick: host.playback_tick.clone(),
             transport: host.transport_state.clone(),
+            play_requested: AtomicBool::new(false),
+            resources_pending_at: AtomicU64::new(0),
             error: host.engine_error.clone(),
+            master_scope: host.vis_buf.clone(),
             base: Mutex::new(std::path::absolute(
                 project_path
                     .and_then(Path::parent)
@@ -238,11 +340,14 @@ impl LiveSession {
                         let _ = stream.set_write_timeout(Some(Duration::from_secs(2)));
                         let result = (|| -> Result<()> {
                             let mut text = String::new();
-                            BufReader::new(&stream)
+                            let read = BufReader::new(&stream)
                                 .take(MAX_MESSAGE)
                                 .read_line(&mut text)?;
+                            if read == 0 {
+                                return Ok(()); // Session discovery probes the socket.
+                            }
                             let req: Request = serde_json::from_str(&text)?;
-                            let response = service.execute(&req)?;
+                            let response = service.execute_at(&req, None, true)?;
                             serde_json::to_writer(&mut stream, &response)?;
                             stream.write_all(b"\n")?;
                             Ok(())
@@ -281,7 +386,12 @@ impl LiveSession {
         } else if daw_core::audio::engine::DROPPED_AUDIO_EVENTS.load(Ordering::Relaxed) > 0 {
             "audio queue overflow".into()
         } else if daw_core::audio::engine::LATE_AUDIO_EVENTS.load(Ordering::Relaxed) > 0 {
-            format!("late audio events: {}", daw_core::audio::engine::LATE_AUDIO_EVENTS.load(Ordering::Relaxed))
+            format!(
+                "late audio events: {}",
+                daw_core::audio::engine::LATE_AUDIO_EVENTS.load(Ordering::Relaxed)
+            )
+        } else if applied < self.service.resources_pending_at.load(Ordering::Relaxed) {
+            "loading audio resources".into()
         } else if applied < session.revision {
             "pending".into()
         } else {
@@ -306,6 +416,23 @@ impl LiveSession {
         if let Some(error) = response.error {
             anyhow::bail!("{}: {}", error.code, error.message);
         }
+        Ok(())
+    }
+
+    /// Arm a local take and queue its count-in as one transport action. The
+    /// callback arms capture before the sequencer can roll.
+    pub fn start_recording(&self, count_in_bars: u8, arm: impl FnOnce()) -> Result<()> {
+        let _session = self
+            .service
+            .session
+            .lock()
+            .map_err(|_| anyhow::anyhow!("session lock poisoned"))?;
+        self.service.check_audio_ready()?;
+        arm();
+        self.service
+            .tx
+            .send(SequencerCommand::RecordStart { count_in_bars })?;
+        self.service.play_requested.store(true, Ordering::Relaxed);
         Ok(())
     }
     pub fn inspect(&self) -> Result<Response> {
@@ -355,6 +482,7 @@ impl LiveSession {
                 },
             },
             base,
+            false,
         )?;
         if let Some(e) = r.error {
             anyhow::bail!("{}: {}", e.code, e.message);
@@ -430,6 +558,108 @@ impl LiveSession {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn remote_instrument_load_waits_for_pause_while_drum_loop_keeps_scheduling() {
+        use daw_core::audio::AudioEvent;
+
+        let mut project = Project::default_project();
+        project.project.bpm = 300.;
+        project.loop_region.enabled = true;
+        project.loop_region.end_bar = 1;
+        let mut changed = project.clone();
+        changed.tracks[1].instrument = Instrument::Soundfont {
+            preset: 32,
+            bank: 0,
+            soundfont: Some("/slow-to-load.sf2".into()),
+        };
+        let (tx, commands) = crossbeam_channel::unbounded();
+        let (audio_tx, audio) = crossbeam_channel::unbounded();
+        let sequencer = daw_core::sequencer::Sequencer::new(commands, audio_tx);
+        let service = Service {
+            session: Mutex::new(Session::new(project.clone()).unwrap()),
+            tx,
+            ack: Arc::new(AtomicU64::new(0)),
+            sample_rate: Arc::new(AtomicU32::new(44100)),
+            tick: sequencer.playback_tick.clone(),
+            transport: sequencer.transport_state.clone(),
+            play_requested: AtomicBool::new(false),
+            resources_pending_at: AtomicU64::new(0),
+            error: Arc::new(Mutex::new(None)),
+            master_scope: Default::default(),
+            base: Mutex::new(std::env::temp_dir()),
+            legacy: std::env::temp_dir(),
+        };
+        let send = |command, revision| {
+            service
+                .execute_at(
+                    &Request {
+                        version: 1,
+                        operation_id: operation_id(),
+                        expected_revision: Some(revision),
+                        command,
+                    },
+                    None,
+                    true,
+                )
+                .unwrap()
+        };
+        let worker = std::thread::spawn(|| sequencer.run());
+        service
+            .tx
+            .send(SequencerCommand::LoadProject(project))
+            .unwrap();
+        assert!(send(Command::Play, 0).error.is_none());
+        let edit = Command::Batch {
+            label: "Agent: new bass instrument".into(),
+            edits: vec![Edit::Replace { project: changed }],
+        };
+        let blocked = send(edit.clone(), 0);
+        assert_eq!(blocked.error.unwrap().code, "resources_require_pause");
+        assert_eq!(blocked.revision, 0);
+
+        let deadline = std::time::Instant::now() + Duration::from_secs(3);
+        let mut kicks = 0;
+        while kicks < 3 {
+            let event = audio.recv_deadline(deadline).expect("drum loop kept going");
+            match event {
+                AudioEvent::NoteOn {
+                    strip: 0,
+                    pitch: 36,
+                    ..
+                } => kicks += 1,
+                AudioEvent::LoadStrips { .. } if kicks > 0 => {
+                    panic!("instrument load reached the rolling audio relay")
+                }
+                AudioEvent::Applied { revision: 1, .. } => panic!("blocked edit reached playback"),
+                _ => {}
+            }
+        }
+        assert!(send(Command::Pause, 0).error.is_none());
+        while service.transport.load(Ordering::Acquire) != TRANSPORT_STOPPED {
+            assert!(
+                std::time::Instant::now() < deadline,
+                "transport did not pause"
+            );
+            std::thread::sleep(Duration::from_millis(5));
+        }
+        assert!(send(edit, 0).error.is_none());
+        // Withhold the audio callback's acknowledgement to model a slow load.
+        assert_eq!(
+            send(Command::Play, 1).error.unwrap().code,
+            "resources_loading"
+        );
+        loop {
+            if let AudioEvent::Applied { revision: 1, ack } = audio.recv_deadline(deadline).unwrap()
+            {
+                ack.store(1, Ordering::Release);
+                break;
+            }
+        }
+        assert!(send(Command::Play, 1).error.is_none());
+        service.tx.send(SequencerCommand::Quit).unwrap();
+        worker.join().unwrap();
+    }
     #[test]
     fn failed_import_retains_directory_and_undo_restores_it() {
         let mut session = Session::new(Project::default_project()).unwrap();
@@ -442,7 +672,10 @@ mod tests {
             sample_rate: Arc::new(AtomicU32::new(0)),
             tick: Arc::new(AtomicU32::new(0)),
             transport: Arc::new(AtomicU8::new(0)),
+            play_requested: AtomicBool::new(false),
+            resources_pending_at: AtomicU64::new(0),
             error: Arc::new(Mutex::new(None)),
+            master_scope: Default::default(),
             base: Mutex::new(PathBuf::from("/old/project")),
             legacy: PathBuf::from("/"),
         };
@@ -456,14 +689,14 @@ mod tests {
             },
         };
         assert!(service
-            .execute_at(&request, Some(Path::new("/new/project")))
+            .execute_at(&request, Some(Path::new("/new/project")), false)
             .unwrap()
             .error
             .is_some());
         assert_eq!(*service.base.lock().unwrap(), PathBuf::from("/old/project"));
         request.expected_revision = Some(0);
         assert!(service
-            .execute_at(&request, Some(Path::new("/new/project")))
+            .execute_at(&request, Some(Path::new("/new/project")), false)
             .unwrap()
             .error
             .is_none());
@@ -488,7 +721,10 @@ mod tests {
             sample_rate: Arc::new(AtomicU32::new(44100)),
             tick: Arc::new(AtomicU32::new(123)),
             transport: Arc::new(AtomicU8::new(0)),
+            play_requested: AtomicBool::new(false),
+            resources_pending_at: AtomicU64::new(0),
             error: Arc::new(Mutex::new(None)),
+            master_scope: Default::default(),
             base: Mutex::new(std::env::temp_dir()),
             legacy: std::env::temp_dir(),
         });

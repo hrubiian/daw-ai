@@ -8,7 +8,7 @@ mod ampforge;
 
 impl DawView {
     pub(super) fn open_guitar_window(&mut self, cx: &mut Context<Self>) {
-        self.scan_guitar_inputs();
+        self.scan_input_devices();
         let owner = cx.entity();
         // open_window renders synchronously. Defer until the transport's
         // DawView update has finished so the new view can read its owner.
@@ -46,14 +46,14 @@ impl DawView {
         });
     }
 
-    pub(super) fn scan_guitar_inputs(&mut self) {
+    pub(super) fn scan_input_devices(&mut self) {
         if self.input_scan_running {
             return;
         }
         self.input_scan_running = true;
         let result = self.input_scan.clone();
         std::thread::spawn(move || {
-            let devices = daw_core::audio::input::list_input_devices();
+            let devices = daw_io::host::list_input_devices();
             if let Ok(mut slot) = result.lock() {
                 *slot = Some((devices, daw_io::list_midi_ports()));
             }
@@ -61,7 +61,8 @@ impl DawView {
     }
 
     pub(super) fn amp_setup_button(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
-        cell_btn("amp-setup", "Amp setup…", false, PANEL_ALT)
+        let theme = self.theme();
+        theme.cell_btn("amp-setup", "Amp setup…", false, theme.panel_alt)
             .debug_selector(|| "amp-setup".into())
             .on_click(cx.listener(|this, _, _, cx| {
                 this.st.open_menu = None;
@@ -84,7 +85,7 @@ impl DawView {
     }
 
     /// (Re)open the monitor streams with the current settings.
-    pub(super) fn start_monitor(&mut self) {
+    pub(super) fn start_monitor(&mut self) -> bool {
         match self.host.start_monitor(&self.config, self.st.bpm()) {
             Ok(m) => {
                 let short = |name: &str| {
@@ -100,9 +101,41 @@ impl DawView {
                     short(&m.output_name)
                 );
                 self.st.set_status(text);
+                true
             }
-            Err(e) => self.st.set_status(format!("guitar amp unavailable: {e}")),
+            Err(e) => {
+                self.st.set_status(format!("guitar amp unavailable: {e}"));
+                false
+            }
         }
+    }
+
+    fn set_guitar_input(&mut self, input: Option<daw_io::config::GuitarInput>) {
+        if self.config.guitar.input == input {
+            return;
+        }
+        let _ = self.save_ampforge_state();
+        let previous = std::mem::replace(&mut self.config.guitar.input, input);
+        if self.host.monitor.is_some() && !self.start_monitor() {
+            self.config.guitar.input = previous;
+            if self.host.monitor.is_none() {
+                let error = self.st.status.clone();
+                self.start_monitor();
+                self.st.set_status(error);
+            }
+        } else {
+            let _ = self.config.save();
+        }
+        self.refresh_auto_capture();
+    }
+
+    fn choose_guitar_device(&mut self, device: Option<String>) {
+        let mut route = self.config.guitar_input();
+        if route.device != device {
+            route.device = device;
+            route.channel = 0;
+        }
+        self.set_guitar_input(Some(route));
     }
 
     /// Change an amp control: save it and send it to the running rig.
@@ -254,6 +287,7 @@ impl DawView {
 
     /// Transport button: shows the measured latency while on.
     pub(super) fn amp_pill(&self, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        let theme = self.theme();
         let on = self.host.monitor.is_some();
         let label = match self.monitor_readout() {
             Some(r) => format!("🎸 Amp {r}"),
@@ -261,14 +295,15 @@ impl DawView {
         };
         pill(
             label,
-            if on { self.accent() } else { PANEL_ALT },
-            if on { BG } else { TEXT },
+            if on { self.accent() } else { theme.panel_alt },
+            if on { theme::contrast_text(self.accent()) } else { theme.text },
         )
         .id("toggle-amp")
         .debug_selector(|| "toggle-amp".into())
         .cursor_pointer()
-        .tooltip(|_, cx| {
+        .tooltip(move |_, cx| {
             cx.new(|_| TextTooltip {
+                theme,
                 text:
                     "Toggle guitar monitoring · use Amp setup… for input, tone and cabinet controls"
                         .into(),
@@ -281,8 +316,9 @@ impl DawView {
         }))
     }
 
-    /// The "Guitar amp" block of the Settings panel.
-    pub(super) fn guitar_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
+    /// Amp controls in the separate setup window.
+    fn guitar_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         if self.config.guitar.ampforge_enabled { return self.ampforge_controls(cx); }
         let accent = self.accent();
         let g = self.config.guitar.clone();
@@ -298,9 +334,9 @@ impl DawView {
                 .gap_2()
                 .px_3()
                 .py_1()
-                .child(div().w(px(64.)).text_color(rgb(TEXT_DIM)).child(name))
+                .child(div().w(px(64.)).text_color(rgb(theme.text_dim)).child(name))
                 .child(
-                    cell_btn(format!("amp-{id}-down"), "−", false, PANEL_ALT).on_click(
+                    theme.cell_btn(format!("amp-{id}-down"), "−", false, theme.panel_alt).on_click(
                         cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                             let step = if e.modifiers().shift { 0.01 } else { 0.05 };
                             this.edit_amp(|a| {
@@ -314,11 +350,11 @@ impl DawView {
                 .child(
                     div()
                         .w(px(44.))
-                        .text_color(rgb(TEXT))
+                        .text_color(rgb(theme.text))
                         .child(format!("{:.0}", value * 100.0)),
                 )
                 .child(
-                    cell_btn(format!("amp-{id}-up"), "+", false, PANEL_ALT).on_click(cx.listener(
+                    theme.cell_btn(format!("amp-{id}-up"), "+", false, theme.panel_alt).on_click(cx.listener(
                         move |this, e: &gpui::ClickEvent, _, cx| {
                             let step = if e.modifiers().shift { 0.01 } else { 0.05 };
                             this.edit_amp(|a| {
@@ -364,7 +400,7 @@ impl DawView {
                     .px_3()
                     .py_1()
                     .child(
-                        cell_btn(
+                        theme.cell_btn(
                             "amp-monitor",
                             if on {
                                 "Monitoring: on"
@@ -380,7 +416,7 @@ impl DawView {
                         })),
                     )
                     .child(
-                        cell_btn(
+                        theme.cell_btn(
                             "amp-on",
                             if g.amp.amp_on {
                                 "Amp: on"
@@ -400,7 +436,7 @@ impl DawView {
                 div()
                     .px_3()
                     .py_1()
-                    .text_color(rgb(if on { TEXT } else { TEXT_DIM }))
+                    .text_color(rgb(if on { theme.text } else { theme.text_dim }))
                     .child(status),
             )
             .child(
@@ -410,9 +446,9 @@ impl DawView {
                     .gap_2()
                     .px_3()
                     .py_1()
-                    .child(div().w(px(64.)).text_color(rgb(TEXT_DIM)).child("Buffer"))
+                    .child(div().w(px(64.)).text_color(rgb(theme.text_dim)).child("Buffer"))
                     .child(
-                        cell_btn("amp-buf-down", "−", false, PANEL_ALT).on_click(cx.listener(
+                        theme.cell_btn("amp-buf-down", "−", false, theme.panel_alt).on_click(cx.listener(
                             move |this, _, _, cx| {
                                 let choices = daw_core::audio::monitor::BUFFER_CHOICES;
                                 this.edit_monitor_device(|g| {
@@ -425,11 +461,11 @@ impl DawView {
                     .child(
                         div()
                             .w(px(84.))
-                            .text_color(rgb(TEXT))
+                            .text_color(rgb(theme.text))
                             .child(format!("{} frames", g.buffer_frames)),
                     )
                     .child(
-                        cell_btn("amp-buf-up", "+", false, PANEL_ALT).on_click(cx.listener(
+                        theme.cell_btn("amp-buf-up", "+", false, theme.panel_alt).on_click(cx.listener(
                             move |this, _, _, cx| {
                                 let choices = daw_core::audio::monitor::BUFFER_CHOICES;
                                 this.edit_monitor_device(|g| {
@@ -442,13 +478,13 @@ impl DawView {
                     )
                     .child(
                         div()
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(theme.text_dim))
                             .child("smaller = less delay; raise it if you hear crackles"),
                     ),
             )
             .child(
                 div().flex().items_center().gap_2().px_3().py_1().child(
-                    cell_btn(
+                    theme.cell_btn(
                         "amp-output",
                         if g.output_same_as_input {
                             "Output: this interface"
@@ -482,7 +518,7 @@ impl DawView {
                 div()
                     .px_3()
                     .py_1()
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child("Shift + click for fine steps · settings save automatically"),
             )
             .child(
@@ -493,7 +529,7 @@ impl DawView {
                     .px_3()
                     .py_1()
                     .child(
-                        cell_btn("amp-cab", cab_label, g.amp.cabinet != Cabinet::Off, accent)
+                        theme.cell_btn("amp-cab", cab_label, g.amp.cabinet != Cabinet::Off, accent)
                             .on_click(cx.listener(|this, _, _, cx| {
                                 let mode = match this.config.guitar.amp.cabinet {
                                     Cabinet::BuiltIn => Cabinet::Ir,
@@ -505,7 +541,7 @@ impl DawView {
                             })),
                     )
                     .child(
-                        cell_btn("amp-ir", "Load IR…", false, PANEL_ALT).on_click(cx.listener(
+                        theme.cell_btn("amp-ir", "Load IR…", false, theme.panel_alt).on_click(cx.listener(
                             |this, _, _, cx| {
                                 this.pick_cabinet_ir();
                                 cx.notify();
@@ -578,6 +614,7 @@ impl GuitarWindow {
 
 impl GuitarWindow {
     fn preset_editor(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.owner.upgrade().map_or(Theme::DARK, |owner| owner.read(cx).theme());
         div()
             .flex()
             .flex_col()
@@ -585,7 +622,7 @@ impl GuitarWindow {
             .py_2()
             .child(
                 div()
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child("Preset name (saving the same name replaces it)"),
             )
             .child(
@@ -593,9 +630,9 @@ impl GuitarWindow {
                     .id("guitar-preset-name")
                     .track_focus(&self.preset_focus)
                     .p_2()
-                    .bg(rgb(BG))
+                    .bg(rgb(theme.bg))
                     .border_1()
-                    .border_color(rgb(TEXT_DIM))
+                    .border_color(rgb(theme.text_dim))
                     .child(format!("{}{}", self.preset_name, "▏"))
                     .on_mouse_down(
                         gpui::MouseButton::Left,
@@ -642,7 +679,7 @@ impl GuitarWindow {
                     })),
             )
             .child(
-                cell_btn("guitar-save-preset", "Save current rig", false, ACCENT).on_click(
+                theme.cell_btn("guitar-save-preset", "Save current rig", false, theme.accents[0]).on_click(
                     cx.listener(|this, _, _, cx| {
                         let name = this.preset_name.clone();
                         let _ = this.owner.update(cx, |owner, cx| {
@@ -657,9 +694,10 @@ impl GuitarWindow {
 
 impl Render for GuitarWindow {
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        let theme = self.owner.upgrade().map_or(Theme::DARK, |owner| owner.read(cx).theme());
         let input_open = self.input_open;
         let plugins_open = self.plugins_open;
-        let input_toggle = cell_btn(
+        let input_toggle = theme.cell_btn(
             "guitar-input-toggle",
             if input_open {
                 "Input & routing ▾"
@@ -667,13 +705,13 @@ impl Render for GuitarWindow {
                 "Input & routing ▸"
             },
             false,
-            PANEL_ALT,
+            theme.panel_alt,
         )
         .on_click(cx.listener(|this, _, _, cx| {
             this.input_open = !this.input_open;
             cx.notify();
         }));
-        let plugins_toggle = cell_btn(
+        let plugins_toggle = theme.cell_btn(
             "guitar-plugins-toggle",
             if plugins_open {
                 "CLAP plugins ▾"
@@ -681,7 +719,7 @@ impl Render for GuitarWindow {
                 "CLAP plugins ▸"
             },
             false,
-            PANEL_ALT,
+            theme.panel_alt,
         )
         .on_click(cx.listener(|this, _, _, cx| {
             this.plugins_open = !this.plugins_open;
@@ -704,9 +742,9 @@ impl Render for GuitarWindow {
                     .child(owner.drive_pedals(cx))
                     .child(
                         div()
-                            .bg(rgb(PANEL))
+                            .bg(rgb(theme.panel))
                             .py_2()
-                            .child(section_title("Amp · gate · output"))
+                            .child(theme.section_title("Amp · gate · output"))
                             .child(owner.guitar_settings(cx)),
                     )
                     .child(owner.cabinet_builder(cx))
@@ -723,20 +761,20 @@ impl Render for GuitarWindow {
             .size_full()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
-            .text_color(rgb(TEXT))
+            .bg(rgb(theme.bg))
+            .text_color(rgb(theme.text))
             .text_sm()
             .child(
                 div()
                     .p_3()
-                    .bg(rgb(PANEL))
+                    .bg(rgb(theme.panel))
                     .flex()
                     .items_center()
                     .gap_3()
                     .child(div().text_xl().child("Guitar rack"))
                     .child(
                         div()
-                            .text_color(rgb(TEXT_DIM))
+                            .text_color(rgb(theme.text_dim))
                             .child("Live monitoring · editable tones · recording"),
                     ),
             )
@@ -752,7 +790,7 @@ impl Render for GuitarWindow {
                             .flex_shrink_0()
                             .overflow_y_scroll()
                             .p_3()
-                            .bg(rgb(PANEL))
+                            .bg(rgb(theme.panel))
                             .child(library)
                             .child(editor),
                     )
@@ -770,27 +808,21 @@ impl Render for GuitarWindow {
                 div()
                     .px_3()
                     .py_2()
-                    .bg(rgb(PANEL))
-                    .text_color(rgb(TEXT_DIM))
+                    .bg(rgb(theme.panel))
+                    .text_color(rgb(theme.text_dim))
                     .child(status),
             );
-        window_frame::frame(content, window, |_, w, _| w.remove_window())
+        window_frame::frame(theme, content, window, |_, w, _| w.remove_window())
     }
 }
 
 impl DawView {
     fn guitar_input_settings(&self, cx: &mut Context<Self>) -> gpui::Div {
-        use daw_core::audio::input::InputChannels;
-        let channel = match self.config.input_channels {
-            InputChannels::Mono(c) | InputChannels::Stereo(c, _) => c,
-        };
-        let max_channels = self
-            .input_devices
-            .iter()
-            .find(|d| self.config.input_device.as_deref() == Some(d.name.as_str()))
-            .map(|d| d.channels)
-            .unwrap_or(2)
-            .max(1);
+        let theme = self.theme();
+        use daw_io::config::GuitarInput;
+        let input = self.config.guitar_input();
+        let follows_default = self.config.guitar.input.is_none();
+        let max_channels = self.input_channel_count(input.device.as_deref());
         let meter = self
             .host
             .monitor
@@ -812,15 +844,15 @@ impl DawView {
             .flex_col()
             .gap_1()
             .p_3()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme.panel))
             .child(
                 div()
                     .flex()
                     .items_center()
                     .gap_2()
-                    .child(div().flex_1().child("Audio input"))
+                    .child(div().flex_1().child("Guitar input"))
                     .child(
-                        cell_btn(
+                        theme.cell_btn(
                             "amp-input-refresh",
                             if self.input_scan_running {
                                 "Scanning…"
@@ -828,33 +860,36 @@ impl DawView {
                                 "Refresh"
                             },
                             false,
-                            PANEL_ALT,
+                            theme.panel_alt,
                         )
                         .on_click(cx.listener(|this, _, _, cx| {
-                            this.scan_guitar_inputs();
+                            this.scan_input_devices();
                             cx.notify();
                         })),
                     ),
             )
-            .child(div().text_color(rgb(TEXT_DIM)).child(format!(
-                    "Selected: {}",
-                    self.config
-                        .input_device
-                        .as_deref()
-                        .unwrap_or("System default")
+            .child(div().text_color(rgb(theme.text_dim)).child(format!(
+                    "{} · Mono {}{}",
+                    self.input_device_label(input.device.as_deref()),
+                    input.channel + 1,
+                    if follows_default { " · Follows recording default" } else { "" },
                 )))
             .child(
-                cell_btn(
+                theme.cell_btn("amp-input-inherit", "Use recording default", follows_default, self.accent())
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.set_guitar_input(None);
+                        cx.notify();
+                    })),
+            )
+            .child(
+                theme.cell_btn(
                     "amp-input-default",
                     "System default",
-                    self.config.input_device.is_none(),
+                    !follows_default && input.device.is_none(),
                     self.accent(),
                 )
                 .on_click(cx.listener(|this, _, _, cx| {
-                    this.config.input_device = None;
-                    this.config.input_channels = InputChannels::Mono(0);
-                    let _ = this.config.save();
-                    this.reopen_capture_if_armed();
+                    this.choose_guitar_device(None);
                     cx.notify();
                 })),
             )
@@ -866,19 +901,16 @@ impl DawView {
                     .flex()
                     .flex_col()
                     .gap_1()
-                    .children(self.input_devices.iter().enumerate().map(|(i, device)| {
+                    .children(self.input_devices.iter().filter(|device| device.name != "default").enumerate().map(|(i, device)| {
                         let name = device.name.clone();
-                        cell_btn(
+                        theme.cell_btn(
                             format!("amp-input-{i}"),
-                            format!("{} ({} ch)", name, device.channels),
-                            self.config.input_device.as_deref() == Some(name.as_str()),
+                            format!("{} · {} inputs", device.label, device.channels),
+                            !follows_default && input.device.as_deref() == Some(name.as_str()),
                             self.accent(),
                         )
                         .on_click(cx.listener(move |this, _, _, cx| {
-                            this.config.input_device = Some(name.clone());
-                            this.config.input_channels = InputChannels::Mono(0);
-                            let _ = this.config.save();
-                            this.reopen_capture_if_armed();
+                            this.choose_guitar_device(Some(name.clone()));
                             cx.notify();
                         }))
                     })),
@@ -886,35 +918,21 @@ impl DawView {
             .child(
                 div()
                     .flex()
+                    .flex_wrap()
                     .items_center()
                     .gap_2()
                     .py_1()
-                    .child(
-                        cell_btn("amp-input-down", "−", false, PANEL_ALT).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.config.input_channels =
-                                    InputChannels::Mono(channel.saturating_sub(1));
-                                let _ = this.config.save();
-                                this.reopen_capture_if_armed();
+                    .children((0..max_channels).map(|channel| {
+                        let route = GuitarInput { device: input.device.clone(), channel };
+                        theme.cell_btn(format!("amp-input-channel-{channel}"), format!("Mono {}", channel + 1),
+                            input.channel == channel, self.accent())
+                            .on_click(cx.listener(move |this, _, _, cx| {
+                                this.set_guitar_input(Some(route.clone()));
                                 cx.notify();
-                            },
-                        )),
-                    )
-                    .child(format!("Guitar: input {} (mono)", channel + 1))
-                    .child(
-                        cell_btn("amp-input-up", "+", false, PANEL_ALT).on_click(cx.listener(
-                            move |this, _, _, cx| {
-                                this.config.input_channels = InputChannels::Mono(
-                                    channel.saturating_add(1).min(max_channels - 1),
-                                );
-                                let _ = this.config.save();
-                                this.reopen_capture_if_armed();
-                                cx.notify();
-                            },
-                        )),
-                    ),
+                            }))
+                    })),
             )
-            .child(div().text_color(rgb(TEXT_DIM)).child(meter))
+            .child(div().text_color(rgb(theme.text_dim)).child(meter))
     }
 }
 

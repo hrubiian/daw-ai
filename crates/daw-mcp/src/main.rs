@@ -1,18 +1,22 @@
-//! daw-mcp: stdio MCP server over one .daw.json project.
-//! Usage: daw-mcp <song.daw.json>
+//! daw-mcp: stdio MCP server over a live session or a .daw.json file.
+//! Usage: daw-mcp --live or daw-mcp <song.daw.json>
 //!
 //! Every tool is a one-line wrapper over the sync `DawTools` core; a GUI
 //! opened on the same file in JAM mode hears every edit live.
 
-use daw_mcp::tools::{DawTools, NoteArg, StepRowArg};
+use daw_mcp::{
+    store::ProjectStore,
+    tools::{DawTools, NoteArg, StepRowArg},
+};
 use rmcp::{
-    handler::server::{router::tool::ToolRouter, wrapper::Parameters},
+    handler::server::{router::tool::ToolRouter, tool::ToolCallContext, wrapper::Parameters},
     model::*,
     schemars, tool, tool_handler, tool_router,
-    ErrorData as McpError, ServerHandler, ServiceExt,
+    service::RequestContext,
+    ErrorData as McpError, RoleServer, ServerHandler, ServiceExt,
     transport::stdio,
 };
-use std::sync::Arc;
+use std::{path::PathBuf, sync::{Arc, Mutex}};
 
 /// Tool failures become `isError` tool results (not protocol errors), so
 /// the model always sees the actionable message.
@@ -24,18 +28,52 @@ fn reply(r: Result<String, String>) -> Result<CallToolResult, McpError> {
 }
 
 async fn blocking(f: impl FnOnce() -> Result<String, String> + Send + 'static) -> Result<CallToolResult, McpError> {
+    reply(blocking_result(f).await)
+}
+
+async fn blocking_result<T: Send + 'static>(f: impl FnOnce() -> Result<T, String> + Send + 'static) -> Result<T, String> {
     static LIMIT: std::sync::OnceLock<Arc<tokio::sync::Semaphore>> = std::sync::OnceLock::new();
     let permit = match LIMIT.get_or_init(|| Arc::new(tokio::sync::Semaphore::new(2))).clone().try_acquire_owned() {
-        Ok(p) => p, Err(_) => return reply(Err("analysis busy: retry when a current job completes".into())),
+        Ok(p) => p, Err(_) => return Err("analysis busy: retry when a current job completes".into()),
     };
-    reply(tokio::task::spawn_blocking(move || { let _permit = permit; f() }).await.unwrap_or_else(|e| Err(format!("analysis worker failed: {e}"))))
+    tokio::task::spawn_blocking(move || { let _permit = permit; f() }).await.unwrap_or_else(|e| Err(format!("analysis worker failed: {e}")))
 }
 
 #[derive(Clone)]
 struct DawServer {
     tools: Arc<DawTools>,
-    #[allow(dead_code, reason = "read by the #[tool_handler] macro expansion")]
+    automatic_session: Option<Arc<AutomaticSession>>,
     tool_router: ToolRouter<DawServer>,
+}
+
+#[derive(Default)]
+struct AutomaticSession {
+    selected: Mutex<Option<(PathBuf, Arc<DawTools>)>>,
+}
+
+impl AutomaticSession {
+    fn tools(&self, inspect: bool) -> Result<Arc<DawTools>, String> {
+        let sockets = daw_io::session::discover()
+            .map_err(|error| format!("Could not discover live DAW sessions: {error}"))?;
+        let socket = match sockets.as_slice() {
+            [socket] => socket,
+            [] => return Err("No live DAW session found. Open daw-ai and try again.".into()),
+            _ => return Err("Multiple live DAW sessions found. Leave one open or select a socket with --list-sessions and --session.".into()),
+        };
+        let store = ProjectStore::live(socket.clone())?;
+        let mut selected = self.selected.lock().map_err(|_| "Could not lock the live DAW selection")?;
+        if let Some((previous, tools)) = selected.as_ref() {
+            if previous == socket && tools.store.path == store.path {
+                return Ok(tools.clone());
+            }
+            if !inspect {
+                return Err("The live DAW session changed. Call session_state or project_summary to check the open song before editing.".into());
+            }
+        }
+        let tools = Arc::new(DawTools::with_store(store));
+        *selected = Some((socket.clone(), tools.clone()));
+        Ok(tools)
+    }
 }
 
 // ── Tool argument structs (doc comments become the JSON schema docs) ─────────
@@ -377,6 +415,49 @@ struct RenderArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ListeningJobArgs {
+    #[serde(flatten)]
+    render: RenderArgs,
+    /// Bypass DAW inserts and shared effects in the render snapshot. Instrument
+    /// envelopes and plugin-internal effects remain active. Defaults to false.
+    dry: Option<bool>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AuditionExcerptArgs {
+    /// Completed listening job ID.
+    id: String,
+    /// Seconds from the start of the render, including a range render.
+    offset_seconds: f64,
+    /// Excerpt duration, 0.25–6 seconds.
+    duration_seconds: f64,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct PrepareAuditionArgs {
+    /// First completed listening job ID.
+    first: String,
+    /// Second completed listening job ID with the same range and settings.
+    second: String,
+    /// Seconds from the start of both renders.
+    offset_seconds: f64,
+    /// Equal excerpt duration, 5–30 seconds.
+    duration_seconds: f64,
+    /// A focused question the listener can answer, without revealing the variants.
+    question: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AuditionChoiceArgs {
+    /// ID returned by prepare_audition.
+    id: String,
+    /// The musician's own A/B preference.
+    preference: daw_mcp::audition::Preference,
+    /// The musician's own comment, ideally pointing to a specific phrase or sound.
+    comment: Option<String>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 struct WavPathArgs {
     /// Path to any WAV (e.g. a recorded take).
     path: String,
@@ -390,12 +471,17 @@ struct DiffArgs {
 
 #[tool_router]
 impl DawServer {
-    fn new(tools: DawTools) -> Self {
-        Self { tools: Arc::new(tools), tool_router: Self::tool_router() }
+    fn new(tools: DawTools, automatic: bool) -> Self {
+        Self {
+            tools: Arc::new(tools),
+            automatic_session: automatic.then(|| Arc::new(AutomaticSession::default())),
+            tool_router: Self::tool_router(),
+        }
     }
 
     #[tool(description = "Start a bounded background listening job for an immutable project revision. Returns job id; poll job_status or use cancel_job. Artifacts include WAV, project snapshot and provenance report. Does not block live edits.")]
-    fn start_listen(&self, Parameters(a): Parameters<RenderArgs>) -> Result<CallToolResult, McpError> {
+    fn start_listen(&self, Parameters(args): Parameters<ListeningJobArgs>) -> Result<CallToolResult, McpError> {
+        let ListeningJobArgs { render: a, dry } = args;
         let result = (|| -> Result<String, String> {
             let (mut project, revision, directory) = if self.tools.store.live_socket.is_some() {
                 let state = self.tools.store.inspect_live()?;
@@ -406,7 +492,9 @@ impl DawServer {
                 for track in &mut project.tracks { track.muted |= !tracks.contains(&track.id); }
             }
             let range = if a.start_bar.is_some() || a.end_bar.is_some() { Some((a.start_bar.unwrap_or(0), a.end_bar.unwrap_or_else(|| project.song_bars()))) } else { None };
-            daw_mcp::jobs::manager().submit(project, revision, directory, self.tools.sf2_path.clone(), range)
+            daw_mcp::jobs::manager().submit_with_dry(
+                project, revision, directory, self.tools.sf2_path.clone(), range, dry.unwrap_or(false),
+            )
         })(); reply(result)
     }
     #[tool(description = "Get progress, errors, structured listening measurements and revision-linked artifacts for a listening job.")]
@@ -420,6 +508,53 @@ impl DawServer {
     #[tool(description = "Compare two completed revision-linked renders with matching settings. Returns audio artifact paths and structured diagnostics for A/B listening; metrics do not measure musical quality.")]
     fn compare_renders(&self, Parameters(a): Parameters<CompareArg>) -> Result<CallToolResult, McpError> {
         reply(self.render_base().and_then(|base| daw_mcp::jobs::manager().compare_in(&base, &a.a, &a.b)).and_then(|v| serde_json::to_string_pretty(&v).map_err(|e| e.to_string())))
+    }
+
+    #[tool(description = "Return a short mono WAV from a completed render as MCP audio. Use an audio-capable client/model to judge the sound; text-only clients should offer the WAV to the musician.")]
+    async fn audition_excerpt(&self, Parameters(a): Parameters<AuditionExcerptArgs>) -> Result<CallToolResult, McpError> {
+        let base = self.render_base();
+        match blocking_result(move || {
+            let report = daw_mcp::jobs::manager().status_in(&base?, &a.id)?;
+            let bytes = daw_mcp::audition::preview(&report, a.offset_seconds, a.duration_seconds).map_err(|e| e.to_string())?;
+            Ok((report, bytes))
+        }).await {
+            Ok((report, bytes)) => {
+                use base64::Engine;
+                let audio = RawContent::Audio(RawAudioContent {
+                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
+                    mime_type: "audio/wav".into(),
+                }).no_annotation();
+                let paths = report.artifacts.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ");
+                Ok(CallToolResult::success(vec![Content::text(format!("Mono excerpt from render {}. Full render artifacts: {paths}", report.id)), audio]))
+            }
+            Err(error) => reply(Err(error)),
+        }
+    }
+
+    #[tool(description = "Prepare two stereo WAVs for a listener to compare. Uses the same excerpt from two completed renders, matches integrated loudness with gain only and randomizes which revision is called A or B. Requires FFmpeg. Ask the listener the supplied question.")]
+    async fn prepare_audition(&self, Parameters(a): Parameters<PrepareAuditionArgs>) -> Result<CallToolResult, McpError> {
+        let base = self.render_base();
+        blocking(move || {
+            let base = base?;
+            let jobs = daw_mcp::jobs::manager();
+            let first = jobs.status_in(&base, &a.first)?;
+            let second = jobs.status_in(&base, &a.second)?;
+            let pair = daw_mcp::audition::prepare(&base, first, second, a.offset_seconds, a.duration_seconds, a.question).map_err(|e| e.to_string())?;
+            serde_json::to_string_pretty(&pair).map_err(|e| e.to_string())
+        }).await
+    }
+
+    #[tool(description = "Record the musician's explicit A/B choice and words, and reveal which render was assigned to A and B. Call only after the listener responds. Keep the feedback tied to that listening question.")]
+    fn record_audition_choice(&self, Parameters(a): Parameters<AuditionChoiceArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.render_base().and_then(|base| {
+            let choice = daw_mcp::audition::record_choice(&base, &a.id, a.preference, a.comment.as_deref().unwrap_or_default()).map_err(|e| e.to_string())?;
+            serde_json::to_string_pretty(&choice).map_err(|e| e.to_string())
+        }))
+    }
+
+    #[tool(description = "Read the daw-ai composition playbook for developing an editable musical idea, rendering alternatives, and iterating from listening feedback.")]
+    fn composition_guide(&self) -> Result<CallToolResult, McpError> {
+        reply(Ok(include_str!("../../../docs/music-collaboration.md").into()))
     }
     #[tool(description = "List durable listening reports in the current project directory, including earlier MCP runs. Paginated by lexicographically sorted render ID; returns malformed-entry errors without hiding valid reports. A saved running job owned by another process is unavailable, not claimed failed.")]
     fn render_history(&self, Parameters(a): Parameters<HistoryArgs>) -> Result<CallToolResult, McpError> {
@@ -436,7 +571,7 @@ impl DawServer {
         reply(self.tools.store.inspect_live().and_then(|s| serde_json::to_string_pretty(&s).map_err(|e| e.to_string())))
     }
 
-    #[tool(description = "Apply a version 1 session request encoded as JSON: operation_id, expected_revision, and command. Commands: inspect, preview (label + edits; validates without committing), batch (label + edits), undo, redo, play, pause, stop, seek (tick). Batch edits: tempo (bpm), track (id, optional volume/pan/muted), remove_track (id), replace (project). Refresh session_state after revision_conflict. Live mode only.")]
+    #[tool(description = "Apply a version 1 session request encoded as JSON: operation_id, expected_revision, and command. Commands: inspect, preview (label + edits; validates without committing), batch (label + edits; one undo), undo, redo, play, pause, stop, seek (tick). Edits: add_piano_roll (track_id, pattern_id, name, bars, notes), set_notes (pattern_id, notes), place_clip (track_id, pattern_id, bar, optional offset_ticks/len_bars), remove_clip (track_id, bar, optional offset_ticks), tempo, track, remove_track, replace. Notes use pitch, tick, duration, vel. Bars are zero-based. Pause before edits that load audio resources. Refresh session_state after revision_conflict. Live mode only.")]
     fn session_command(&self, Parameters(a): Parameters<JsonArg>) -> Result<CallToolResult, McpError> {
         let result = serde_json::from_str(&a.json).map_err(|e| format!("invalid session request: {e}"))
             .and_then(|req| self.tools.store.live_request(req))
@@ -582,12 +717,12 @@ impl DawServer {
         reply(self.tools.audio_clip(a.index, a.move_to_sec, a.gain, a.len_sec, a.remove))
     }
 
-    #[tool(description = "List installed CLAP plugins (instruments and effects).")]
+    #[tool(description = "List installed CLAP and imported Flow Music plugins, including whether each is an instrument or effect.")]
     fn list_clap_plugins(&self) -> Result<CallToolResult, McpError> {
         reply(self.tools.list_clap_plugins())
     }
 
-    #[tool(description = "Rescan installed Linux CLAP plugins after installation. Refreshes this MCP process's plugin catalog.")]
+    #[tool(description = "Refresh this MCP process's catalog after installing a CLAP plugin or importing a Flow Music .fmx file.")]
     async fn rescan_clap_plugins(&self) -> Result<CallToolResult, McpError> {
         let tools=self.tools.clone(); blocking(move ||tools.rescan_clap_plugins()).await
     }
@@ -639,7 +774,7 @@ impl DawServer {
         reply(self.tools.revert_sound(a.uid, a.version))
     }
 
-    #[tool(description = "Append a CLAP effect plugin to a track's insert chain.")]
+    #[tool(description = "Append a CLAP or imported Flow Music effect to an audio or instrument track's insert chain. Use the plugin ID from list_clap_plugins.")]
     fn add_clap_fx(&self, Parameters(a): Parameters<ClapAddArgs>) -> Result<CallToolResult, McpError> {
         reply(self.tools.add_clap_fx(a.track_id, a.plugin_id))
     }
@@ -677,9 +812,22 @@ impl DawServer {
         blocking(move || tools.analyze_arrangement()).await
     }
 
-    #[tool(description = "ANALYZE GROOVE: symbolic timing/feel report — how notes sit against the 16th grid (on-grid % + micro-timing spread) plus swing/humanize/timing. Flags dead-mechanical patterns. Fast, no render. Use to check the rhythm feels human, not robotic.")]
+    #[tool(description = "Summarize piano-roll note placement against the 16th grid and report swing, humanize, and timing settings. Use compare_groove to check how two sources line up in the arrangement.")]
     fn analyze_groove(&self) -> Result<CallToolResult, McpError> {
         reply(self.tools.analyze_groove())
+    }
+
+    #[tool(description = "Compare two selected sources' scheduled note onsets over 1–32 arrangement bars. Optional MIDI pitch filters isolate hits such as kick. Reports exact matches, signed offsets from nearby reference hits, and counts per bar. Use start_listen with dry=true to investigate audible attacks and echoes.")]
+    async fn compare_groove(
+        &self,
+        Parameters(args): Parameters<daw_mcp::groove_compare::GrooveCompareArgs>,
+    ) -> Result<CallToolResult, McpError> {
+        let tools = self.tools.clone();
+        blocking(move || {
+            let project = tools.store.load()?;
+            let report = daw_mcp::groove_compare::compare(&project, args).map_err(|e| e.to_string())?;
+            serde_json::to_string(&report).map_err(|e| e.to_string())
+        }).await
     }
 
     #[tool(description = "DIFF PROJECT: describe the musical changes from another .daw.json (the 'before') to the current project — added/removed tracks, volume/instrument/effect edits, note-count changes, arrangement moves. Semantic, not a JSON line-diff. Pass other_path (e.g. a git-stashed copy) to review what an edit changed.")]
@@ -699,7 +847,7 @@ impl DawServer {
         blocking(move || tools.check()).await
     }
 
-    #[tool(description = "LISTEN: render a bar range and return a numeric report — peak/RMS dBFS, clipping, per-bar loudness, stereo width, 7-band spectral balance. tracks=[…] solos a subset. This is how you hear the project.")]
+    #[tool(description = "Render a bar range and return a numerical report: peak/RMS dBFS, clipping, per-bar loudness, stereo width, and spectral balance. tracks=[…] solos a subset. For audio use a completed start_listen job and audition_excerpt.")]
     async fn listen(&self, Parameters(a): Parameters<RenderArgs>) -> Result<CallToolResult, McpError> {
         let tools = self.tools.clone();
         blocking(move || tools.listen(a.start_bar, a.end_bar, a.tracks)).await
@@ -720,6 +868,39 @@ impl DawServer {
 
 #[tool_handler]
 impl ServerHandler for DawServer {
+    async fn call_tool(
+        &self,
+        request: CallToolRequestParams,
+        context: RequestContext<RoleServer>,
+    ) -> Result<CallToolResult, McpError> {
+        let bound;
+        let server = if let Some(automatic) = &self.automatic_session {
+            let automatic = automatic.clone();
+            let inspect = matches!(
+                request.name.as_ref(),
+                "session_state" | "project_summary" | "get_project"
+            );
+            let resolved = tokio::task::spawn_blocking(move || automatic.tools(inspect))
+                .await
+                .map_err(|error| format!("Live DAW discovery failed: {error}"))
+                .and_then(|result| result);
+            let tools = match resolved {
+                Ok(tools) => tools,
+                Err(error) => return reply(Err(error)),
+            };
+            // Pin all reads and writes in this call to the same socket.
+            bound = Self {
+                tools,
+                automatic_session: None,
+                tool_router: self.tool_router.clone(),
+            };
+            &bound
+        } else {
+            self
+        };
+        self.tool_router.call(ToolCallContext::new(server, request, context)).await
+    }
+
     fn get_info(&self) -> ServerInfo {
         ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
@@ -727,7 +908,7 @@ impl ServerHandler for DawServer {
                 "daw-ai project server. Start with project_summary; in live mode also inspect session_state. \
                  Compose short editable phrases with explicit velocities, note lengths, intentional timing, rests and musical development. \
                  Global swing and random humanization do not replace phrasing. Use set_notes for detailed performances, set_sampler_pad to build sampler kits (gate=true for sounds that should follow note length), set_sampler_variants for velocity-layered or alternate takes, and set_modulators for filter/volume/pan movement. \
-                 Use start_listen for cancellable revision-linked audio renders and diagnostics. Audition the audio with the musician before expanding an arrangement; numerical analysis does not establish musical quality, and do not invent listening judgments or ratings. \
+                 Use composition_guide for the composition loop. Write the motif and its answer first, then render comparable revisions with start_listen. Use audition_excerpt for actual audio if the client supports it, and prepare_audition to ask the musician one focused question with loudness-matched A/B clips. Treat numeric diagnostics as technical measurements and record only real listener feedback. \
                  Live mode shares revision-checked edits and undo with the musician; inspect engine application status. Offline mode edits files only. \
                  Designing sounds from words (Surge XT): find_patches → load_patch → describe_sound → shape_sound → audition_sound, then let the musician steer; the musician judges by ear."
                     .to_string(),
@@ -738,20 +919,24 @@ impl ServerHandler for DawServer {
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
     let mut args = std::env::args().skip(1);
-    let first = args.next().ok_or_else(|| anyhow::anyhow!("usage: daw-mcp <project> | --list-sessions | --session <socket>"))?;
+    let first = args.next().ok_or_else(|| anyhow::anyhow!("usage: daw-mcp <project> | --live | --list-sessions | --session <socket>"))?;
     if first == "--list-sessions" {
         println!("{}", serde_json::to_string_pretty(&daw_io::session::discover()?)?);
         return Ok(());
     }
-    let tools = if first == "--session" {
-        let socket = args.next().ok_or_else(|| anyhow::anyhow!("--session needs a socket path"))?;
-        let mut tools = DawTools::new("live.daw.json".into());
-        tools.store = daw_mcp::store::ProjectStore::live(socket.into()).map_err(anyhow::Error::msg)?;
-        tools
-    } else {
-        DawTools::new(daw_core::project::format::absolute(std::path::Path::new(&first))?)
+    let server = match first.as_str() {
+        "--live" => DawServer::new(DawTools::new("live.daw.json".into()), true),
+        "--session" => {
+            let socket = args.next().ok_or_else(|| anyhow::anyhow!("--session needs a socket path"))?;
+            let store = ProjectStore::live(socket.into()).map_err(anyhow::Error::msg)?;
+            DawServer::new(DawTools::with_store(store), false)
+        }
+        _ => DawServer::new(
+            DawTools::new(daw_core::project::format::absolute(std::path::Path::new(&first))?),
+            false,
+        ),
     };
-    let service = DawServer::new(tools).serve(stdio()).await?;
+    let service = server.serve(stdio()).await?;
     service.waiting().await?;
     Ok(())
 }

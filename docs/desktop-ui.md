@@ -1,8 +1,9 @@
 # Desktop UI and mixing
 
-Select **Mixing** beside Sequencer, Piano Roll, FX and Code, or use the Mixing
-button in the transport. The console fills the workspace. Switching tabs does
-not reload the song or reset playback.
+Select **Mixer** in the transport to open the channel strips between the
+arrangement and the editor. On shorter windows, select a bottom tab to return
+to the editor. Drag the divider above a panel to resize it when both are shown.
+**Arrange ⛶** expands the timeline. Switching views preserves playback.
 
 Each channel shows its name, instrument, level in dB, pan, mute/solo, reverb and
 echo sends, and a live peak meter. Use +/− or the wheel over a level bar; Shift
@@ -15,7 +16,8 @@ The master stays visible. Wide windows also pin the returns; on narrower
 screens they scroll with the tracks. Scroll sideways for additional channels
 and vertically in short windows. Full names remain available as tooltips.
 
-The browser, transport, patterns and editors scroll when they overflow. Native
+Hover over **Browse instruments…** in the header or press **Ctrl+K** to search.
+The transport, patterns and editors scroll when they overflow. Native
 window controls support minimize/maximize/close and resizing. Unsaved work is
 protected by a close prompt and conflict-checked saves. Effects/menu overlays
 consume pointer events instead of activating covered track controls.
@@ -27,5 +29,5 @@ undo, revision conflicts, diagnostics and recoverable saving.
 Run `cargo test -p daw-gpui --lib --locked` for device-free render/interaction
 regressions. Coverage includes control isolation, undo, effects navigation,
 last-channel access after scrolling/resizing, and playback/pattern preservation.
-Hardware playback and native compositor behavior still need desktop acceptance.
+Hardware playback depends on the selected device and compositor.
 After updating the binary, save your work and restart an existing GUI process.

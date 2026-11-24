@@ -20,9 +20,12 @@ jobs:
         if: matrix.audio-assets
         run: |
           sudo apt-get install -y fluid-soundfont-gm
-          cp /usr/share/sounds/sf2/FluidR3_GM.sf2 assets/GeneralUser.sf2
+          bash fetch-assets.sh --quickstart
           echo DAW_REQUIRE_TEST_ASSETS=1 >> "$GITHUB_ENV"
       - run: cargo build --workspace --locked
+      - name: Quickstart sound check
+        if: matrix.audio-assets
+        run: python3 scripts/test-quickstart.py
       - run: python3 scripts/test-mcp-protocol.py
       - run: cargo test --workspace --locked
       - run: cargo clippy --workspace --all-targets --locked -- -D warnings

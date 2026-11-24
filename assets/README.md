@@ -2,8 +2,9 @@
 
 Large binaries (`*.sf2`, `*.wav`, `assets/samples/`) are **gitignored** — they're
 fetched locally, not committed (same model as the soundfont). The guitar amp's
-built-in cabinets are synthesized in code, so no IR files ship either. Get the
-free, redistributable extras with:
+built-in cabinets are synthesized in code, so no IR files ship either. Use
+[`./fetch-assets.sh --quickstart`](../README.md#quickstart) to link the system
+FluidR3 GM package for the first-run demo. To also fetch the VCSL sample library:
 
 ```bash
 ./fetch-assets.sh
@@ -13,7 +14,7 @@ free, redistributable extras with:
 
 | Path | What | License |
 |------|------|---------|
-| `GeneralUser.sf2` | Project default GM soundfont. **It's actually "Fluid R3 GM"** (Frank Wen) — renamed. `head -c 2000 GeneralUser.sf2 \| strings \| grep -i fluid` | MIT |
+| `GeneralUser.sf2` | Project default General MIDI SoundFont. Quickstart links FluidR3 GM here when no file is present. | See the license of your installed SoundFont |
 | `samples/wav/*.wav` | Drum one-shots (TR-909, LinnDrum, lo-fi) + vocal clips | mixed / check source |
 | `samples/vcsl/` | **VCSL** — Versilian Community Sample Library (after `fetch-assets.sh`) | CC0 |
 | `icons/` | App icons | project |

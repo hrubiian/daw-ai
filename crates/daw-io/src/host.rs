@@ -1,10 +1,10 @@
 use crate::config::UserConfig;
-use crate::midi::{connect_midi, connect_midi_port, MidiEvent, MidiHandle};
+use crate::midi::{connect_keylab_daw, connect_midi, connect_midi_port, MidiEvent, MidiHandle};
 use crate::midi_map::MidiMap;
 use crossbeam_channel::{bounded, unbounded, Receiver, Sender};
-use daw_core::audio::input::CaptureStream;
+use daw_core::audio::input::{CaptureStream, InputChannels};
 use daw_core::audio::{AudioEvent, StripMeter};
-use daw_core::project::Project;
+use daw_core::project::{Project, RecordingSource};
 use daw_core::sequencer::{Sequencer, SequencerCommand};
 use std::path::PathBuf;
 use std::sync::{
@@ -25,7 +25,7 @@ pub struct Host {
     pub cmd_tx: Sender<SequencerCommand>,
     pub audio_ev_tx: Sender<AudioEvent>,
     pub playback_tick: Arc<AtomicU32>,
-    pub vis_buf: Arc<Mutex<Vec<f32>>>,
+    pub vis_buf: Arc<Mutex<daw_core::dsp::output::OutputHistory>>,
     pub midi_ev_rx: Receiver<MidiEvent>,
     pub midi_channel: Arc<AtomicU8>,
     pub midi_device: Option<String>,
@@ -34,6 +34,7 @@ pub struct Host {
     /// reconnects because it uses the same channel.
     midi_tx: Sender<MidiEvent>,
     _midi_handle: Option<MidiHandle>,
+    keylab_daw: Option<MidiHandle>,
     /// Output sample rate populated by the audio relay thread after engine init.
     pub sample_rate: Arc<AtomicU32>,
     /// Sequencer transport state (Stopped / CountIn / Rolling).
@@ -42,8 +43,10 @@ pub struct Host {
     pub roll_start_tick: Arc<AtomicU32>,
     /// Open input capture stream while an audio track is armed.
     pub capture: Option<CaptureStream>,
+    capture_input: Option<AudioInputRoute>,
     /// Live instrument monitor (guitar amp + cabinet), when switched on.
     pub monitor: Option<daw_core::audio::monitor::MonitorStream>,
+    guitar_input: Option<AudioInputRoute>,
     /// Per-strip meters (index = track index), replaced on every strip build.
     pub strip_meters: Arc<Mutex<Vec<Arc<StripMeter>>>>,
     /// Master-bus meter (post-limiter).
@@ -94,7 +97,7 @@ impl Host {
     pub fn start(project: &Project, sf2_path: PathBuf) -> Self {
         let engine_error = Arc::new(Mutex::new(None));
         // Visualization buffer — written by the audio callback, read by the frontend.
-        let vis_buf: Arc<Mutex<Vec<f32>>> = Arc::new(Mutex::new(vec![0.0; 4096]));
+        let vis_buf = Arc::new(Mutex::new(daw_core::dsp::output::OutputHistory::default()));
 
         // Sample rate — stored by the relay thread after engine init.
         let sample_rate = Arc::new(AtomicU32::new(0));
@@ -176,6 +179,12 @@ impl Host {
                                     engine.send(AudioEvent::SetAudioClips { clips: loaded });
                                 }
                                 AudioEvent::LoadClapInstances { specs } => {
+                                    {
+                                        let mut error = errors.lock().unwrap();
+                                        if error.as_deref().is_some_and(|message| message.starts_with("plugin ")) {
+                                            *error = None;
+                                        }
+                                    }
                                     // A changed bundle, plugin or saved state (a loaded
                                     // patch) rebuilds that slot's instance only.
                                     let desired: std::collections::HashMap<String, daw_core::audio::clap::SlotFingerprint> = specs
@@ -296,11 +305,14 @@ impl Host {
             midi_map,
             midi_tx,
             _midi_handle: midi_handle,
+            keylab_daw: None,
             sample_rate,
             transport_state,
             roll_start_tick,
             capture: None,
+            capture_input: None,
             monitor: None,
+            guitar_input: None,
             strip_meters,
             master_meter,
             return_meters,
@@ -318,18 +330,20 @@ impl Host {
     }
 
     /// Open the input capture stream per `cfg` (idempotent while armed).
-    pub fn arm_input(&mut self, cfg: &UserConfig, guitar: bool) -> anyhow::Result<&CaptureStream> {
+    pub fn arm_input(&mut self, cfg: &UserConfig, recording_source: RecordingSource) -> anyhow::Result<&CaptureStream> {
         if self.capture.is_none() {
             let source = cfg.input_device.as_deref().and_then(alsa_card_id)
                 .and_then(|card| server_nodes_for_card(card).0);
+            let route = AudioInputRoute::resolve(cfg.input_device.as_deref(), source.as_deref(), cfg.input_channels);
             let mut cs = CaptureStream::open_routed(
                 cfg.input_device.as_deref(),
                 source.as_deref(),
+                route.server_channels(),
                 cfg.input_channels,
                 Arc::clone(&self.take_gate),
                 Arc::clone(&self.roll_start_tick),
             )?;
-            if guitar {
+            if recording_source.uses_guitar(self.guitar_input.as_ref() == Some(&route)) {
               if let Some(slot) = cfg.guitar.active_ampforge()? {
                 cs.set_plugin(slot)?;
               } else {
@@ -342,25 +356,38 @@ impl Host {
             // Show the logical interface, even when the sound server owns it.
             if let Some(name) = &cfg.input_device { cs.device_name = name.clone(); }
             self.capture = Some(cs);
+            self.capture_input = Some(route);
         }
         Ok(self.capture.as_ref().expect("just set"))
+    }
+
+    pub fn capture_uses_guitar(&self, source: RecordingSource) -> bool {
+        source.uses_guitar(self.capture_input.is_some() && self.capture_input == self.guitar_input)
     }
 
     /// Start (or restart with new device settings) the low-latency guitar
     /// monitor: input channel → amp → cabinet → output.
     pub fn start_monitor(&mut self, cfg: &UserConfig, bpm: f64) -> anyhow::Result<&daw_core::audio::monitor::MonitorStream> {
-        use daw_core::audio::input::InputChannels;
         use daw_core::audio::monitor::{MonitorConfig, MonitorStream};
-        self.monitor = None; // release the devices before reopening them
+        let input = cfg.guitar_input();
         // With a sound server running, route through it to the interface the
         // musician picked (it already holds the card for the song's playback,
         // so the card cannot be opened directly). Without one, open devices by name.
-        let card = cfg.input_device.as_deref().and_then(alsa_card_id);
+        let card = input.device.as_deref().and_then(alsa_card_id);
         let (source, sink) = card.map(server_nodes_for_card).unwrap_or((None, None));
+        let route = AudioInputRoute::resolve(input.device.as_deref(), source.as_deref(), InputChannels::Mono(input.channel));
+        if self.capture.as_ref().is_some_and(CaptureStream::is_monitoring) {
+            anyhow::ensure!(
+                !self.capture_input.as_ref().is_some_and(|active| active.overlaps(&route)),
+                "this channel is already playing through an audio track's Monitor. Choose a different guitar input or turn that track monitor off"
+            );
+        }
+        self.stop_monitor(); // release the devices before reopening them
         let mc = MonitorConfig {
-            input_device: cfg.input_device.clone(),
-            input_channel: match cfg.input_channels { InputChannels::Mono(c) | InputChannels::Stereo(c, _) => c },
-            output_device: if cfg.guitar.output_same_as_input { cfg.input_device.clone() } else { None },
+            input_device: input.device.clone(),
+            input_channel: input.channel,
+            source_channels: route.server_channels(),
+            output_device: if cfg.guitar.output_same_as_input { input.device } else { None },
             buffer_frames: cfg.guitar.buffer_frames,
             server_sink: if cfg.guitar.output_same_as_input { sink } else { None },
             server_source: source,
@@ -373,22 +400,50 @@ impl Host {
             if let Ok(ir) = crate::cabinet::build_ir(&cfg.guitar, stream.sample_rate()) { stream.set_ir(ir); }
         }
         self.monitor = Some(stream);
+        self.guitar_input = Some(route);
         Ok(self.monitor.as_ref().expect("just set"))
     }
 
     pub fn stop_monitor(&mut self) {
         self.monitor = None;
+        self.guitar_input = None;
     }
 
     /// Close the capture stream (finalizes any open take via Drop).
     pub fn disarm_input(&mut self) {
         self.capture = None;
+        self.capture_input = None;
+    }
+
+    /// Send the armed capture to the audio track's mixer path without changing
+    /// which frames or effects the recorder writes to disk.
+    pub fn enable_track_monitor(&mut self, track_id: &str) -> anyhow::Result<()> {
+        anyhow::ensure!(self.sample_rate.load(Ordering::Acquire) != 0, "audio output is unavailable");
+        if let (Some(capture), Some(guitar)) = (&self.capture_input, &self.guitar_input) {
+            anyhow::ensure!(
+                !capture.overlaps(guitar),
+                "this channel is already playing through the guitar amp. Choose a different input on the track or turn guitar monitoring off"
+            );
+        }
+        let capture = self.capture.as_mut().ok_or_else(|| anyhow::anyhow!("no audio input is open"))?;
+        if let Some(input) = capture.take_monitor_input() {
+            self.audio_ev_tx.send(AudioEvent::SetTrackMonitor {
+                track_id: track_id.to_owned(),
+                input: Box::new(input),
+            }).map_err(|_| anyhow::anyhow!("audio engine is disconnected"))?;
+        }
+        capture.set_monitoring(true);
+        Ok(())
+    }
+
+    pub fn disable_track_monitor(&self) {
+        if let Some(capture) = &self.capture {
+            capture.set_monitoring(false);
+        }
     }
 
     /// Switch the live MIDI input to port `idx`. Returns `false` if it can't connect.
     pub fn set_midi_port(&mut self, idx: usize) -> bool {
-        // Drop the old connection before opening a new one on the same port.
-        self._midi_handle = None;
         match connect_midi_port(
             idx,
             self.audio_ev_tx.clone(),
@@ -399,11 +454,130 @@ impl Host {
             Some((handle, name)) => {
                 self._midi_handle = Some(handle);
                 self.midi_device = Some(name);
+                self.keylab_daw = None;
                 true
             }
             None => false,
         }
     }
+
+    pub fn enable_keylab_controls(&mut self) {
+        if self.keylab_daw.is_none() {
+            self.keylab_daw = self.midi_device.as_deref()
+                .and_then(|name| connect_keylab_daw(name, self.midi_tx.clone()));
+        }
+    }
+
+    pub fn keylab_controls_connected(&self) -> bool {
+        self.keylab_daw.is_some()
+    }
+}
+
+/// Recognize the physical input shared by ALSA aliases and the sound server.
+#[derive(Debug, PartialEq, Eq)]
+struct AudioInputRoute {
+    device: AudioInputDevice,
+    channels: InputChannels,
+}
+
+#[derive(Debug, PartialEq, Eq)]
+enum AudioInputDevice {
+    Server(String),
+    Alsa(String),
+}
+
+impl AudioInputRoute {
+    fn resolve(device: Option<&str>, server_node: Option<&str>, channels: InputChannels) -> Self {
+        let device = if let Some(node) = server_node {
+            AudioInputDevice::Server(node.into())
+        } else if matches!(device, None | Some("default" | "pipewire" | "pulse")) {
+            std::env::var("PULSE_SOURCE").ok().filter(|name| !name.is_empty())
+                .or_else(|| pactl(&["get-default-source"]).map(|name| name.trim().to_owned()).filter(|name| !name.is_empty()))
+                .map_or_else(|| AudioInputDevice::Alsa("default".into()), AudioInputDevice::Server)
+        } else {
+            let name = device.unwrap_or("default");
+            AudioInputDevice::Alsa(alsa_card_id(name).unwrap_or(name).into())
+        };
+        Self { device, channels }
+    }
+
+    fn overlaps(&self, other: &Self) -> bool {
+        fn selected(channels: InputChannels) -> [u16; 2] {
+            match channels {
+                InputChannels::Mono(channel) => [channel, channel],
+                InputChannels::Stereo(left, right) => [left, right],
+            }
+        }
+        self.device == other.device
+            && selected(self.channels).into_iter().any(|channel| selected(other.channels).contains(&channel))
+    }
+
+    fn server_channels(&self) -> Option<u16> {
+        let AudioInputDevice::Server(source) = &self.device else { return None };
+        source_channels(&pactl(&["list", "short", "sources"])?, source)
+    }
+}
+
+fn pactl(args: &[&str]) -> Option<String> {
+    let output = std::process::Command::new("pactl").args(args).output().ok()?;
+    output.status.success().then(|| String::from_utf8_lossy(&output.stdout).into_owned())
+}
+
+fn source_channels(listing: &str, source: &str) -> Option<u16> {
+    listing.lines().find_map(|line| {
+        let mut fields = line.split_whitespace();
+        if fields.nth(1)? != source { return None; }
+        channel_count(fields)
+    })
+}
+
+fn channel_count<'a>(mut spec: impl Iterator<Item = &'a str>) -> Option<u16> {
+    spec.find_map(|field| field.strip_suffix("ch")?.parse::<u16>().ok()).filter(|&count| count > 0)
+}
+
+/// Keep the saved ALSA route names while showing the interface names and
+/// channel counts that are actually available through the sound server.
+pub fn list_input_devices() -> Vec<daw_core::audio::input::InputDeviceInfo> {
+    use daw_core::audio::input::InputDeviceInfo;
+
+    #[derive(serde::Deserialize)]
+    struct Source {
+        name: String,
+        description: String,
+        sample_specification: String,
+        properties: std::collections::HashMap<String, String>,
+    }
+
+    let mut devices = daw_core::audio::input::list_input_devices();
+    let Some(sources) = pactl(&["--format=json", "list", "sources"])
+        .and_then(|json| serde_json::from_str::<Vec<Source>>(&json).ok()) else { return devices };
+    let default_source = pactl(&["get-default-source"]);
+    for source in sources {
+        let Some(channels) = channel_count(source.sample_specification.split_whitespace()) else { continue };
+        if default_source.as_deref().is_some_and(|name| name.trim() == source.name) {
+            for device in devices.iter_mut().filter(|d| matches!(d.name.as_str(), "default" | "pipewire" | "pulse")) {
+                device.channels = channels;
+            }
+        }
+        let Some(card) = source.properties.get("alsa.id").filter(|_| !source.name.ends_with(".monitor")) else { continue };
+        let mut aliases = devices.iter_mut().filter(|d| alsa_card_id(&d.name) == Some(card.as_str())).peekable();
+        if aliases.peek().is_some() {
+            for device in aliases {
+                device.label = format!("{} ({})", source.description, device.name);
+                device.channels = channels;
+            }
+        } else {
+            let sample_rate = source.sample_specification.split_whitespace()
+                .find_map(|field| field.strip_suffix("Hz")?.parse().ok()).unwrap_or(48_000);
+            devices.push(InputDeviceInfo {
+                name: format!("hw:CARD={card},DEV=0"),
+                label: source.description,
+                channels,
+                sample_rate,
+            });
+        }
+    }
+    devices
 }
 
 /// ALSA card id from a device name such as `iec958:CARD=U192k,DEV=0` or
@@ -418,9 +592,7 @@ pub fn alsa_card_id(device: &str) -> Option<&str> {
 /// read from `pactl`. `(None, None)` when no PulseAudio-compatible server
 /// answers or the card is not known to it.
 pub fn server_nodes_for_card(card: &str) -> (Option<String>, Option<String>) {
-    let list = |kind: &str| std::process::Command::new("pactl").args(["list", kind]).output().ok()
-        .filter(|o| o.status.success()).map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
-        .and_then(|text| node_for_card(&text, card));
+    let list = |kind: &str| pactl(&["list", kind]).and_then(|text| node_for_card(&text, card));
     (list("sources"), list("sinks"))
 }
 
@@ -462,12 +634,12 @@ impl Host {
             engine_error: Default::default(),
             cmd_tx, audio_ev_tx,
             playback_tick: Default::default(),
-            vis_buf: Arc::new(Mutex::new(vec![0.; 512])),
+            vis_buf: Default::default(),
             midi_ev_rx, midi_channel: Default::default(), midi_device: None,
-            midi_map: Arc::new(MidiMap::default()), midi_tx, _midi_handle: None,
+            midi_map: Arc::new(MidiMap::default()), midi_tx, _midi_handle: None, keylab_daw: None,
             sample_rate: Arc::new(AtomicU32::new(44100)),
             transport_state: Default::default(), roll_start_tick: Default::default(),
-            capture: None, monitor: None, strip_meters: Default::default(),
+            capture: None, capture_input: None, monitor: None, guitar_input: None, strip_meters: Default::default(),
             master_meter: Default::default(), return_meters: Default::default(),
             clap_meta_rx, take_gate: Default::default(),
         }, commands, audio)
@@ -477,6 +649,30 @@ impl Host {
 #[cfg(test)]
 mod monitor_routing_tests {
     use super::*;
+
+    #[test]
+    fn uses_the_selected_sound_server_sources_full_channel_count() {
+        let listing = "30\tlaptop\tPipeWire\ts32le 2ch 48000Hz\tSUSPENDED\n\
+                       31\tinterface\tPipeWire\ts32le 4ch 48000Hz\tRUNNING";
+        assert_eq!(source_channels(listing, "interface"), Some(4));
+        assert_eq!(source_channels(listing, "laptop"), Some(2));
+        assert_eq!(source_channels(listing, "missing"), None);
+    }
+
+    #[test]
+    fn audio_routes_detect_overlap_without_confusing_other_channels_or_devices() {
+        let voice = AudioInputRoute::resolve(Some("hw:CARD=U192k,DEV=0"), Some("usb-source"), InputChannels::Mono(0));
+        let same = AudioInputRoute::resolve(Some("plughw:CARD=U192k,DEV=0"), Some("usb-source"), InputChannels::Mono(0));
+        let guitar = AudioInputRoute::resolve(Some("plughw:CARD=U192k,DEV=0"), Some("usb-source"), InputChannels::Mono(1));
+        let pair = AudioInputRoute::resolve(Some("hw:CARD=U192k,DEV=0"), Some("usb-source"), InputChannels::Stereo(0, 1));
+        let other = AudioInputRoute::resolve(Some("hw:CARD=other,DEV=0"), Some("other-source"), InputChannels::Mono(0));
+        assert_eq!(voice, same);
+        assert!(voice.overlaps(&same));
+        assert!(!voice.overlaps(&guitar));
+        assert!(pair.overlaps(&guitar));
+        assert_ne!(pair, guitar, "auto tone matching requires the exact mono input");
+        assert!(!voice.overlaps(&other));
+    }
 
     #[test]
     fn card_id_is_read_from_any_alsa_alias_and_matched_to_server_nodes() {

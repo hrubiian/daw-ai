@@ -19,6 +19,7 @@ pub(super) fn content_height(window: &Window) -> f32 {
 }
 
 pub(super) fn frame(
+    theme: Theme,
     content: impl IntoElement,
     window: &Window,
     close: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -26,10 +27,11 @@ pub(super) fn frame(
     if !client_frame(window) {
         return div().size_full().child(content);
     }
-    client_frame_content(content, window, close)
+    client_frame_content(theme, content, window, close)
 }
 
 fn client_frame_content(
+    theme: Theme,
     content: impl IntoElement,
     window: &Window,
     close: impl Fn(&gpui::ClickEvent, &mut Window, &mut App) + 'static,
@@ -72,11 +74,11 @@ fn client_frame_content(
         .h(px(TITLE_HEIGHT))
         .flex_shrink_0()
         .flex()
-        .bg(rgb(PANEL))
-        .text_color(rgb(TEXT))
+        .bg(rgb(theme.panel))
+        .text_color(rgb(theme.text))
         .child(title)
         .child(
-            button("window-minimize", "−", PANEL_ALT).on_click(|_, w, cx| {
+            button("window-minimize", "−", theme.panel_alt).on_click(|_, w, cx| {
                 cx.stop_propagation();
                 w.minimize_window();
             }),
@@ -85,7 +87,7 @@ fn client_frame_content(
             button(
                 "window-maximize",
                 if window.is_maximized() { "❐" } else { "□" },
-                PANEL_ALT,
+                theme.panel_alt,
             )
             .on_click(|_, w, cx| {
                 cx.stop_propagation();
@@ -175,7 +177,7 @@ mod tests {
         fn render(&mut self, window: &mut Window, _: &mut Context<Self>) -> impl IntoElement {
             // Test windows report server decorations. Exercise the actual client
             // frame explicitly so Wayland-only startup panics cannot hide there.
-            client_frame_content(div().size_full().child("Workspace"), window, |_, w, _| {
+            client_frame_content(Theme::DARK, div().size_full().child("Workspace"), window, |_, w, _| {
                 w.remove_window()
             })
         }

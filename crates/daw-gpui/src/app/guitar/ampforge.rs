@@ -96,20 +96,22 @@ impl DawView {
     }
 
     pub(super) fn guitar_backend(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let selected = self.config.guitar.ampforge_enabled;
-        div().flex().flex_col().gap_2().p_3().bg(rgb(PANEL))
-            .child(section_title("Guitar processor"))
+        div().flex().flex_col().gap_2().p_3().bg(rgb(theme.panel))
+            .child(theme.section_title("Guitar processor"))
             .child(div().flex().flex_wrap().gap_2()
-                .child(cell_btn("guitar-backend-builtin", "Built-in rack", !selected, self.accent())
+                .child(theme.cell_btn("guitar-backend-builtin", "Built-in rack", !selected, self.accent())
                     .on_click(cx.listener(|this, _, _, cx| { this.select_guitar_backend(false); cx.notify(); })))
-                .child(cell_btn("guitar-backend-ampforge", "AmpForge", selected, self.accent())
+                .child(theme.cell_btn("guitar-backend-ampforge", "AmpForge", selected, self.accent())
                     .on_click(cx.listener(|this, _, _, cx| { this.select_guitar_backend(true); cx.notify(); })))
-                .child(cell_btn("ampforge-rescan", "Rescan plugins", false, PANEL_ALT)
+                .child(theme.cell_btn("ampforge-rescan", "Rescan plugins", false, theme.panel_alt)
                     .on_click(cx.listener(|this, _, _, cx| { this.start_clap_scan(); cx.notify(); }))))
-            .child(div().text_color(rgb(TEXT_DIM)).child("AmpForge uses its own amp, cabinet and pedals for live monitoring and new guitar-rack takes."))
+            .child(div().text_color(rgb(theme.text_dim)).child("AmpForge uses its own amp, cabinet and pedals for live monitoring and new guitar-rack takes."))
     }
 
     pub(super) fn ampforge_controls(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let on = self.host.monitor.is_some();
         let choices = daw_core::audio::monitor::BUFFER_CHOICES;
         let index = choices
@@ -138,12 +140,12 @@ impl DawView {
                 )
             })
             .unwrap_or_else(|| "Monitoring is off".into());
-        div().flex().flex_col().gap_2().p_3().bg(rgb(PANEL))
-            .child(section_title("AmpForge · live guitar"))
+        div().flex().flex_col().gap_2().p_3().bg(rgb(theme.panel))
+            .child(theme.section_title("AmpForge · live guitar"))
             .child(div().flex().flex_wrap().gap_2()
-                .child(cell_btn("amp-monitor", if on { "Monitoring: on" } else { "Monitoring: off" }, on, self.accent())
+                .child(theme.cell_btn("amp-monitor", if on { "Monitoring: on" } else { "Monitoring: off" }, on, self.accent())
                     .on_click(cx.listener(|this, _, _, cx| { this.toggle_monitor(); cx.notify(); })))
-                .child(cell_btn("ampforge-editor", "Open AmpForge editor…", false, PANEL_ALT)
+                .child(theme.cell_btn("ampforge-editor", "Open AmpForge editor…", false, theme.panel_alt)
                     .on_click(cx.listener(|this, _, _, cx| {
                         if this.recording_route_locked() {
                             this.st.set_status("finish the AmpForge take before editing its tone");
@@ -152,7 +154,7 @@ impl DawView {
                         } else { this.st.set_status("enable monitoring first, then open the AmpForge editor"); }
                         cx.notify();
                     })))
-                .child(cell_btn("ampforge-save", "Save AmpForge tone", false, PANEL_ALT)
+                .child(theme.cell_btn("ampforge-save", "Save AmpForge tone", false, theme.panel_alt)
                     .on_click(cx.listener(|this, _, _, cx| {
                         match this.save_ampforge_state() {
                             Ok(()) => this.st.set_status("AmpForge tone saved; use My presets to name this rig"),
@@ -162,18 +164,18 @@ impl DawView {
                     }))))
             .child(div().flex().flex_wrap().items_center().gap_2()
                 .child(div().child(format!("Buffer: {} frames", self.config.guitar.buffer_frames)))
-                .child(cell_btn("ampforge-buffer-down", "−", false, PANEL_ALT).on_click(cx.listener(move |this, _, _, cx| {
+                .child(theme.cell_btn("ampforge-buffer-down", "−", false, theme.panel_alt).on_click(cx.listener(move |this, _, _, cx| {
                     this.edit_monitor_device(|g| g.buffer_frames = previous); cx.notify();
                 })))
-                .child(cell_btn("ampforge-buffer-up", "+", false, PANEL_ALT).on_click(cx.listener(move |this, _, _, cx| {
+                .child(theme.cell_btn("ampforge-buffer-up", "+", false, theme.panel_alt).on_click(cx.listener(move |this, _, _, cx| {
                     this.edit_monitor_device(|g| g.buffer_frames = next); cx.notify();
                 })))
-                .child(cell_btn("ampforge-output", if same_output { "Output: this interface" } else { "Output: system default" }, same_output, self.accent())
+                .child(theme.cell_btn("ampforge-output", if same_output { "Output: this interface" } else { "Output: system default" }, same_output, self.accent())
                     .on_click(cx.listener(|this, _, _, cx| { this.edit_monitor_device(|g| g.output_same_as_input = !g.output_same_as_input); cx.notify(); }))))
-            .child(div().text_color(rgb(TEXT_DIM)).child(meter))
-            .child(div().text_color(rgb(TEXT_DIM)).child("Use AmpForge's editor for its pedals, cabinet WAVs, NAM models and presets. Cabinet/model files must remain at their saved paths."))
-            .child(div().text_color(rgb(TEXT_DIM)).child("Recording: select Mono input and Guitar rack in the track input picker. The editor hides when a take starts; its tone is held for the take. Stop recording before editing."))
-            .child(cell_btn("ampforge-project", "AmpForge downloads & source", false, PANEL_ALT)
+            .child(div().text_color(rgb(theme.text_dim)).child(meter))
+            .child(div().text_color(rgb(theme.text_dim)).child("Use AmpForge's editor for its pedals, cabinet WAVs, NAM models and presets. Cabinet/model files must remain at their saved paths."))
+            .child(div().text_color(rgb(theme.text_dim)).child("Recording: select Mono input and Guitar rack in the track input picker. The editor hides when a take starts; its tone is held for the take. Stop recording before editing."))
+            .child(theme.cell_btn("ampforge-project", "AmpForge downloads & source", false, theme.panel_alt)
                 .on_click(|_, _, cx| cx.open_url("https://github.com/Loursy/AmpForge")))
     }
 }
@@ -196,6 +198,7 @@ mod tests {
                 id: AMPFORGE_ID.into(),
                 name: "AmpForge".into(),
                 vendor: "AmpForge".into(),
+                features: Vec::new(),
                 is_instrument: false,
                 is_effect: true,
             }];

@@ -1,6 +1,7 @@
 use super::*;
+use daw_core::musical_time::{seconds_per_bar, BEATS_PER_BAR, TICKS_PER_BAR, TICKS_PER_BEAT};
 
-const PLAYHEAD_GREEN: u32 = 0x4ade80;
+struct TimelineScrollDrag;
 
 impl DawView {
     /// One drag event on audio clip `idx` at cursor x `mouse_x`: snapshot
@@ -26,20 +27,23 @@ impl DawView {
         (BAR_W * self.st.arrange_zoom).clamp(MIN_BAR_W, MAX_BAR_W)
     }
 
+    fn seek_at_timeline_x(&mut self, x: gpui::Pixels) {
+        let timeline_x = f64::from(f32::from(x) - TRACK_HEADER_W)
+            + f64::from(self.st.arrange_scroll_x);
+        let tick = (timeline_x * f64::from(TICKS_PER_BAR) / f64::from(self.bar_w())).round();
+        self.seek_to_tick(tick as u32);
+    }
+
     /// Total pixel height of all track rows stacked (the scrollable content).
     pub(super) fn tracks_content_h(&self) -> f32 {
         self.st.project.tracks.iter().map(|t| self.track_h(&t.id)).sum()
     }
 
-    /// Visible height of the track-rows viewport (below the ruler), derived from
-    /// the window height minus the fixed chrome (menu 24, optional sf2 banner,
-    /// transport 48, song toolbar 30, status 18), then the editor dock
-    /// (splitter 5 + dock_h, absent in full-arrange mode), then the ruler.
+    /// Visible height of the track lanes below the ruler.
     pub(super) fn tracks_vis_h(&self, window_h: f32) -> f32 {
-        let banner = if self.sf2_missing { 22.0 } else { 0.0 };
-        let chrome = 24.0 + banner + 48.0 + 30.0 + 18.0;
-        let dock = if self.st.arrange_full { 0.0 } else { 5.0 + self.st.dock_h };
-        (window_h - chrome - dock - RULER_H - LOOP_LANE_H).max(40.0)
+        let banner = if self.sf2_missing { SOUNDFONT_BANNER_H } else { 0. };
+        let layout = layout::PanelLayout::new(window_h, &self.st, self.sf2_missing);
+        (window_h - ARRANGE_CHROME_H - banner - layout.bottom_height()).max(0.)
     }
 
     /// Largest valid vertical scroll offset: content taller than the viewport,
@@ -48,9 +52,115 @@ impl DawView {
         (self.tracks_content_h() - self.tracks_vis_h(window_h)).max(0.0)
     }
 
+    fn timeline_bars(&self, width: f32) -> u32 {
+        let viewport_bars = (width / self.bar_w()).ceil() as u32;
+        self.st.project.song_bars()
+            .max(self.st.project.loop_region.end_bar)
+            .max(viewport_bars)
+            .saturating_add(8)
+    }
+
+    pub(super) fn timeline_max_scroll(&self, width: f32) -> f32 {
+        (self.timeline_bars(width) as f32 * self.bar_w() - width).max(0.)
+    }
+
+    pub(super) fn arrangement_end_offset(&self, window: &Window) -> f32 {
+        (self.st.project.song_bars() as f32 * self.bar_w() - self.timeline_width(window)).max(0.)
+    }
+
+    pub(super) fn scroll_timeline_to(&mut self, offset: f32, window: &Window) {
+        self.st.arrange_scroll_x = offset.clamp(0., self.timeline_max_scroll(self.timeline_width(window)));
+        // Explicit navigation can leave the playhead offscreen during playback.
+        let x = self.st.playhead() as f32 / TICKS_PER_BAR as f32 * self.bar_w();
+        self.playhead_was_visible = (self.st.arrange_scroll_x..=self.st.arrange_scroll_x + self.timeline_width(window)).contains(&x);
+    }
+
+    fn scroll_tracks(&mut self, delta: f32, window: &Window) {
+        let limit = self.tracks_max_scroll_y(window_frame::content_height(window));
+        self.st.arrange_scroll_y = (self.st.arrange_scroll_y - delta).clamp(0., limit);
+    }
+
+    fn timeline_wheel(&mut self, event: &gpui::ScrollWheelEvent, window: &Window, over_ruler: bool) {
+        let delta = event.delta.pixel_delta(px(48.));
+        let (dx, dy) = (f32::from(delta.x), f32::from(delta.y));
+        if event.control {
+            if dy == 0. { return; }
+            let mouse_x = (f32::from(event.position.x) - TRACK_HEADER_W)
+                .clamp(0., self.timeline_width(window));
+            let bar = (self.st.arrange_scroll_x + mouse_x) / self.bar_w();
+            let factor = if dy > 0. { 1.1 } else { 1. / 1.1 };
+            self.st.arrange_zoom = (self.st.arrange_zoom * factor)
+                .clamp(MIN_BAR_W / BAR_W, MAX_BAR_W / BAR_W);
+            self.scroll_timeline_to(bar * self.bar_w() - mouse_x, window);
+        } else if event.shift || over_ruler {
+            let horizontal = if dx.abs() >= dy.abs() { dx } else { dy };
+            self.scroll_timeline_to(self.st.arrange_scroll_x - horizontal, window);
+        } else {
+            self.scroll_tracks(dy, window);
+            if dx != 0. {
+                self.scroll_timeline_to(self.st.arrange_scroll_x - dx, window);
+            }
+        }
+    }
+
+    fn drag_timeline_scrollbar(&mut self, x: f32, window: &Window) {
+        let Some(grab) = self.timeline_scroll_grab else { return; };
+        let width = self.timeline_width(window);
+        let max = self.timeline_max_scroll(width);
+        let travel = width - scrollbar_thumb(width, max);
+        if travel > 0. {
+            self.scroll_timeline_to((x - grab) / travel * max, window);
+        }
+    }
+
+    fn timeline_scrollbar(&self, width: f32, cx: &mut Context<Self>) -> gpui::Stateful<gpui::Div> {
+        use gpui::MouseButton::Left;
+
+        let theme = self.theme();
+        let max = self.timeline_max_scroll(width);
+        let thumb = scrollbar_thumb(width, max);
+        let left = if max > 0. { self.st.arrange_scroll_x / max * (width - thumb) } else { 0. };
+        div()
+            .id("timeline-scrollbar")
+            .debug_selector(|| "timeline-scrollbar".into())
+            .relative()
+            .h(px(ARRANGE_SCROLLBAR_H))
+            .flex_shrink_0()
+            .bg(rgb(theme.panel))
+            .border_t_1()
+            .border_color(rgb(theme.border))
+            .cursor_pointer()
+            .tooltip(move |_, cx| cx.new(|_| TextTooltip {
+                theme,
+                text: "Drag or Shift+scroll to move through bars".into(),
+            }).into())
+            .child(div().debug_selector(|| "timeline-scrollbar-thumb".into())
+                .absolute().top(px(3.)).left(px(left)).w(px(thumb)).h(px(9.))
+                .rounded_full().bg(rgb(theme.text_dim)))
+            .on_mouse_down(Left, cx.listener(move |this, event: &gpui::MouseDownEvent, window, cx| {
+                let x = f32::from(event.position.x) - TRACK_HEADER_W;
+                let within_thumb = x - left;
+                this.timeline_scroll_grab = Some(if (0.0..=thumb).contains(&within_thumb) {
+                    within_thumb
+                } else {
+                    thumb / 2.
+                });
+                this.drag_timeline_scrollbar(x, window);
+                cx.notify();
+            }))
+            .on_drag(TimelineScrollDrag, |_, _, _, cx| cx.new(|_| EmptyDrag))
+            .on_drag_move(cx.listener(|this, event: &DragMoveEvent<TimelineScrollDrag>, window, cx| {
+                this.drag_timeline_scrollbar(f32::from(event.event.position.x - event.bounds.left()), window);
+                cx.notify();
+            }))
+            .on_mouse_up(Left, cx.listener(|this, _, _, _| this.timeline_scroll_grab = None))
+            .on_mouse_up_out(Left, cx.listener(|this, _, _, _| this.timeline_scroll_grab = None))
+    }
+
     /// The track header column: one row per track with select / mute / solo /
     /// volume / pan steppers / instrument label.
     pub(super) fn track_headers(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let accent = self.accent();
         let selected = self.st.selected_track.clone();
         let rows: Vec<_> = self.st.project.tracks.iter().enumerate().map(|(ti, t)| {
@@ -67,7 +177,7 @@ impl DawView {
             // obvious, always-visible confirmation of what's loaded.
             let instr_color = match &t.instrument {
                 daw_core::project::Instrument::Soundfont { bank: 0, .. } => accent,
-                _ => TEXT_DIM,
+                _ => theme.text_dim,
             };
             let tcolor = track_color(ti);
             let th = self.track_h(&id);
@@ -80,9 +190,9 @@ impl DawView {
                 .gap_1()
                 .h(px(th))
                 .flex_shrink_0()
-                .bg(rgb(if is_sel { PANEL_ALT } else { PANEL }))
+                .bg(rgb(if is_sel { theme.panel_alt } else { theme.panel }))
                 .border_b_1()
-                .border_color(rgb(BORDER))
+                .border_color(rgb(theme.border))
                 .cursor_pointer()
                 .on_click(cx.listener({
                     let id = id.clone();
@@ -106,12 +216,12 @@ impl DawView {
                                     .id(SharedString::from(format!("trkname-{id}")))
                                     .tooltip({
                                         let text = SharedString::from(format!("{name} · Double-click to rename"));
-                                        move |_w, cx| cx.new(|_| TextTooltip { text: text.clone() }).into()
+                                        move |_w, cx| cx.new(|_| TextTooltip { theme, text: text.clone() }).into()
                                     })
                                     .flex_1()
                                     .min_w(px(60.))
                                     .truncate()
-                                    .text_color(rgb(TEXT))
+                                    .text_color(rgb(theme.text))
                                     .child(name.clone())
                                     .on_click(cx.listener(move |this, e: &gpui::ClickEvent, w, cx| {
                                         if e.click_count() >= 2 {
@@ -122,58 +232,58 @@ impl DawView {
                                     }))
                                     .into_any_element()
                             })
-                            .child(cell_btn(format!("m-{id}"), "M", muted, RECORD).on_click(cx.listener({
+                            .child(theme.cell_btn(format!("m-{id}"), "M", muted, RECORD).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| {
                                     this.toggle_mute(&id);
                                     cx.notify();
                                 }
                             })))
-                            .child(cell_btn(format!("s-{id}"), "S", soloed, accent).on_click(cx.listener({
+                            .child(theme.cell_btn(format!("s-{id}"), "S", soloed, accent).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| {
                                     this.toggle_solo(&id);
                                     cx.notify();
                                 }
                             })))
-                            .child(cell_btn(format!("tt-{id}"), "T", false, PANEL_ALT).on_click(cx.listener({
+                            .child(theme.cell_btn(format!("tt-{id}"), "T", false, theme.panel_alt).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| { this.cycle_track_type(&id); cx.notify(); }
                             })))
-                            .child(cell_btn(format!("tp-{id}"), "+P", false, PANEL_ALT).on_click(cx.listener({
+                            .child(theme.cell_btn(format!("tp-{id}"), "+P", false, theme.panel_alt).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| { this.add_pattern(&id); cx.notify(); }
                             })))
-                            .child(cell_btn(format!("tx-{id}"), "✕", false, RECORD).on_click(cx.listener({
+                            .child(theme.cell_btn(format!("tx-{id}"), "✕", false, RECORD).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| { this.remove_track(&id); cx.notify(); }
                             })))
                         )
                         .child(div().flex().items_center().gap_1().pl_1().text_size(px(12.))
-                            .child(cell_btn(format!("vd-{id}"), "−", false, PANEL_ALT).on_click(cx.listener({
+                            .child(theme.cell_btn(format!("vd-{id}"), "−", false, theme.panel_alt).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| {
                                     this.nudge_volume(&id, -0.05);
                                     cx.notify();
                                 }
                             })))
-                            .child(div().w(px(46.)).flex_shrink_0().whitespace_nowrap().text_color(rgb(TEXT_DIM)).child(format!("{:.0}%", vol * 100.0)))
-                            .child(cell_btn(format!("vu-{id}"), "+", false, PANEL_ALT).on_click(cx.listener({
+                            .child(div().w(px(46.)).flex_shrink_0().whitespace_nowrap().text_color(rgb(theme.text_dim)).child(format!("{:.0}%", vol * 100.0)))
+                            .child(theme.cell_btn(format!("vu-{id}"), "+", false, theme.panel_alt).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| {
                                     this.nudge_volume(&id, 0.05);
                                     cx.notify();
                                 }
                             })))
-                            .child(cell_btn(format!("pd-{id}"), "−", false, PANEL_ALT).on_click(cx.listener({
+                            .child(theme.cell_btn(format!("pd-{id}"), "−", false, theme.panel_alt).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| {
                                     this.nudge_pan(&id, -0.1);
                                     cx.notify();
                                 }
                             })))
-                            .child(div().w(px(46.)).flex_shrink_0().whitespace_nowrap().text_color(rgb(TEXT_DIM)).child(pan_label(pan)))
-                            .child(cell_btn(format!("pu-{id}"), "+", false, PANEL_ALT).on_click(cx.listener({
+                            .child(div().w(px(46.)).flex_shrink_0().whitespace_nowrap().text_color(rgb(theme.text_dim)).child(pan_label(pan)))
+                            .child(theme.cell_btn(format!("pu-{id}"), "+", false, theme.panel_alt).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| {
                                     this.nudge_pan(&id, 0.1);
@@ -181,10 +291,11 @@ impl DawView {
                                 }
                             })))
                             .child(self.track_input_button(t, cx))
+                            .children((t.track_type == daw_core::project::TrackType::Audio).then(|| self.track_monitor_button(t, cx)))
                             .child(div().id(SharedString::from(format!("instrument-{id}")))
                                 .tooltip({
                                     let text = SharedString::from(instr.clone());
-                                    move |_w, cx| cx.new(|_| TextTooltip { text: text.clone() }).into()
+                                    move |_w, cx| cx.new(|_| TextTooltip { theme, text: text.clone() }).into()
                                 })
                                 .flex_1().min_w(px(0.)).truncate().text_color(rgb(instr_color)).child(instr))
                         )
@@ -199,7 +310,7 @@ impl DawView {
                         .right_0()
                         .h(px(4.))
                         .cursor_pointer()
-                        .bg(rgb(BORDER))
+                        .bg(rgb(theme.border))
                         .on_drag(TrackResize { track: id.clone() }, |_, _, _, cx| cx.new(|_| EmptyDrag))
                         .on_drag_move(cx.listener({
                             let id = id.clone();
@@ -229,12 +340,12 @@ impl DawView {
             .w(px(TRACK_HEADER_W))
             .flex_shrink_0()
             .overflow_hidden()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme.panel))
             // Top spacer aligns header rows with the timeline lanes (below the ruler);
             // it stays pinned while the rows below scroll.
             .child(div().h(px(RULER_H + LOOP_LANE_H)).flex_shrink_0()
-                .px_2().flex().items_center().text_size(px(12.)).text_color(rgb(TEXT_DIM))
-                .border_b_1().border_color(rgb(BORDER)).child("TRACKS  ·  double-click a name to rename"))
+                .px_2().flex().items_center().text_size(px(12.)).text_color(rgb(theme.text_dim))
+                .border_b_1().border_color(rgb(theme.border)).child("TRACKS  ·  double-click a name to rename"))
             // Scrollable rows: a bounded viewport that clips, with the row stack
             // shifted up by `arrange_scroll_y`. Vertical wheel drives the shared
             // offset (the arrange lanes read the same value, staying in sync).
@@ -242,13 +353,7 @@ impl DawView {
                 track_viewport()
                     .id("track-rows")
                     .on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, w, cx| {
-                        let step = match e.delta {
-                            gpui::ScrollDelta::Lines(p) => p.y * 48.0,
-                            gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
-                        };
-                        if step == 0.0 { return; }
-                        let max_y = this.tracks_max_scroll_y(window_frame::content_height(w));
-                        this.st.arrange_scroll_y = (this.st.arrange_scroll_y - step).clamp(0.0, max_y);
+                        this.scroll_tracks(f32::from(e.delta.pixel_delta(px(48.)).y), w);
                         cx.notify();
                     }))
                     .child(
@@ -256,30 +361,30 @@ impl DawView {
                             .children(rows),
                     ),
             )
+            .child(div().h(px(ARRANGE_SCROLLBAR_H)).flex_shrink_0()
+                .border_t_1().border_color(rgb(theme.border)))
     }
 
     /// The arrangement timeline: a clickable bar ruler, one lane per track with
     /// clip blocks from the project's arrangement, and a continuous green playhead.
     pub(super) fn timeline(&self, cx: &mut Context<Self>, vis_w: f32) -> gpui::Div {
+        let theme = self.theme();
         let accent = self.accent();
-        let bars = self.st.project.song_bars();
+        let bars = self.timeline_bars(vis_w);
         let cur_bar = self.st.current_bar();
-        let bps = self.st.project.project.time_signature[0].max(1) as f64;
-        let bar_seconds = (60.0 / self.st.project.project.bpm) * bps;
+        let bar_seconds = seconds_per_bar(self.st.project.project.bpm);
         let bw = self.bar_w();
         let pps = (bw as f64 / bar_seconds) as f32; // pixels per second
         let scroll_x = self.st.arrange_scroll_x;
         let playhead_x = self.st.playhead() as f32
-            / daw_core::sequencer::TICKS_PER_BAR as f32 * bw - scroll_x;
+            / TICKS_PER_BAR as f32 * bw - scroll_x;
         let document_w = (bars as f32 * bw).max(vis_w);
 
         // Virtualize: only build the bars within the visible scroll window (plus a
         // small margin), so render cost is O(visible bars), not O(song length).
-        // `vis_w` (window width) is a conservative over-estimate of the timeline
-        // region — it renders a few extra bars rather than ever too few.
         let first_bar = ((scroll_x / bw).floor() as u32).min(bars);
         let vis_count = (vis_w / bw).ceil() as u32 + 2;
-        let last_bar = (first_bar + vis_count).min(bars);
+        let last_bar = first_bar.saturating_add(vis_count).min(bars);
 
         // Loop-region row: a thin clickable lane above the ruler. Click left
         // of the region to move its start, right of it to extend the end,
@@ -289,7 +394,7 @@ impl DawView {
             .flex()
             .h(px(LOOP_LANE_H))
             .flex_shrink_0()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme.panel))
             .child(div().w(px(first_bar as f32 * bw)).flex_shrink_0())
             .children((first_bar..last_bar).map(|b| {
                 let inside = b >= lr.start_bar && b < lr.end_bar;
@@ -298,7 +403,7 @@ impl DawView {
                 } else if inside {
                     0x666666
                 } else {
-                    PANEL_ALT
+                    theme.panel_alt
                 };
                 div()
                     .id(SharedString::from(format!("loopbar-{b}")))
@@ -307,7 +412,7 @@ impl DawView {
                     .flex_shrink_0()
                     .cursor_pointer()
                     .border_r_1()
-                    .border_color(rgb(PANEL))
+                    .border_color(rgb(theme.panel))
                     .bg(rgb(bg))
                     .on_click(cx.listener(move |this, _e, _w, cx| {
                         this.click_loop_bar(b);
@@ -315,14 +420,17 @@ impl DawView {
                     }))
             }));
 
-        // Ruler: clickable bar-number cells that seek.
+        // Hide labels first and then ticks as the available space per beat shrinks.
+        let beat_w = bw / BEATS_PER_BAR as f32;
+        let active_beat = (self.st.playhead() % TICKS_PER_BAR) / TICKS_PER_BEAT;
+        let label_stride = if bw >= 32. { 1 } else if bw >= 16. { 2 } else { 4 };
         let ruler = div()
             .flex()
             .h(px(RULER_H))
             .flex_shrink_0()
-            .bg(rgb(PANEL))
+            .bg(rgb(theme.panel))
             .border_b_1()
-            .border_color(rgb(BORDER))
+            .border_color(rgb(theme.border))
             // leading spacer for the bars scrolled off the left
             .child(div().w(px(first_bar as f32 * bw)).flex_shrink_0())
             .children((first_bar..last_bar).map(|b| {
@@ -331,16 +439,35 @@ impl DawView {
                     .w(px(bw))
                     .flex_shrink_0()
                     .flex()
-                    .items_end()
+                    .flex_col()
+                    .overflow_hidden()
                     .cursor_pointer()
                     .border_r_1()
-                    .border_color(rgb(BORDER))
-                    .child(div().px_1().text_color(rgb(if b == cur_bar { accent } else { TEXT_DIM })).child(format!("{}", b + 1)))
-                    .children((0..3).map(move |_| div().w(px(1.)).h(px(5.)).bg(rgb(PANEL_ALT)).ml(px(bw / 4.0 - 1.0))))
-                    .on_click(cx.listener(move |this, _e, _w, cx| { this.seek_to_bar(b); cx.notify(); }))
+                    .border_color(rgb(theme.border))
+                    .bg(rgb(if b == cur_bar { theme.panel_alt } else { theme.panel }))
+                    .child(div().h(px(17.)).px_1().text_size(px(11.)).line_height(px(16.))
+                        .text_color(rgb(if b == cur_bar { accent } else { theme.text }))
+                        .children(b.is_multiple_of(label_stride).then(|| (b + 1).to_string())))
+                    .children((beat_w >= 4.).then(|| {
+                        div().flex().border_t_1().border_color(rgb(theme.border)).children(
+                            (0..BEATS_PER_BAR).map(|beat| {
+                                let active = b == cur_bar && beat == active_beat;
+                                div().w(px(beat_w)).h(px(14.)).flex_shrink_0()
+                                    .border_l_1().border_color(rgb(if active { accent } else { theme.border }))
+                                    .px_1().text_size(px(9.)).line_height(px(13.))
+                                    .debug_selector(move || format!("timeline-beat-{b}-{beat}"))
+                                    .text_color(rgb(if active { accent } else { theme.text_dim }))
+                                    .children((beat_w >= 13.).then(|| (beat + 1).to_string()))
+                            }),
+                        )
+                    }))
+                    .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                        this.seek_at_timeline_x(event.position().x);
+                        cx.notify();
+                    }))
             }));
 
-        let tpb = daw_core::sequencer::TICKS_PER_BAR as f32;
+        let tpb = TICKS_PER_BAR as f32;
         // One lane per track; clip blocks span their bars (in document flow), empty
         // bars are grid cells. A clip's sub-bar `offset_ticks` is shown as a small
         // left margin so off-grid starts are visible; the engine plays the true
@@ -388,6 +515,7 @@ impl DawView {
                     cells.push(
                         div()
                             .id(SharedString::from(format!("clip-{tid}-{bar}")))
+                            .debug_selector(|| format!("clip-{tid}-{bar}"))
                             .ml(px(off_px))
                             .w(px(bw * span as f32))
                             .flex_shrink_0()
@@ -398,7 +526,7 @@ impl DawView {
                             .rounded_md()
                             .cursor_pointer()
                             .bg(rgb(color))
-                            .text_color(rgb(BG))
+                            .text_color(rgb(ON_CLIP))
                             .px_2()
                             .overflow_hidden()
                             .relative()
@@ -414,12 +542,12 @@ impl DawView {
                                     .map(|p| {
                                         // Clip-local x of the visible timeline window.
                                         let clip_x = bar as f32 * bw + off_px;
-                                        clip_preview_marks_in(p, bw * span as f32, th - 8.0, span * daw_core::sequencer::TICKS_PER_BAR,
+                                        clip_preview_marks_in(p, bw * span as f32, th - 8.0, span * TICKS_PER_BAR,
                                             scroll_x - clip_x - 16.0, scroll_x - clip_x + vis_w + 16.0)
                                     })
                                     .unwrap_or_default();
                                 div().absolute().inset_0().children(marks.into_iter().map(|(x, y, w, h)| {
-                                    div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).rounded_sm().bg(rgb(BG))
+                                    div().absolute().left(px(x)).top(px(y)).w(px(w)).h(px(h)).rounded_sm().bg(rgb(theme.bg))
                                 }))
                             })
                             // Hover: full pattern name even on 1-bar slivers.
@@ -429,7 +557,7 @@ impl DawView {
                                     if span == 1 { "" } else { "s" }
                                 )
                                 .into();
-                                move |_w, cx| cx.new(|_| TextTooltip { text: tip.clone() }).into()
+                                move |_w, cx| cx.new(|_| TextTooltip { theme, text: tip.clone() }).into()
                             })
                             .child(
                                 div()
@@ -443,7 +571,7 @@ impl DawView {
                                 div()
                                     .id(SharedString::from(format!("clipcyc-{tid}-{bar}")))
                                     .px_1()
-                                    .text_color(rgb(BG))
+                                    .text_color(rgb(ON_CLIP))
                                     .cursor_pointer()
                                     .child("⟳")
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -457,7 +585,7 @@ impl DawView {
                                 div()
                                     .id(SharedString::from(format!("clipx-{tid}-{bar}")))
                                     .px_1()
-                                    .text_color(rgb(BG))
+                                    .text_color(rgb(ON_CLIP))
                                     .cursor_pointer()
                                     .child("✕")
                                     .on_click(cx.listener(move |this, _e, _w, cx| {
@@ -474,7 +602,7 @@ impl DawView {
                                     .h(px(th - 8.0))
                                     .flex_shrink_0()
                                     .cursor_pointer()
-                                    .bg(rgb(BG))
+                                    .bg(rgb(theme.bg))
                                     .on_drag(ResizeClip { track: tid.clone(), bar }, |_, _, _, cx| cx.new(|_| EmptyDrag))
                                     .on_drag_move(cx.listener({
                                         let tr = tid.clone();
@@ -503,13 +631,11 @@ impl DawView {
                                         }
                                     })),
                             )
-                            .on_click(cx.listener(move |this, _e, _w, cx| {
+                            .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                                 this.st.select_track(&tid_c);
                                 this.sync_midi_strip();
                                 this.st.select_pattern(&pid);
-                                // Set the playback start to this clip's first bar so
-                                // Play begins from here (matches DAW arrange behavior).
-                                this.seek_to_bar(bx);
+                                this.seek_at_timeline_x(event.position().x);
                                 cx.notify();
                             }))
                             .on_drag(drag, |d, _off, _win, cx| {
@@ -538,8 +664,8 @@ impl DawView {
                             .h(px(th))
                             .cursor_pointer()
                             .border_r_1()
-                            .border_color(rgb(PANEL))
-                            .bg(rgb(if here { PANEL_ALT } else { BG }))
+                            .border_color(rgb(if (b + 1).is_multiple_of(4) { theme.border } else { theme.panel }))
+                            .bg(rgb(if here { theme.panel_alt } else { theme.bg }))
                             .on_click(cx.listener(move |this, _e, _w, cx| {
                                 this.place_in_arrange(&tid_c, b);
                                 cx.notify();
@@ -580,26 +706,25 @@ impl DawView {
                     };
                     let name = std::path::Path::new(&c.path).file_name()
                         .map(|s| s.to_string_lossy().to_string()).unwrap_or_default();
-                    let start_sec = c.start_sec;
                     div()
                         .id(SharedString::from(format!("aclip-{idx}")))
+                        .debug_selector(|| format!("aclip-{idx}"))
                         .absolute()
                         .left(px(left))
                         .top(px(4.))
                         .w(px(width))
                         .h(px(h))
                         .rounded_md()
-                        .bg(rgb(PANEL_ALT))
+                        .bg(rgb(theme.panel_alt))
                         .border_1()
-                        .border_color(rgb(BORDER))
+                        .border_color(rgb(theme.border))
                         .overflow_hidden()
                         .cursor_pointer()
                         // Every press starts a fresh drag anchor (the edge
                         // handles' presses bubble here too).
                         .on_mouse_down(gpui::MouseButton::Left, cx.listener(|this, _, _, _| this.st.end_audio_drag()))
-                        .on_click(cx.listener(move |this, _e, _w, cx| {
-                            // Start playback from exactly where this audio clip begins.
-                            this.seek_to_sec(start_sec);
+                        .on_click(cx.listener(|this, event: &gpui::ClickEvent, _, cx| {
+                            this.seek_at_timeline_x(event.position().x);
                             cx.notify();
                         }))
                         .on_drag(AudioMove { idx }, |_, _, _, cx| cx.new(|_| EmptyDrag))
@@ -614,11 +739,11 @@ impl DawView {
                                     div().w(px(1.)).h(px((m * h).max(1.0))).mr(px(1.)).bg(rgb(accent))
                                 ))
                         )
-                        .child(div().absolute().top_0().left_0().px_1().text_color(rgb(TEXT)).child(name))
+                        .child(div().absolute().top_0().left_0().px_1().text_color(rgb(theme.text)).child(name))
                         .child(
                             div().id(SharedString::from(format!("aclipx-{idx}")))
                                 .absolute().top_0().right_0().px_1().cursor_pointer()
-                                .text_color(rgb(TEXT)).child("✕")
+                                .text_color(rgb(theme.text)).child("✕")
                                 .on_click(cx.listener(move |this, _e, _w, cx| {
                                     this.undo.record("remove audio clip", &this.st.project);
                                     this.st.project.remove_audio_clip(idx);
@@ -632,7 +757,7 @@ impl DawView {
                                 .absolute().top_0().left_0().bottom_0()
                                 .w(px(6.))
                                 .cursor_pointer()
-                                .bg(rgb(BORDER))
+                                .bg(rgb(theme.border))
                                 .on_drag(AudioCropL { idx }, |_, _, _, cx| cx.new(|_| EmptyDrag))
                                 .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<AudioCropL>, _w, cx| {
                                     if e.drag(cx).idx != idx { return; }
@@ -645,7 +770,7 @@ impl DawView {
                                 .absolute().top_0().right_0().bottom_0()
                                 .w(px(6.))
                                 .cursor_pointer()
-                                .bg(rgb(BORDER))
+                                .bg(rgb(theme.border))
                                 .on_drag(AudioCropR { idx }, |_, _, _, cx| cx.new(|_| EmptyDrag))
                                 .on_drag_move(cx.listener(move |this, e: &DragMoveEvent<AudioCropR>, _w, cx| {
                                     if e.drag(cx).idx != idx { return; }
@@ -662,23 +787,19 @@ impl DawView {
                 .h(px(th))
                 .flex_shrink_0()
                 .border_b_1()
-                .border_color(rgb(BG))
+                .border_color(rgb(theme.border))
                 .children(cells)
                 .children(audio_blocks)
         });
 
-        // Manual horizontal scroll: we shift the content left by `scroll_x` (computed
-        // above) inside an overflow-hidden viewport. We do NOT use gpui's
-        // overflow_x_scroll/track_scroll here because a plain mouse wheel emits only
-        // vertical deltas (which an x-only scroll ignores) and because the scroll
-        // element overwrites a handle's offset from its own input state each frame —
-        // so set_offset had no lasting effect.
+        // Shift the document within stationary viewports so the ruler, lanes
+        // and headers stay aligned during horizontal and vertical scrolling.
         let scroll_y = self.st.arrange_scroll_y;
         div()
             .flex_1()
             .flex()
             .flex_col()
-            .bg(rgb(BG))
+            .bg(rgb(theme.bg))
             .min_w(px(0.))
             .child(
                 div()
@@ -690,60 +811,19 @@ impl DawView {
                     .flex()
                     .flex_col()
                     .overflow_hidden()
-                    .on_scroll_wheel(cx.listener(|this, e: &gpui::ScrollWheelEvent, w, cx| {
-                        // Ctrl+wheel = zoom; Shift+wheel = vertical track scroll;
-                        // any other wheel = horizontal scroll.
-                        let dy = match e.delta {
-                            gpui::ScrollDelta::Lines(p)  => p.y,
-                            gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
-                        };
-                        let dx = match e.delta {
-                            gpui::ScrollDelta::Lines(p) => p.x * 48.,
-                            gpui::ScrollDelta::Pixels(p) => f32::from(p.x),
-                        };
-                        if dy == 0.0 && dx == 0.0 { return; }
-                        let content_w = this.st.project.song_bars() as f32 * this.bar_w();
-
-                        if e.shift && !e.control {
-                            let step = match e.delta {
-                                gpui::ScrollDelta::Lines(p) => p.y * 48.0,
-                                gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
-                            };
-                            let max_y = this.tracks_max_scroll_y(window_frame::content_height(w));
-                            this.st.arrange_scroll_y = (this.st.arrange_scroll_y - step).clamp(0.0, max_y);
-                            cx.notify();
-                            return;
-                        }
-
-                        if e.control {
-                            let old_bw = this.bar_w();
-                            let factor = if dy > 0.0 { 1.1 } else { 1.0 / 1.1 };
-                            this.st.arrange_zoom = (this.st.arrange_zoom * factor)
-                                .clamp(MIN_BAR_W / BAR_W, MAX_BAR_W / BAR_W);
-                            let new_bw = this.bar_w();
-                            // Keep the left-edge bar roughly fixed as zoom changes.
-                            this.st.arrange_scroll_x =
-                                (this.st.arrange_scroll_x * new_bw / old_bw).max(0.0);
-                            cx.notify();
-                            return;
-                        }
-
-                        // Wheel down (dy < 0) advances toward later bars. Lines→px per notch.
-                        let step = match e.delta {
-                            gpui::ScrollDelta::Lines(p)  => p.y * 48.0,
-                            gpui::ScrollDelta::Pixels(p) => f32::from(p.y),
-                        };
-                        let max_off = (content_w - this.timeline_width(w)).max(0.0);
-                        this.st.arrange_scroll_x =
-                            (this.st.arrange_scroll_x - if dx != 0. { dx } else { step }).clamp(0.0, max_off);
+                    .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, window, cx| {
+                        this.timeline_wheel(event, window, false);
                         cx.notify();
+                        cx.stop_propagation();
                     }))
-                    // Keep every clipping viewport stationary. Only the absolute
-                    // document inside it moves; flex sizing must not resize a
-                    // scrolling document or translate its ancestor's clip mask.
                     .child(
-                        div().relative().h(px(RULER_H + LOOP_LANE_H))
+                        div().id("timeline-ruler").relative().h(px(RULER_H + LOOP_LANE_H))
                             .flex_shrink_0().overflow_hidden()
+                            .on_scroll_wheel(cx.listener(|this, event: &gpui::ScrollWheelEvent, window, cx| {
+                                this.timeline_wheel(event, window, true);
+                                cx.notify();
+                                cx.stop_propagation();
+                            }))
                             .child(scroll_document(document_w, RULER_H + LOOP_LANE_H, scroll_x, 0.0)
                                 .child(region_row).child(ruler)),
                     )
@@ -760,10 +840,11 @@ impl DawView {
                         div().id("arrangement-playhead")
                             .absolute().left(px(playhead_x))
                             .top(px(LOOP_LANE_H)).bottom_0().w(px(2.))
-                            .bg(rgb(PLAYHEAD_GREEN))
+                            .bg(rgb(theme.playhead))
                             .child(div().absolute().top_0().left(px(-3.))
-                                .w(px(8.)).h(px(5.)).bg(rgb(PLAYHEAD_GREEN))),
+                                .w(px(8.)).h(px(5.)).bg(rgb(theme.playhead))),
                     ),
             )
+            .child(self.timeline_scrollbar(vis_w, cx))
     }
 }

@@ -58,15 +58,16 @@ impl DawView {
     }
 
     pub(super) fn guitar_library(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let accent = self.accent();
         let mut library = div()
             .flex()
             .flex_col()
             .gap_2()
-            .child(section_title("Built-in tone presets"))
+            .child(theme.section_title("Built-in tone presets"))
             .child(
                 div()
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child("Choose a built-in tone, or save an AmpForge rig under My presets."),
             );
         for (preset, description) in factory_presets().into_iter().zip([
@@ -83,7 +84,7 @@ impl DawView {
                     .gap_1()
                     .py_2()
                     .child(
-                        cell_btn(
+                        theme.cell_btn(
                             format!("guitar-preset-{}", preset.name),
                             preset.name.clone(),
                             selected,
@@ -94,7 +95,7 @@ impl DawView {
                             cx.notify();
                         })),
                     )
-                    .child(div().text_color(rgb(TEXT_DIM)).child(description)),
+                    .child(div().text_color(rgb(theme.text_dim)).child(description)),
             );
         }
         let current = factory_presets()
@@ -110,11 +111,11 @@ impl DawView {
                     .text_color(rgb(accent))
                     .child(format!("Current: {current}")),
             )
-            .child(section_title("My presets"));
+            .child(theme.section_title("My presets"));
         if self.config.guitar_presets.is_empty() {
             library = library.child(
                 div()
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child("Name and save your rig below."),
             );
         }
@@ -126,7 +127,7 @@ impl DawView {
                     .items_center()
                     .gap_1()
                     .child(
-                        cell_btn(
+                        theme.cell_btn(
                             format!("guitar-user-{index}"),
                             trunc(&preset.name, 22),
                             selected,
@@ -139,7 +140,7 @@ impl DawView {
                         })),
                     )
                     .child(
-                        cell_btn(format!("guitar-delete-{index}"), "×", false, PANEL_ALT).on_click(
+                        theme.cell_btn(format!("guitar-delete-{index}"), "×", false, theme.panel_alt).on_click(
                             cx.listener(move |this, _, _, cx| {
                                 this.config.guitar_presets.remove(index);
                                 if let Err(e) = this.config.save() {
@@ -156,16 +157,17 @@ impl DawView {
     }
 
     pub(super) fn cabinet_builder(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let g = &self.config.guitar;
         let accent = self.accent();
-        let mut panel = div().flex().flex_col().gap_2().p_3().bg(rgb(PANEL))
-            .child(section_title("Cabinet builder"))
+        let mut panel = div().flex().flex_col().gap_2().p_3().bg(rgb(theme.panel))
+            .child(theme.section_title("Cabinet builder"))
             .child(div().flex().gap_2()
                 .children([(Cabinet::BuiltIn, "Built-in"), (Cabinet::Ir, "Dual IR"), (Cabinet::Off, "Bypass")].into_iter().map(|(mode, label)| {
-                    cell_btn(format!("cab-mode-{mode:?}"), label, g.amp.cabinet == mode, accent)
+                    theme.cell_btn(format!("cab-mode-{mode:?}"), label, g.amp.cabinet == mode, accent)
                         .on_click(cx.listener(move |this, _, _, cx| { this.set_cabinet_mode(mode); cx.notify(); }))
                 })))
-            .child(div().text_color(rgb(TEXT_DIM)).child("Blend two speaker/mic IRs into your own cabinet. Cuts and blend affect Dual IR mode."));
+            .child(div().text_color(rgb(theme.text_dim)).child("Blend two speaker/mic IRs into your own cabinet. Cuts and blend affect Dual IR mode."));
         for secondary in [false, true] {
             let slot = if secondary { "B" } else { "A" };
             let source = if secondary {
@@ -179,7 +181,7 @@ impl DawView {
                     .flex_col()
                     .gap_1()
                     .p_2()
-                    .bg(rgb(BG))
+                    .bg(rgb(theme.bg))
                     .child(div().child(format!(
                             "IR {slot}: {}",
                             source
@@ -192,7 +194,7 @@ impl DawView {
                             .flex_wrap()
                             .gap_1()
                             .children(daw_io::cabinet::BUNDLED_IRS.iter().map(|preset| {
-                                cell_btn(
+                                theme.cell_btn(
                                     format!("cab-{slot}-{}", preset.id),
                                     preset.name,
                                     source == Some(preset.id),
@@ -206,7 +208,7 @@ impl DawView {
                                 ))
                             }))
                             .child(
-                                cell_btn(format!("cab-load-{slot}"), "Load WAV…", false, PANEL_ALT)
+                                theme.cell_btn(format!("cab-load-{slot}"), "Load WAV…", false, theme.panel_alt)
                                     .on_click(cx.listener(move |this, _, _, cx| {
                                         this.pick_cabinet_ir_for(secondary);
                                         cx.notify();
@@ -229,7 +231,7 @@ impl DawView {
                 .gap_2()
                 .child(div().flex_1().child(label))
                 .child(
-                    cell_btn(format!("cab-{id}-down"), "−", false, PANEL_ALT).on_click(
+                    theme.cell_btn(format!("cab-{id}-down"), "−", false, theme.panel_alt).on_click(
                         cx.listener(move |this, e: &gpui::ClickEvent, _, cx| {
                             let step = if e.modifiers().shift {
                                 step / 5.0
@@ -242,7 +244,7 @@ impl DawView {
                     ),
                 )
                 .child(
-                    cell_btn(format!("cab-{id}-up"), "+", false, PANEL_ALT).on_click(cx.listener(
+                    theme.cell_btn(format!("cab-{id}-up"), "+", false, theme.panel_alt).on_click(cx.listener(
                         move |this, e: &gpui::ClickEvent, _, cx| {
                             let step = if e.modifiers().shift {
                                 step / 5.0
@@ -271,7 +273,7 @@ impl DawView {
                 cx,
             ))
             .child(
-                cell_btn(
+                theme.cell_btn(
                     "cab-invert-b",
                     if g.cabinet.invert_b {
                         "B phase: inverted"
@@ -323,7 +325,7 @@ impl DawView {
                 cx,
             ))
             .child(
-                cell_btn("cab-export", "Export cabinet WAV…", false, PANEL_ALT).on_click(
+                theme.cell_btn("cab-export", "Export cabinet WAV…", false, theme.panel_alt).on_click(
                     cx.listener(|this, _, _, cx| {
                         this.export_guitar_cabinet();
                         cx.notify();
@@ -364,16 +366,17 @@ impl DawView {
     }
 
     pub(super) fn guitar_plugins(&self, cx: &mut Context<Self>) -> gpui::Div {
+        let theme = self.theme();
         let target = self
             .st
             .selected_track
             .as_deref()
             .and_then(|id| self.st.project.tracks.iter().find(|t| t.id == id));
-        let mut panel = div().flex().flex_col().gap_2().p_3().bg(rgb(PANEL))
-            .child(section_title("CLAP guitar plugins"))
-            .child(div().text_color(rgb(TEXT_DIM)).child("Track inserts process recorded playback. Live monitoring uses the built-in rack above."))
+        let mut panel = div().flex().flex_col().gap_2().p_3().bg(rgb(theme.panel))
+            .child(theme.section_title("CLAP guitar plugins"))
+            .child(div().text_color(rgb(theme.text_dim)).child("Track inserts process recorded playback. Live monitoring uses the built-in rack above."))
             .child(div().child(format!("Insert target: {}", target.map(|t| t.name.as_str()).unwrap_or("select a track in the main window"))))
-            .child(cell_btn("guitar-scan-clap", if self.clap_scanning.load(Ordering::Acquire) { "Scanning…" } else { "Rescan installed CLAP effects" }, false, PANEL_ALT)
+            .child(theme.cell_btn("guitar-scan-clap", if self.clap_scanning.load(Ordering::Acquire) { "Scanning…" } else { "Rescan installed CLAP effects" }, false, theme.panel_alt)
                 .on_click(cx.listener(|this, _, _, cx| { this.start_clap_scan(); cx.notify(); })));
         let mut installed = div()
             .id("guitar-installed-plugins")
@@ -386,11 +389,11 @@ impl DawView {
             let path = plugin.path.clone();
             let id = plugin.id.clone();
             installed = installed.child(
-                cell_btn(
+                theme.cell_btn(
                     format!("guitar-clap-{}", plugin.id),
                     format!("+ {} · {}", plugin.name, plugin.vendor),
                     false,
-                    PANEL_ALT,
+                    theme.panel_alt,
                 )
                 .on_click(cx.listener(move |this, _, _, cx| {
                     this.add_clap_fx(path.clone(), id.clone());
@@ -401,14 +404,14 @@ impl DawView {
         panel = panel.child(installed);
         if !self.st.clap_plugins.iter().any(|p| p.is_effect) {
             panel =
-                panel.child(div().text_color(rgb(TEXT_DIM)).child(
+                panel.child(div().text_color(rgb(theme.text_dim)).child(
                     "No CLAP effects found. Install a Linux .clap in ~/.clap, then rescan.",
                 ));
         }
         panel
             .child(
                 div()
-                    .text_color(rgb(TEXT_DIM))
+                    .text_color(rgb(theme.text_dim))
                     .child("Explore compatible formats (not yet tested in daw-ai):"),
             )
             .children(
@@ -425,11 +428,11 @@ impl DawView {
                 .into_iter()
                 .enumerate()
                 .map(|(index, (label, url))| {
-                    cell_btn(
+                    theme.cell_btn(
                         format!("guitar-plugin-link-{index}"),
                         label,
                         false,
-                        PANEL_ALT,
+                        theme.panel_alt,
                     )
                     .on_click(move |_, _, cx| cx.open_url(url))
                 }),

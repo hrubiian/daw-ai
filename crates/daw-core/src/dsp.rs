@@ -1,4 +1,5 @@
 //! Pure DSP analysis helpers (FFT spectrum) shared by frontends.
+pub mod output;
 use rustfft::{num_complex::Complex, FftPlanner};
 
 /// Hann-windowed magnitude spectrum of `samples`, bucketed onto a log frequency

@@ -2,6 +2,7 @@ use crate::midi::MidiEvent;
 use crate::midi_map::{ButtonAction, FaderParam, KnobParam, MidiMap};
 use crossbeam_channel::Sender;
 use daw_core::audio::input::{CaptureStream, RecordPhase, RecordingSession};
+use daw_core::dsp::output::OutputHistory;
 use daw_core::project::{ArrangementSlot, Instrument, Note, Pattern, Project, TrackType};
 use daw_core::sequencer::SequencerCommand;
 use std::collections::HashMap;
@@ -115,7 +116,7 @@ pub struct App {
     pub knob_values:          HashMap<KnobParam, u8>,
     pub fader_values:         HashMap<FaderParam, u8>,
     // Visualization — shared with audio thread
-    pub vis_buf:              Arc<Mutex<Vec<f32>>>,
+    pub vis_buf:              Arc<Mutex<OutputHistory>>,
     pub vis_snapshot:         Vec<f32>,
     // JAM mode — hot-reload the project file when it changes on disk
     // (lets Claude / an external editor re-pattern the music while it plays).
@@ -145,7 +146,7 @@ impl App {
         midi_device: Option<String>,
         midi_map: Arc<MidiMap>,
         playback_tick: Arc<AtomicU32>,
-        vis_buf: Arc<Mutex<Vec<f32>>>,
+        vis_buf: Arc<Mutex<OutputHistory>>,
     ) -> Self {
         let file_revision = project_path.as_ref().and_then(|path| daw_core::project::format::load_versioned(path).ok().map(|(disk, revision)| {
             if daw_core::project::format::project_revision(&disk).ok() == daw_core::project::format::project_revision(&project).ok() { revision } else { "stale-loaded-project".into() }
@@ -310,15 +311,23 @@ impl App {
         let _ = std::fs::create_dir_all("recordings");
         // Session base: the writer appends "-p<N>.wav" per loop pass.
         let base = std::path::PathBuf::from(format!("recordings/{safe_id}-{stamp}"));
-        if let Some(cs) = &self.capture {
-            cs.begin_session(base);
+        let bars = if self.is_playing { 0 } else { cfg.count_in_bars };
+        let arm = || {
+            if let Some(cs) = &self.capture { cs.begin_session(base); }
+        };
+        if let Some(session) = &self.session {
+            if let Err(e) = session.start_recording(bars, arm) {
+                self.rec_status = e.to_string();
+                return;
+            }
+        } else {
+            arm();
+            self.send(SequencerCommand::RecordStart { count_in_bars: bars });
         }
         self.rec.arm();
         self.rec.begin();
         self.rec_track = Some(track_id);
         self.rec_latency_trim_ms = cfg.latency_trim_ms;
-        let bars = if self.is_playing { 0 } else { cfg.count_in_bars };
-        self.send(SequencerCommand::RecordStart { count_in_bars: bars });
         self.is_playing = true;
         self.is_recording = true;
         self.rec_status = if bars > 0 { format!("count-in: {bars} bar(s)…") } else { "recording…".into() };
@@ -902,7 +911,7 @@ mod tests {
     use super::*;
     use crate::midi_map::MidiMap;
     use daw_core::project::{EffectChain, Instrument, Project, Track, TrackType};
-    use std::sync::{Arc, Mutex, atomic::{AtomicU8, AtomicU32}};
+    use std::sync::{Arc, atomic::{AtomicU8, AtomicU32}};
 
     fn make_app(tracks: Vec<Track>) -> App {
         let (seq_tx, _) = crossbeam_channel::unbounded();
@@ -919,7 +928,7 @@ mod tests {
             None,
             Arc::new(MidiMap::default()),
             Arc::new(AtomicU32::new(0)),
-            Arc::new(Mutex::new(Vec::new())),
+            Default::default(),
         )
     }
 
