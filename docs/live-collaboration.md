@@ -65,7 +65,7 @@ preserve other positions, including overlaps. Bars are zero-based and
 `offset_ticks` defaults to 0 with a range of 0–479. Add a pattern to the track
 before placing it.
 
-Commands also include `undo`, `redo`, `play`, `pause`, `stop`, and `seek` with a tick value. One bar is 480 ticks in supported 4/4 projects. GUI Ctrl+Z/Ctrl+Shift+Z and TUI Ctrl+Z/Ctrl+Y access the same session history. Opening another project stores its asset directory with undo history.
+Commands also include `undo`, `redo`, `play`, `pause`, `stop`, and `seek` with a tick value. One bar is the project's bar length in ticks: 480 in 4/4, 360 in 3/4 or 6/8. GUI Ctrl+Z/Ctrl+Shift+Z and TUI Ctrl+Z/Ctrl+Y access the same session history. Opening another project stores its asset directory with undo history.
 
 An accepted edit can still be `pending`. While playing, note and arrangement
 swaps occur at the next bar. `applied_revision` advances when the audio callback

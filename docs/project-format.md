@@ -59,8 +59,13 @@ serde-defaulted: files from older versions always load.
 }
 ```
 
-Timing: 480 ticks per 4/4 bar, 120 per beat; step-grid steps are always
-16th notes (30 ticks). The authoritative schema is the serde model in
+Timing: 120 ticks per quarter note; step-grid steps are always 16th notes
+(30 ticks). A bar's length follows `time_signature` (numerator 1–16,
+denominator 2, 4, 8 or 16): 480 ticks in 4/4, 360 in 3/4 or 6/8, 840 in 7/4.
+Piano-roll `ticks_per_bar` must match it; the MCP `set_time_signature` tool
+updates it for you (the desktop app has no meter control yet). Optional `tempo_changes` add tempo points along the
+song, e.g. `[{"tick": 1920, "bpm": 140.0}, {"tick": 3840, "bpm": 160.0, "ramp": true}]`
+(a ramp glides from the previous point; BPM 20–400). The authoritative schema is the serde model in
 `crates/daw-core/src/project/mod.rs`. See [Live collaboration](live-collaboration.md) for validation and persistence.
 
 ## Expressive sampler pads
