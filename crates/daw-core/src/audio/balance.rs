@@ -48,6 +48,7 @@ pub fn compute_balance(measured: &[(String, f32, f32)]) -> Vec<BalanceResult> {
 /// the median active-bar loudness.
 pub fn auto_balance(project: &Project, sf2: &Path) -> anyhow::Result<Vec<BalanceResult>> {
     let bpm = project.project.bpm;
+    let ts = project.project.time_signature;
     let mut measured: Vec<(String, f32, f32)> = Vec::new();
     let mut silent: Vec<(String, String, f32)> = Vec::new();
     for t in project.tracks.iter().filter(|t| !t.muted) {
@@ -56,14 +57,19 @@ pub fn auto_balance(project: &Project, sf2: &Path) -> anyhow::Result<Vec<Balance
             o.muted = o.id != t.id;
         }
         let (samples, sr) = super::export::render_project_samples(&solo, sf2, false)?;
-        let spb = 240.0 / bpm.max(1.0);
-        let frames_per_bar = ((spb * sr as f64) as usize).max(1);
         let frames = samples.len() / 2;
         let mut active: Vec<f32> = Vec::new();
-        let mut bar = 0usize;
-        while bar * frames_per_bar < frames {
-            let lo = bar * frames_per_bar;
-            let hi = ((bar + 1) * frames_per_bar).min(frames);
+        let mut bar = 0u32;
+        loop {
+            let lo = (crate::musical_time::bar_sample_map(bar, bpm, ts, &project.tempo_changes, sr) as usize).min(frames);
+            if lo >= frames {
+                break;
+            }
+            let hi = (crate::musical_time::bar_sample_map(bar + 1, bpm, ts, &project.tempo_changes, sr) as usize).min(frames);
+            if hi <= lo {
+                bar += 1;
+                continue;
+            }
             let sum: f64 = (lo..hi)
                 .map(|f| {
                     let m = (samples[f * 2] + samples[f * 2 + 1]) / 2.0;

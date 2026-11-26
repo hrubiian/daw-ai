@@ -146,6 +146,9 @@ pub fn referenced_asset_paths(project: &Project, default_sf2: &Path) -> std::col
             Instrument::Clap(plugin) => {
                 paths.insert(PathBuf::from(&plugin.path));
             }
+            Instrument::Sfz { path } if !path.is_empty() => {
+                paths.insert(PathBuf::from(path));
+            }
             _ => {}
         }
         paths.extend(track.clap_fx.iter().map(|p| PathBuf::from(&p.path)));
@@ -193,6 +196,7 @@ pub fn resolve_assets(project: &Project, base: &Path, legacy_root: &Path) -> Pro
                 }
             }
             Instrument::Clap(c) => resolve(&mut c.path),
+            Instrument::Sfz { path } => resolve(path),
             _ => {}
         }
         for c in &mut t.clap_fx {

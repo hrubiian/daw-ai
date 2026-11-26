@@ -617,11 +617,18 @@ impl PingPongDelay {
 /// `STRIP_UTILITY` targets the always-present utility synth (metronome,
 /// previews).
 /// Convert a microtonal detune in cents to a 14-bit MIDI pitch-bend value
+/// (0..=16383, where 8192 is no bend) for the given bend range in semitones.
+pub fn bend14_from_cents_with_range(cents: f32, range_semitones: u8) -> i32 {
+    let span = f32::from(range_semitones.max(1)) * 100.0;
+    let v = (8192.0 + cents / span * 8192.0).round();
+    (v as i32).clamp(0, 16383)
+}
+
+/// Convert a microtonal detune in cents to a 14-bit MIDI pitch-bend value
 /// (0..=16383, where 8192 is no bend). Assumes the synth's default ±2-semitone
 /// (±200-cent) bend range; magnitudes beyond that clamp to the 14-bit endpoints.
 pub fn bend14_from_cents(cents: f32) -> i32 {
-    let v = (8192.0 + cents / 200.0 * 8192.0).round();
-    (v as i32).clamp(0, 16383)
+    bend14_from_cents_with_range(cents, 2)
 }
 
 #[derive(Debug)]
@@ -635,6 +642,7 @@ pub enum AudioEvent {
     SetProgram { strip: u8, bank: u8, preset: u8 },
     /// Strip fader/pan/mute — real mixer math, not GM CCs.
     SetStripGain { strip: u8, gain: f32 },
+    SetStripVolumeAutomation { strip: u8, gain: f32 },
     SetStripPan  { strip: u8, pan: f32 },
     SetStripMute { strip: u8, muted: bool },
     /// Full per-strip insert chain + the GM CC subset to the strip's synth.
@@ -669,6 +677,8 @@ pub enum AudioEvent {
     SetReturns { returns: crate::project::Returns },
     /// Tempo used by synced return effects, shared by live and offline rendering.
     SetTempo { bpm: f64 },
+    /// Project time signature, forwarded to CLAP plugin transport.
+    SetTimeSignature { numerator: u8, denominator: u8 },
     // ── CLAP hosting ─────────────────────────────────────────────────────────
     /// Install a freshly built plugin processor (relay/exporter → mixer).
     AddClapInstance { uid: String, processor: super::clap::ClapProcessor },
@@ -694,6 +704,8 @@ pub enum StripKind {
     Melodic { font: Option<String>, bank: u8, preset: u8 },
     Drum    { font: Option<String>, bank: u8, preset: u8 },
     Sampler { pads: Vec<crate::project::SamplePad> },
+    /// Native SFZ multi-sampled instrument.
+    Sfz     { path: String },
     Audio,
     /// CLAP instrument — no synth; the processor is looked up by uid.
     Clap,
@@ -715,6 +727,8 @@ pub struct StripSpec {
     /// Constant microtonal detune in cents, applied as a fixed pitch bend to the
     /// strip's synth at build time. 0 = standard 12-TET.
     pub tuning_cents: f32,
+    /// Pitch bend sensitivity in semitones (`1..=24`, default `2`).
+    pub pitch_bend_range_semitones: u8,
 }
 
 impl StripSpec {
@@ -730,7 +744,8 @@ impl StripSpec {
                     pads: pads.clone(),
                 },
                 (Instrument::Clap(_), _) => StripKind::Clap,
-                (_, TrackType::Audio) => StripKind::Audio,
+                (Instrument::Sfz { path }, _) => StripKind::Sfz { path: path.clone() },
+                (Instrument::AudioFile { .. }, _) | (_, TrackType::Audio) => StripKind::Audio,
                 (Instrument::Soundfont { preset, bank, soundfont }, ty) => {
                     let font = soundfont.clone().filter(|p| !p.is_empty());
                     if ty == TrackType::Drum {
@@ -739,7 +754,6 @@ impl StripSpec {
                         StripKind::Melodic { font, bank: *bank, preset: *preset }
                     }
                 }
-                _ => StripKind::Audio,
             },
             gain: t.volume,
             pan: t.pan,
@@ -751,6 +765,7 @@ impl StripSpec {
             },
             clap_fx: t.clap_fx.iter().map(|s| s.uid.clone()).collect(),
             tuning_cents: t.tuning_cents,
+            pitch_bend_range_semitones: t.pitch_bend_range_semitones,
         }).collect()
     }
 }
@@ -818,8 +833,10 @@ struct SampleVoice {
 /// One mixer channel. Built off the RT thread (relay), processed on it.
 pub struct Strip {
     audio_track: Option<String>,
-    /// Per-strip synthesizer; None for sampler/audio strips.
+    /// Per-strip synthesizer; None for sampler/audio/SFZ strips.
     pub synth: Option<rustysynth::Synthesizer>,
+    /// Native SFZ multi-sampled synthesizer, if this track uses an `.sfz` file.
+    pub sfz: Option<super::sfz::SfzSynth>,
     /// GM channel inside this strip's synth: 9 for drums, else 0.
     pub gm_channel: i32,
     /// Pitch -> preloaded base sample, velocity layers and alternate takes.
@@ -849,6 +866,9 @@ pub struct Strip {
     /// LFO overrides of the fader and pan (synth-less strips only).
     mod_gain: Option<f32>,
     mod_pan: Option<f32>,
+    volume_automation: f32,
+    base_tuning_cents: f32,
+    pitch_bend_range_semitones: u8,
 }
 
 impl Strip {
@@ -877,6 +897,7 @@ impl Strip {
         Strip {
             audio_track: None,
             synth: None,
+            sfz: None,
             gm_channel: 0,
             pads: std::collections::HashMap::new(),
             sample_voices: Vec::with_capacity(MAX_SAMPLE_VOICES),
@@ -895,6 +916,9 @@ impl Strip {
             gain_primed: false,
             mod_gain: None,
             mod_pan: None,
+            volume_automation: 1.0,
+            base_tuning_cents: 0.0,
+            pitch_bend_range_semitones: 2,
         }
     }
 
@@ -1044,6 +1068,9 @@ impl Mixer {
                         if let Some(p) = st.clap_instrument.as_ref().and_then(|u| clap.get_mut(u)) {
                             p.queue_note_on(pitch, velocity);
                             st.meter.set_key(pitch, velocity != 0 && !st.muted);
+                        } else if let Some(sfz) = st.sfz.as_mut() {
+                            sfz.note_on(pitch, velocity);
+                            st.meter.set_keys(if st.muted { [0; 2] } else { sfz.active_keys() });
                         } else if st.synth.is_none() && st.pads.contains_key(&pitch) {
                             // Sampler strips: a matching pad plays as a one-shot.
                             st.trigger_sample(pitch, velocity as f32 / 127.0);
@@ -1065,6 +1092,9 @@ impl Mixer {
                         if let Some(p) = st.clap_instrument.as_ref().and_then(|u| clap.get_mut(u)) {
                             p.queue_note_off(pitch);
                             st.meter.set_key(pitch, false);
+                        } else if let Some(sfz) = st.sfz.as_mut() {
+                            sfz.note_off(pitch);
+                            st.meter.set_keys(if st.muted { [0; 2] } else { sfz.active_keys() });
                         } else if let Some(s) = st.synth.as_mut() {
                             s.note_off(st.gm_channel, pitch as i32);
                             st.meter.set_key(pitch, false);
@@ -1084,6 +1114,11 @@ impl Mixer {
             AudioEvent::SetStripGain { strip, gain } => {
                 if let Some(st) = self.strip_mut(strip) { st.gain = gain.clamp(0.0, 2.0); }
             }
+            AudioEvent::SetStripVolumeAutomation { strip, gain } => {
+                if let Some(st) = self.strip_mut(strip) {
+                    st.volume_automation = gain.clamp(0.0, 2.0);
+                }
+            }
             AudioEvent::SetStripPan { strip, pan } => {
                 if let Some(st) = self.strip_mut(strip) { st.pan = pan.clamp(-1.0, 1.0); }
             }
@@ -1093,7 +1128,19 @@ impl Mixer {
                     st.muted = muted;
                     if muted {
                         st.meter.set_keys([0; 2]);
+                        st.synth_msg(0xB0, 64, 0);  // Sustain off
+                        st.synth_msg(0xB0, 1, 0);   // Mod wheel reset
+                        st.synth_msg(0xB0, 11, 127); // Expression reset
+                        let bend = bend14_from_cents_with_range(st.base_tuning_cents, st.pitch_bend_range_semitones);
+                        st.synth_msg(0xE0, bend & 0x7F, (bend >> 7) & 0x7F);
                         st.synth_msg(0xB0, 123, 0); // All Notes Off, so unmute is clean
+                        if let Some(sfz) = st.sfz.as_mut() {
+                            sfz.control_change(64, 0);
+                            sfz.control_change(1, 0);
+                            sfz.control_change(11, 127);
+                            sfz.set_pitch_bend((bend & 0x7F) as u8, ((bend >> 7) & 0x7F) as u8, st.pitch_bend_range_semitones);
+                            sfz.control_change(123, 0);
+                        }
                         if let Some(p) = st.clap_instrument.as_ref().and_then(|u| clap.get_mut(u)) {
                             p.queue_all_notes_off();
                         }
@@ -1136,6 +1183,14 @@ impl Mixer {
                 if let ReturnFx::Delay(d) = &mut self.returns[1].fx {
                     d.configure(&self.returns_settings.delay, self.bpm);
                 }
+                for p in self.clap.values_mut() {
+                    p.set_tempo(self.bpm);
+                }
+            }
+            AudioEvent::SetTimeSignature { numerator, denominator } => {
+                for p in self.clap.values_mut() {
+                    p.set_time_signature(numerator, denominator);
+                }
             }
             AudioEvent::RawCC { strip, cc, value } => {
                 if strip == STRIP_UTILITY {
@@ -1144,6 +1199,12 @@ impl Mixer {
                     }
                 } else if let Some(st) = self.strip_mut(strip) {
                     st.synth_msg(0xB0, cc as i32, value as i32);
+                    if let Some(sfz) = st.sfz.as_mut() {
+                        sfz.control_change(cc, value);
+                        if matches!(cc, 120 | 123) {
+                            st.meter.set_keys([0; 2]);
+                        }
+                    }
                     if st.synth.is_some() && matches!(cc, 120 | 123) {
                         st.meter.set_keys([0; 2]);
                     }
@@ -1157,12 +1218,15 @@ impl Mixer {
                         74 => st.inserts.modulate_cutoff(value),
                         7 if synthless => st.mod_gain = value,
                         10 if synthless => st.mod_pan = value.map(|v| v * 2.0 - 1.0),
-                        // SoundFont strips keep their established CC response;
+                        // SoundFont/SFZ strips keep their CC response;
                         // clearing restores the GM defaults (volume 100, pan centre).
                         _ => {
                             let default = match cc { 7 => Some(100), 10 => Some(64), _ => None };
                             if let Some(v) = value.map(|v| (v * 127.0).round() as i32).or(default) {
                                 st.synth_msg(0xB0, cc as i32, v);
+                                if let Some(sfz) = st.sfz.as_mut() {
+                                    sfz.control_change(cc, v.clamp(0, 127) as u8);
+                                }
                             }
                         }
                     }
@@ -1171,6 +1235,9 @@ impl Mixer {
             AudioEvent::PitchBend { strip, lsb, msb } => {
                 if let Some(st) = self.strip_mut(strip) {
                     st.synth_msg(0xE0, lsb as i32, msb as i32);
+                    if let Some(sfz) = st.sfz.as_mut() {
+                        sfz.set_pitch_bend(lsb, msb, st.pitch_bend_range_semitones);
+                    }
                 }
             }
             AudioEvent::TriggerSample { strip, pitch, gain } => {
@@ -1217,8 +1284,20 @@ impl Mixer {
             AudioEvent::Panic => {
                 for st in &mut self.strips {
                     st.meter.set_keys([0; 2]);
-                    st.synth_msg(0xB0, 120, 0); // All Sound Off
-                    st.synth_msg(0xB0, 123, 0); // All Notes Off
+                    st.synth_msg(0xB0, 64, 0);   // Sustain off
+                    st.synth_msg(0xB0, 1, 0);    // Mod wheel reset
+                    st.synth_msg(0xB0, 11, 127); // Expression reset
+                    let bend = bend14_from_cents_with_range(st.base_tuning_cents, st.pitch_bend_range_semitones);
+                    st.synth_msg(0xE0, bend & 0x7F, (bend >> 7) & 0x7F);
+                    st.synth_msg(0xB0, 120, 0);  // All Sound Off
+                    st.synth_msg(0xB0, 123, 0);  // All Notes Off
+                    if let Some(sfz) = st.sfz.as_mut() {
+                        sfz.control_change(64, 0);
+                        sfz.control_change(1, 0);
+                        sfz.control_change(11, 127);
+                        sfz.set_pitch_bend((bend & 0x7F) as u8, ((bend >> 7) & 0x7F) as u8, st.pitch_bend_range_semitones);
+                        sfz.control_change(120, 0);
+                    }
                     st.sample_voices.clear();
                     for pad in st.pads.values_mut() { for layer in &mut pad.layers { layer.next = 0; } }
                 }
@@ -1276,6 +1355,10 @@ impl Mixer {
             if let Some(s) = st.synth.as_mut() {
                 s.render(sl, sr);
             }
+            if let Some(sfz) = st.sfz.as_mut() {
+                sfz.render(sl, sr);
+                st.meter.set_keys(if st.muted { [0; 2] } else { sfz.active_keys() });
+            }
 
             // CLAP instrument: renders the strip's source into the scratch
             // (these strips have no rustysynth synth).
@@ -1315,7 +1398,7 @@ impl Mixer {
                 }
                 playing
             });
-            if st.synth.is_none() && st.clap_instrument.is_none() && !st.pads.is_empty() {
+            if st.synth.is_none() && st.sfz.is_none() && st.clap_instrument.is_none() && !st.pads.is_empty() {
                 st.meter.set_keys(if st.muted { [0; 2] } else { sample_keys });
             }
 
@@ -1345,7 +1428,9 @@ impl Mixer {
             }
 
             // Fader/pan/mute targets; LFO overrides replace the fader or pan.
-            let fader = if st.muted { 0.0 } else { st.mod_gain.unwrap_or(st.gain) };
+            let fader = if st.muted { 0.0 } else {
+                (st.mod_gain.unwrap_or(st.gain) * st.volume_automation).min(2.0)
+            };
             let pan = st.mod_pan.unwrap_or(st.pan);
             let target_l = fader * (1.0 - pan.max(0.0));
             let target_r = fader * (1.0 + pan.min(0.0));
@@ -1486,6 +1571,10 @@ pub fn build_strips_report(specs: &[StripSpec], main_sf2: &std::path::Path, samp
             .clone()
     };
     let main_font = load_font(&main_key, &mut fonts);
+    let mut sfz_instruments: std::collections::HashMap<String, Arc<super::sfz::SfzInstrument>> =
+        std::collections::HashMap::new();
+    let mut sfz_samples: std::collections::HashMap<std::path::PathBuf, Arc<super::sfz::SampleBuf>> =
+        std::collections::HashMap::new();
 
     let mut strips = Vec::new();
     let mut meters = Vec::new();
@@ -1533,6 +1622,28 @@ pub fn build_strips_report(specs: &[StripSpec], main_sf2: &std::path::Path, samp
                     }
                 }
             }
+            StripKind::Sfz { path } => {
+                if let Some(inst) = sfz_instruments.get(path) {
+                    let mut synth = super::sfz::SfzSynth::new(Arc::clone(inst), sample_rate);
+                    synth.set_base_tuning_cents(spec.tuning_cents);
+                    strip.sfz = Some(synth);
+                } else {
+                    match super::sfz::SfzInstrument::load_with_cache(
+                        std::path::Path::new(path),
+                        sample_rate,
+                        &mut sfz_samples,
+                    ) {
+                        Ok(inst) => {
+                            let arc = Arc::new(inst);
+                            sfz_instruments.insert(path.clone(), Arc::clone(&arc));
+                            let mut synth = super::sfz::SfzSynth::new(arc, sample_rate);
+                            synth.set_base_tuning_cents(spec.tuning_cents);
+                            strip.sfz = Some(synth);
+                        }
+                        Err(e) => errors.push(format!("sfz instrument could not be loaded: {path}: {e}")),
+                    }
+                }
+            }
             // CLAP instruments need no build here — the processor is created
             // by the relay's instance diff and looked up by uid at render.
             StripKind::Audio | StripKind::Clap => {}
@@ -1546,6 +1657,7 @@ pub fn build_strips_report(specs: &[StripSpec], main_sf2: &std::path::Path, samp
         strip.send_reverb = spec.effects.reverb.clamp(0.0, 1.0);
         strip.send_delay = spec.effects.send_delay.clamp(0.0, 1.0);
         strip.inserts.configure(&spec.effects);
+        strip.pitch_bend_range_semitones = spec.pitch_bend_range_semitones.clamp(1, 24);
         if let Some(s) = strip.synth.as_mut() {
             let cc = |v: f32| (v.clamp(0.0, 1.0) * 127.0) as i32;
             let ch = strip.gm_channel;
@@ -1553,10 +1665,20 @@ pub fn build_strips_report(specs: &[StripSpec], main_sf2: &std::path::Path, samp
             s.process_midi_message(ch, 0xB0, 74, cc(spec.effects.cutoff));
             s.process_midi_message(ch, 0xB0, 71, cc(spec.effects.resonance));
             s.process_midi_message(ch, 0xB0, 1,  cc(spec.effects.lfo_depth));
+            if strip.pitch_bend_range_semitones != 2 {
+                // GM RPN 0 (Pitch Bend Sensitivity): coarse semitones + 0 cents, then null RPN.
+                s.process_midi_message(ch, 0xB0, 101, 0);
+                s.process_midi_message(ch, 0xB0, 100, 0);
+                s.process_midi_message(ch, 0xB0, 6, i32::from(strip.pitch_bend_range_semitones));
+                s.process_midi_message(ch, 0xB0, 38, 0);
+                s.process_midi_message(ch, 0xB0, 101, 127);
+                s.process_midi_message(ch, 0xB0, 100, 127);
+            }
             // Microtonal detune: a constant pitch bend held for the strip's life,
             // so every note on this voice sounds `tuning_cents` off 12-TET.
+            strip.base_tuning_cents = spec.tuning_cents;
             if spec.tuning_cents != 0.0 {
-                let bend = bend14_from_cents(spec.tuning_cents);
+                let bend = bend14_from_cents_with_range(spec.tuning_cents, strip.pitch_bend_range_semitones);
                 s.process_midi_message(ch, 0xE0, bend & 0x7F, (bend >> 7) & 0x7F);
             }
         }
@@ -1581,6 +1703,12 @@ mod tests {
         // Beyond the bend range clamps into the valid 14-bit span.
         assert_eq!(bend14_from_cents(250.0), 16383);
         assert_eq!(bend14_from_cents(-250.0), 0);
+        // Wide bend range (±12 semitones = ±1200 cents).
+        assert_eq!(bend14_from_cents_with_range(0.0, 12), 8192);
+        assert_eq!(bend14_from_cents_with_range(600.0, 12), 12288);
+        assert_eq!(bend14_from_cents_with_range(-600.0, 12), 4096);
+        assert_eq!(bend14_from_cents_with_range(1200.0, 12), 16383);
+        assert_eq!(bend14_from_cents_with_range(-1200.0, 12), 0);
     }
 
     #[test]

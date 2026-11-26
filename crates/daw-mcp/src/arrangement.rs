@@ -34,28 +34,65 @@ fn spark_db(vals: &[f32]) -> String {
         .collect()
 }
 
-/// Whole-song arrangement report: density sparkline, dynamic-arc sparkline, and
-/// structural findings. Renders the mix once for the loudness curve.
-pub fn arrangement_report(project: &Project, sf2: &Path) -> anyhow::Result<String> {
-    let song_bars = project.song_bars();
-    // Symbolic density: each clip's (start_bar, effective_len).
-    let slots: Vec<(u32, u32)> = project
+/// Collect `(start_bar, len_bars)` spans from both pattern clips and audio clips.
+pub fn project_clip_spans(project: &Project) -> Vec<(u32, u32)> {
+    let spb_steps = project.steps_per_bar();
+    let mut slots: Vec<(u32, u32)> = project
         .arrangement
         .iter()
         .map(|s| {
             let len = s.len_bars.unwrap_or_else(|| {
-                project.patterns.iter().find(|p| p.id() == s.pattern).map(|p| p.bars()).unwrap_or(1)
+                project.patterns.iter().find(|p| p.id() == s.pattern).map(|p| p.bars_in(spb_steps)).unwrap_or(1)
             });
             (s.bar, len.max(1))
         })
         .collect();
+    let spb = project.seconds_per_bar().max(1e-6);
+    for c in &project.audio_clips {
+        let muted = project.tracks.iter().find(|t| t.id == c.track).is_some_and(|t| t.muted);
+        if muted {
+            continue;
+        }
+        let start_bar = (c.start_sec.max(0.0) / spb).floor() as u32;
+        let end_bar = ((c.start_sec.max(0.0) + c.len_sec) / spb).ceil() as u32;
+        slots.push((start_bar, end_bar.saturating_sub(start_bar).max(1)));
+    }
+    for t in &project.tracks {
+        if t.muted {
+            continue;
+        }
+        if let daw_core::project::Instrument::AudioFile { path } = &t.instrument {
+            if !path.is_empty() {
+                let len_bars = daw_core::audio::wav_duration_sec(Path::new(path))
+                    .map(|dur| (dur / spb).ceil() as u32)
+                    .unwrap_or(1)
+                    .max(1);
+                slots.push((0, len_bars));
+            }
+        }
+    }
+    slots
+}
+
+/// Whole-song arrangement report: density sparkline, dynamic-arc sparkline, and
+/// structural findings. Renders the mix once for the loudness curve.
+pub fn arrangement_report(project: &Project, sf2: &Path) -> anyhow::Result<String> {
+    let song_bars = project.song_bars();
+    let slots = project_clip_spans(project);
     let activity = bar_activity(&slots, song_bars);
 
     // Dynamic arc: per-bar loudness from one whole-mix render.
     let (samples, sr) = daw_core::audio::export::render_project_samples(project, sf2, false)?;
     let l: Vec<f32> = samples.iter().step_by(2).copied().collect();
     let r: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
-    let rep = crate::analysis::analyze(&l, &r, sr, project.project.bpm);
+    let rep = crate::analysis::analyze_with_timing(
+        &l,
+        &r,
+        sr,
+        project.project.bpm,
+        project.project.time_signature,
+        &project.tempo_changes,
+    );
     let mut bar_db = vec![-120.0f32; song_bars.max(1) as usize];
     for (bar, d) in &rep.bar_rms_db {
         let i = (*bar as usize).saturating_sub(1);
@@ -69,7 +106,7 @@ pub fn arrangement_report(project: &Project, sf2: &Path) -> anyhow::Result<Strin
     let mut s = format!(
         "arrangement: {song_bars} bars, {} tracks, {} clips\n",
         project.tracks.len(),
-        project.arrangement.len()
+        project.arrangement.len() + project.audio_clips.len()
     );
     s.push_str(&format!("density  (max {max_act}/bar): {}\n", spark_u32(&activity, max_act)));
     s.push_str(&format!("loudness (per-bar dBFS): {}\n", spark_db(&bar_db)));
@@ -183,5 +220,16 @@ mod tests {
         let activity = vec![1, 2, 3, 4]; // builds up
         let f = arc_findings(&bar_db, &activity);
         assert!(!texts(&f).contains("no intro"), "{}", texts(&f));
+    }
+
+    #[test]
+    fn audio_clips_contribute_to_arrangement_activity() {
+        let mut p = Project::default_project(); // 120 BPM => 2.0s per bar
+        p.arrangement.clear();
+        let tid = p.add_track(daw_core::project::TrackType::Audio);
+        p.add_audio_clip(&tid, "solo.wav", 4.0, 4.0); // bars 2..4
+        let spans = project_clip_spans(&p);
+        let act = bar_activity(&spans, 6);
+        assert_eq!(act, vec![0, 0, 1, 1, 0, 0]);
     }
 }

@@ -1,6 +1,6 @@
 [package]
 name = "daw-ai"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2021"
 
 [workspace]
@@ -10,7 +10,7 @@ members = [
     "crates/daw-clap-testplug-gain", "crates/daw-clap-testplug-tone",
     "crates/daw-mcp",
 ]
-exclude = ["vendor/cpal"]
+exclude = ["vendor/cpal", "vendor/gpui_util", "vendor/taffy"]
 resolver = "2"
 
 # Style lints that fight real-time audio code: indexed loops over parallel
@@ -59,3 +59,7 @@ debug = 0
 # CPAL 0.15.3 ALSA shutdown fix; see vendor/cpal/DAW-PATCH.md.
 [patch.crates-io]
 cpal = { path = "vendor/cpal" }
+# GPUI 0.2.2 pins Taffy 0.9.0, whose upstream Grid dependency is vulnerable.
+taffy = { path = "vendor/taffy" }
+# GPUI test support uses Git2 through this crate.
+gpui_util = { path = "vendor/gpui_util" }

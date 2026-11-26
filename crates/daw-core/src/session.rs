@@ -1,7 +1,6 @@
 //! Versioned, atomic edits and shared history. No frontend or device ownership.
 use crate::project::{
     format::project_revision, ArrangementSlot, Note, Pattern, PianoRollPattern, Project, TrackType,
-    ARR_TICKS_PER_BAR,
 };
 use serde::{Deserialize, Serialize};
 use std::collections::VecDeque;
@@ -51,6 +50,8 @@ pub enum Edit {
         #[serde(default)]
         offset_ticks: u32,
         len_bars: Option<u32>,
+        #[serde(default = "default_clip_gain")]
+        gain: f32,
     },
     RemoveClip {
         track_id: String,
@@ -60,15 +61,19 @@ pub enum Edit {
     },
 }
 
+fn default_clip_gain() -> f32 { 1.0 }
+
 fn exact_clip(
     project: &Project,
     track_id: &str,
     bar: u32,
     offset_ticks: u32,
 ) -> anyhow::Result<Option<usize>> {
+    let tpb = project.ticks_per_bar();
     anyhow::ensure!(
-        offset_ticks < ARR_TICKS_PER_BAR,
-        "clip offset must be 0–479 ticks"
+        offset_ticks < tpb,
+        "clip offset must be 0–{} ticks",
+        tpb - 1
     );
     let mut found = project.arrangement.iter().enumerate().filter(|(_, clip)| {
         clip.track == track_id && clip.bar == bar && clip.offset_ticks == offset_ticks
@@ -126,7 +131,8 @@ impl Edit {
                     project.patterns.iter().all(|p| p.id() != pattern_id),
                     "pattern {pattern_id} already exists"
                 );
-                let length = u32::from(*bars) * ARR_TICKS_PER_BAR;
+                let tpb = project.ticks_per_bar();
+                let length = u32::from(*bars) * tpb;
                 ensure!(
                     notes.iter().all(|note| note.tick < length),
                     "note starts outside pattern {pattern_id}"
@@ -145,9 +151,14 @@ impl Edit {
                     id: pattern_id.clone(),
                     name: name.clone(),
                     bars: *bars,
-                    ticks_per_bar: ARR_TICKS_PER_BAR,
+                    ticks_per_bar: tpb,
                     notes: notes.clone(),
                     legato: false,
+                    cc_events: Vec::new(),
+                    pitch_bends: Vec::new(),
+                    legato_overlap_ticks: 0,
+                    legato_max_gap_ticks: None,
+                    swing: None,
                 }));
             }
             Self::SetNotes { pattern_id, notes } => {
@@ -169,6 +180,7 @@ impl Edit {
                 bar,
                 offset_ticks,
                 len_bars,
+                gain,
             } => {
                 let track = project
                     .tracks
@@ -186,6 +198,7 @@ impl Edit {
                     bar: *bar,
                     offset_ticks: *offset_ticks,
                     len_bars: *len_bars,
+                    gain: *gain,
                 };
                 if let Some(index) = index {
                     project.arrangement[index] = clip;

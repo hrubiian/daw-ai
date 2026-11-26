@@ -31,3 +31,24 @@ regressions. Coverage includes control isolation, undo, effects navigation,
 last-channel access after scrolling/resizing, and playback/pattern preservation.
 Hardware playback depends on the selected device and compositor.
 After updating the binary, save your work and restart an existing GUI process.
+
+## Laptop keys in the Piano Roll
+
+Open an instrument pattern in **Piano Roll** and click **Laptop keys** or press
+`l`. The keys `z x c v b n m` play C4 through B4 and `q w e r t y u` play C5
+through B5. The sharps are `s d g h j` and `2 3 5 6 7`.
+
+Each press previews a note and enters it at the highlighted sixteenth-note step.
+Click a grid column or use **←** and **→** to move the entry cursor. Press `l`
+or **Esc** to return to mouse editing.
+
+## Track comments
+
+Right-click a track header and choose **Add comment** to leave a note about the
+whole track. Right-click a clip or an empty spot in the arrangement to pin the
+comment to the bar under the pointer. Each location holds one comment. Click the
+speech bubble to edit or delete it. **Enter** saves and **Shift+Enter** adds a
+line break.
+
+Comments are saved in the project. A connected MCP agent sees them in
+`project_summary`. Ask it to read the comments when you want it to act on them.

@@ -432,6 +432,7 @@ mod tests {
             clap_instrument: None,
             clap_fx: Vec::new(),
             tuning_cents: 0.0,
+            pitch_bend_range_semitones: 2,
         };
         let (strips, _meters) = super::super::mixer::build_strips(&[spec], sf2, engine.sample_rate);
         engine.send(AudioEvent::SetStrips { strips });

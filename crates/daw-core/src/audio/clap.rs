@@ -412,6 +412,7 @@ pub struct ClapProcessor {
     output_channels: usize,
     dirty: Arc<AtomicBool>,
     tempo: Option<f64>,
+    time_signature: [u8; 2],
     sample_rate: f64,
     pub process_failed: bool,
 }
@@ -530,6 +531,7 @@ impl ClapInstance {
                 output_channels,
                 dirty,
                 tempo: None,
+                time_signature: [4, 4],
                 sample_rate: sample_rate as f64,
                 process_failed: false,
             }),
@@ -718,6 +720,11 @@ impl ClapProcessor {
     pub fn set_tempo(&mut self, bpm: f64) {
         self.tempo = bpm.is_finite().then_some(bpm.clamp(20., 300.));
     }
+    pub fn set_time_signature(&mut self, numerator: u8, denominator: u8) {
+        if crate::musical_time::is_valid_time_signature([numerator, denominator]) {
+            self.time_signature = [numerator, denominator];
+        }
+    }
     fn reserve_event(&self) -> bool {
         if self.events_in.len() < MAX_INPUT_EVENTS { return true; }
         DROPPED_CLAP_EVENTS.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
@@ -802,6 +809,9 @@ impl ClapProcessor {
             let transport = self.tempo.map(|tempo| {
                 let seconds = self.steady as f64 / self.sample_rate;
                 let beats = seconds * tempo / 60.;
+                let num = f64::from(self.time_signature[0].max(1));
+                let den = f64::from(self.time_signature[1].max(1));
+                let beats_per_bar = (num * 4.0 / den).max(0.25);
                 TransportEvent {
                     header: EventHeader::default(),
                     flags: TransportFlags::HAS_TEMPO | TransportFlags::HAS_TIME_SIGNATURE
@@ -809,8 +819,10 @@ impl ClapProcessor {
                     tempo, tempo_inc: 0., song_pos_beats: beats.into(), song_pos_seconds: seconds.into(),
                     loop_start_beats: Default::default(), loop_end_beats: Default::default(),
                     loop_start_seconds: Default::default(), loop_end_seconds: Default::default(),
-                    bar_start: ((beats / 4.).floor() * 4.).into(), bar_number: (beats / 4.) as i32,
-                    time_signature_numerator: 4, time_signature_denominator: 4,
+                    bar_start: ((beats / beats_per_bar).floor() * beats_per_bar).into(),
+                    bar_number: (beats / beats_per_bar) as i32,
+                    time_signature_numerator: self.time_signature[0].into(),
+                    time_signature_denominator: self.time_signature[1].into(),
                 }
             });
             if self.started.process(

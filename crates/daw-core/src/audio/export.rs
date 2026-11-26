@@ -3,7 +3,7 @@ use super::load_wav_stereo;
 use super::mixer::{build_strips_report, AudioEvent, Mixer, StripMeter, StripSpec};
 use crate::project::{Instrument, Pattern, Project, TrackType};
 use crate::sequencer::engine::arranged_track_patterns;
-use crate::sequencer::engine::{piano_note_duration, note_fire_tick, humanize_velocity, mod_base01, modulated_value, pattern_length_ticks, swung_step_tick, TICKS_PER_BAR, TICKS_PER_BEAT};
+use crate::sequencer::engine::{piano_note_duration, note_fire_tick, humanize_velocity, mod_base01, modulated_value, pattern_length_ticks, swung_piano_tick, swung_step_tick, TICKS_PER_BEAT};
 use anyhow::Result;
 use rustysynth::{SoundFont, Synthesizer, SynthesizerSettings};
 use std::path::Path;
@@ -59,28 +59,29 @@ fn spatial_tail_seconds(project: &Project) -> f64 {
 
 /// Total ticks of the full arrangement (max end-tick across all slots).
 fn arrangement_total_ticks(project: &Project) -> u32 {
+    let tpb = project.ticks_per_bar();
     project.arrangement.iter()
         .filter_map(|sl| {
             let pat = project.patterns.iter().find(|p| p.id() == sl.pattern)?;
             // Resized clips (len_bars) extend the song; the pattern loops to fill.
             let len = sl.len_bars
-                .map(|b| b * TICKS_PER_BAR)
+                .map(|b| b * tpb)
                 .unwrap_or_else(|| pattern_length_ticks(pat));
-            Some(sl.bar * TICKS_PER_BAR + sl.offset_ticks + len)
+            Some(sl.bar * tpb + sl.offset_ticks + len)
         })
         .max()
-        .unwrap_or(TICKS_PER_BAR * 4)
+        .unwrap_or(tpb * 4)
 }
 
 /// Fallback for projects with no arrangement: length of the longest first-pattern.
-fn loop_total_ticks(project: &Project) -> u32 {
-    project.tracks.iter()
-        .filter(|t| t.track_type != TrackType::Audio && !t.muted)
-        .flat_map(|t| t.patterns.iter())
+fn loop_total_ticks(project: &Project, solo: Option<usize>) -> u32 {
+    project.tracks.iter().enumerate()
+        .filter(|(index, t)| t.track_type != TrackType::Audio && (!t.muted || solo == Some(*index)))
+        .flat_map(|(_, t)| t.patterns.iter())
         .filter_map(|pid| project.patterns.iter().find(|p| p.id() == pid))
         .map(pattern_length_ticks)
         .max()
-        .unwrap_or(TICKS_PER_BAR * 4)
+        .unwrap_or(project.ticks_per_bar() * 4)
 }
 
 /// Return (pattern, local_tick) for loop mode (no arrangement).
@@ -103,19 +104,39 @@ pub fn render_project_samples(project: &Project, sf2_path: &Path, normalize: boo
 /// Render from time zero to preserve synth/FX history, retain only the requested
 /// range, and stop after its end. Block boundaries match a full render exactly.
 pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool, range: Option<(u32, u32)>, control: &crate::render_control::RenderControl) -> Result<(Vec<f32>, u32)> {
+    render_selection(project, sf2_path, normalize, range, None, control)
+}
+
+/// Render one track with its saved effects, sends, and level automation.
+/// Track indices and the song timeline are preserved. A saved mute is
+/// respected by callers deciding which tracks to check or audition.
+pub fn render_track_samples(
+    project: &Project, sf2_path: &Path, track_index: usize, range: (u32, u32),
+    control: &crate::render_control::RenderControl,
+) -> Result<(Vec<f32>, u32)> {
+    anyhow::ensure!(track_index < project.tracks.len(), "unknown render track");
+    render_selection(project, sf2_path, false, Some(range), Some(track_index), control)
+}
+
+fn render_selection(
+    project: &Project, sf2_path: &Path, normalize: bool, range: Option<(u32, u32)>,
+    solo: Option<usize>, control: &crate::render_control::RenderControl,
+) -> Result<(Vec<f32>, u32)> {
     project.validate()?;
     control.check()?;
     if let Some((start, end)) = range { anyhow::ensure!(start < end, "render range must have start < end"); }
     let bpm   = project.project.bpm;
+    let ts    = project.project.time_signature;
+    let tempo_changes = &project.tempo_changes;
+    let start_bpm = crate::musical_time::bpm_at_tick(bpm, tempo_changes, 0);
     let swing = project.project.swing;
-    let spt   = 60.0 / bpm / TICKS_PER_BEAT as f64; // seconds per tick
-    let spk   = spt * EXPORT_SR as f64;              // samples per tick
+    let plays = |index: usize| solo.map_or(!project.tracks[index].muted, |solo| index == solo);
 
     let has_arr   = !project.arrangement.is_empty();
     let placements: Vec<_> = project.tracks.iter()
         .map(|track| arranged_track_patterns(project, &track.id))
         .collect();
-    let max_ticks = if has_arr { arrangement_total_ticks(project) } else { loop_total_ticks(project) };
+    let max_ticks = if has_arr { arrangement_total_ticks(project) } else { loop_total_ticks(project, solo) };
     // Cover arranged audio clips that extend past the pattern timeline.
     // Whole-file `AudioFile` sources play once from t=0 (as live playback).
     let whole_files = project.tracks.iter().filter_map(|t| match &t.instrument {
@@ -128,22 +149,36 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
         .map(|end_sec| (end_sec * EXPORT_SR as f64).ceil() as u64)
         .max()
         .unwrap_or(0);
-    let total_samp = ((max_ticks as f64 * spk).ceil() as u64)
+    let song_end_sec = crate::musical_time::tick_to_seconds(bpm, tempo_changes, max_ticks);
+    let total_samp = ((song_end_sec * EXPORT_SR as f64).ceil() as u64)
         .max(audio_end_samp)
-        + (spatial_tail_seconds(project)*EXPORT_SR as f64).ceil() as u64;
+        + (spatial_tail_seconds(project) * EXPORT_SR as f64).ceil() as u64;
 
-    let start_sample = range.map(|(start, _)| crate::musical_time::bar_sample(start, bpm, EXPORT_SR)).unwrap_or(0);
-    let end_sample = range.map(|(_, end)| crate::musical_time::bar_sample(end, bpm, EXPORT_SR)).unwrap_or(total_samp).min(total_samp);
+    let start_sample = range.map(|(start, _)| crate::musical_time::bar_sample_map(start, bpm, ts, tempo_changes, EXPORT_SR)).unwrap_or(0);
+    let end_sample = range.map(|(_, end)| crate::musical_time::bar_sample_map(end, bpm, ts, tempo_changes, EXPORT_SR)).unwrap_or(total_samp).min(total_samp);
     anyhow::ensure!(start_sample < end_sample, "render range is outside the song");
     let total_samp = total_samp.min(end_sample.div_ceil(BLOCK as u64) * BLOCK as u64);
     anyhow::ensure!(total_samp <= EXPORT_SR as u64 * 1800, "render exceeds the 30-minute resource limit");
-    let max_ticks = max_ticks.min((total_samp as f64 / spk).ceil() as u32);
+    let max_ticks = max_ticks.min(
+        crate::musical_time::seconds_to_tick(bpm, tempo_changes, total_samp as f64 / EXPORT_SR as f64)
+            .saturating_add(1),
+    );
 
     // ── The mixer: same strips as live playback ───────────────────────────────
-    let specs = StripSpec::from_project(project);
+    let mut specs = StripSpec::from_project(project);
+    if let Some(index) = solo {
+        for (i, spec) in specs.iter_mut().enumerate() {
+            spec.muted = i != index;
+            if spec.muted {
+                spec.kind = super::mixer::StripKind::Audio;
+                spec.clap_instrument = None;
+                spec.clap_fx.clear();
+            }
+        }
+    }
     let (strips, _meters, failures) = build_strips_report(&specs, sf2_path, EXPORT_SR);
     anyhow::ensure!(failures.is_empty(), "{}", failures.join("; "));
-    let utility: Option<Synthesizer> = if sf2_path.exists() {
+    let utility: Option<Synthesizer> = if solo.is_none() && sf2_path.exists() {
         let mut f = std::fs::File::open(sf2_path)?;
         let sf = Arc::new(SoundFont::new(&mut f)?);
         Synthesizer::new(&sf, &SynthesizerSettings::new(EXPORT_SR as i32)).ok()
@@ -157,7 +192,8 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
         [Arc::new(StripMeter::new()), Arc::new(StripMeter::new())],
     );
     mixer.handle_event(AudioEvent::SetStrips { strips });
-    mixer.handle_event(AudioEvent::SetTempo { bpm });
+    mixer.handle_event(AudioEvent::SetTempo { bpm: start_bpm });
+    mixer.handle_event(AudioEvent::SetTimeSignature { numerator: ts[0], denominator: ts[1] });
     // Return buses (reverb/delay sends); the 2 s render pad below covers tails.
     mixer.handle_event(AudioEvent::SetReturns { returns: project.returns.clone() });
 
@@ -165,6 +201,12 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
     let mut load_errors = Vec::new();
     let mut clap_handles: Vec<(String, crate::audio::clap::ClapHandle)> = Vec::new();
     for spec in crate::audio::clap::slot_specs(project) {
+        if let Some(index) = solo {
+            let strip = &specs[index];
+            if strip.clap_instrument.as_deref() != Some(spec.uid.as_str()) && !strip.clap_fx.contains(&spec.uid) {
+                continue;
+            }
+        }
         match crate::audio::clap::ClapInstance::from_spec(&spec, EXPORT_SR) {
             Ok(mut inst) => {
                 let p = inst.processor.take().unwrap();
@@ -180,39 +222,77 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
 
     // ── Sample-stamped event list ─────────────────────────────────────────────
     let mut evs: Vec<(u64, AudioEvent)> = Vec::new();
+    let mut last_bpm = start_bpm;
 
     let mut stopped = None;
     for tick in 0..max_ticks {
         if tick % 1024 == 0 { if let Err(error) = control.check() { stopped = Some(error); break; } }
-        let s = (tick as f64 * spk).round() as u64;
+        let s = (crate::musical_time::tick_to_seconds(bpm, tempo_changes, tick) * EXPORT_SR as f64).round() as u64;
+        let cur_bpm = crate::musical_time::bpm_at_tick(bpm, tempo_changes, tick);
+        if (cur_bpm - last_bpm).abs() > 0.05 {
+            evs.push((s, AudioEvent::SetTempo { bpm: cur_bpm }));
+            last_bpm = cur_bpm;
+        }
 
         for (i, track) in project.tracks.iter().enumerate() {
-            if track.muted { continue; }
-            if track.track_type == TrackType::Audio { continue; }
+            if !plays(i) { continue; }
             let strip = i as u8;
+            if let Some(gain) = crate::project::VolumePoint::scheduled_gain(&track.volume_automation, tick, cur_bpm) {
+                evs.push((s, AudioEvent::SetStripVolumeAutomation { strip, gain }));
+            }
+            if track.track_type == TrackType::Audio { continue; }
             let is_sampler = matches!(track.instrument, Instrument::Sampler { .. });
 
-            let Some((pat, pat_tick)) = (if has_arr {
+            // Release sustain pedal when a clip using CC64 finishes at this tick.
+            if has_arr
+                && placements[i].iter().any(|clip| {
+                    clip.end == tick
+                        && matches!(clip.pattern, Pattern::PianoRoll(pr) if pr.cc_events.iter().any(|c| c.cc == 64))
+                })
+            {
+                evs.push((s, AudioEvent::RawCC { strip, cc: 64, value: 0 }));
+            }
+            // Reset pitch bend back to track base tuning when a clip using pitch_bends finishes.
+            if has_arr
+                && placements[i].iter().any(|clip| {
+                    clip.end == tick
+                        && matches!(clip.pattern, Pattern::PianoRoll(pr) if !pr.pitch_bends.is_empty())
+                })
+            {
+                let bend = super::mixer::bend14_from_cents_with_range(
+                    track.tuning_cents,
+                    track.pitch_bend_range_semitones,
+                );
+                evs.push((s, AudioEvent::PitchBend {
+                    strip,
+                    lsb: (bend & 0x7F) as u8,
+                    msb: ((bend >> 7) & 0x7F) as u8,
+                }));
+            }
+
+            let Some((pat, pat_tick, slot_gain)) = (if has_arr {
                 placements[i].iter().find_map(|clip| {
-                    clip.local_tick_at(tick).map(|local| (clip.pattern, local))
+                    clip.local_tick_at(tick).map(|local| (clip.pattern, local, clip.gain))
                 })
             } else {
-                loop_pat_tick(project, &track.id, tick)
+                loop_pat_tick(project, &track.id, tick).map(|(p, l)| (p, l, 1.0))
             }) else { continue };
+            if slot_gain <= 0.0 { continue; }
 
             let emit = |pitch: u8, vel: u8, dur_ticks: u32, evs: &mut Vec<(u64, AudioEvent)>| {
-                let velocity = humanize_velocity(vel, strip, pitch, tick, project.project.humanize);
+                let scaled = ((vel as f32) * slot_gain).round().clamp(1.0, 127.0) as u8;
+                let velocity = humanize_velocity(scaled, strip, pitch, tick, project.project.humanize);
                 if is_sampler {
                     evs.push((s, AudioEvent::TriggerSample { strip, pitch, gain: velocity as f32 / 127.0 }));
                     // Gated pads follow the note length, as in live playback.
                     let gated = matches!(&track.instrument, Instrument::Sampler { pads }
                         if pads.iter().any(|p| p.pitch == pitch && p.gate));
                     if gated {
-                        let off = ((tick + dur_ticks) as f64 * spk).round() as u64;
+                        let off = (crate::musical_time::tick_to_seconds(bpm, tempo_changes, tick + dur_ticks) * EXPORT_SR as f64).round() as u64;
                         evs.push((off, AudioEvent::NoteOff { strip, pitch }));
                     }
                 } else {
-                    let off = ((tick + dur_ticks) as f64 * spk).round() as u64;
+                    let off = (crate::musical_time::tick_to_seconds(bpm, tempo_changes, tick + dur_ticks) * EXPORT_SR as f64).round() as u64;
                     evs.push((s, AudioEvent::NoteOn { strip, pitch, velocity }));
                     evs.push((off, AudioEvent::NoteOff { strip, pitch }));
                 }
@@ -221,9 +301,10 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
             match pat {
                 Pattern::Step(sp) => {
                     let step_count = sp.steps as u32;
-                    let tps        = TICKS_PER_BAR / 16; // steps are 16ths
+                    let tps        = TICKS_PER_BEAT / 4; // steps are 16ths
+                    let pat_swing  = sp.swing.unwrap_or(swing);
                     for step in 0..step_count {
-                        let nominal = swung_step_tick(step, swing);
+                        let nominal = swung_step_tick(step, pat_swing);
                         for row in &sp.rows {
                             if note_fire_tick(row.pitch, nominal, strip, project.project.timing, pattern_length_ticks(pat)) == pat_tick {
                                 if let Some(vel) = row.step_velocity(step as usize) {
@@ -234,8 +315,29 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
                     }
                 }
                 Pattern::PianoRoll(pr) => {
+                    let pat_len = pattern_length_ticks(pat);
+                    for pb in &pr.pitch_bends {
+                        if pb.tick < pat_len && pb.tick == pat_tick {
+                            let bend = super::mixer::bend14_from_cents_with_range(
+                                track.tuning_cents + pb.cents,
+                                track.pitch_bend_range_semitones,
+                            );
+                            evs.push((s, AudioEvent::PitchBend {
+                                strip,
+                                lsb: (bend & 0x7F) as u8,
+                                msb: ((bend >> 7) & 0x7F) as u8,
+                            }));
+                        }
+                    }
+                    for c in &pr.cc_events {
+                        if c.tick < pat_len && c.tick == pat_tick {
+                            evs.push((s, AudioEvent::RawCC { strip, cc: c.cc, value: c.value }));
+                        }
+                    }
+                    let pat_swing = pr.swing.unwrap_or(0.0);
                     for note in pr.active_notes() {
-                        if note_fire_tick(note.pitch, note.tick, strip, project.project.timing, pattern_length_ticks(pat)) == pat_tick {
+                        let nominal = swung_piano_tick(note.tick, pat_swing);
+                        if note_fire_tick(note.pitch, nominal, strip, project.project.timing, pat_len) == pat_tick {
                             emit(note.pitch, note.vel, piano_note_duration(pr, note), &mut evs);
                         }
                     }
@@ -250,6 +352,7 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
 
     for clip in &project.audio_clips {
         let strip = project.tracks.iter().position(|t| t.id == clip.track).unwrap_or(0) as u8;
+        if solo.is_some_and(|index| index != usize::from(strip)) { continue; }
         match load_wav_stereo(Path::new(&clip.path), EXPORT_SR) {
             Ok((l, r)) => {
                 let id = next_clip_id;
@@ -272,7 +375,7 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
     // on the track's strip. (The old exporter looped these forever — exporting
     // a song-length loop was wrong; one full pass is the intended sound.)
     for (i, track) in project.tracks.iter().enumerate() {
-        if track.muted { continue; }
+        if !plays(i) { continue; }
         if let Instrument::AudioFile { path } = &track.instrument {
             if path.is_empty() { continue; }
             match load_wav_stereo(Path::new(path), EXPORT_SR) {
@@ -303,10 +406,11 @@ pub fn render_range_samples(project: &Project, sf2_path: &Path, normalize: bool,
     // ── LFO modulation jobs: (strip, cc, base value 0..1, modulator) ──────────
     let mut mod_jobs: Vec<(u8, u8, f32, crate::project::Modulator)> = Vec::new();
     for (i, track) in project.tracks.iter().enumerate() {
+        if solo.is_some_and(|index| index != i) { continue; }
         // Same split as the live sequencer: synth-less strips take the
         // mixer-level destinations, SoundFont strips also take resonance.
         let synthless = track.track_type == TrackType::Audio
-            || matches!(track.instrument, Instrument::Sampler { .. } | Instrument::Clap(_));
+            || matches!(track.instrument, Instrument::Sampler { .. } | Instrument::Clap(_) | Instrument::Sfz { .. });
         if synthless {
             for (cc, base, m) in crate::sequencer::engine::mixer_mod_jobs(track) { mod_jobs.push((i as u8, cc, base, m)); }
         } else {
@@ -529,8 +633,8 @@ mod tests {
         p.patterns.push(Pattern::PianoRoll(shadow));
         let track = p.tracks[0].id.clone();
         p.arrangement = vec![
-            crate::project::ArrangementSlot { track: track.clone(), pattern: "shadow".into(), bar: 0, offset_ticks: 70, len_bars: None },
-            crate::project::ArrangementSlot { track, pattern: "pulse".into(), bar: 0, offset_ticks: 0, len_bars: None },
+            crate::project::ArrangementSlot { track: track.clone(), pattern: "shadow".into(), bar: 0, offset_ticks: 70, len_bars: None, gain: 1.0 },
+            crate::project::ArrangementSlot { track, pattern: "pulse".into(), bar: 0, offset_ticks: 0, len_bars: None, gain: 1.0 },
         ];
         let (audio, _) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
         let onsets: Vec<_> = audio.as_chunks::<2>().0.iter().enumerate()
@@ -806,6 +910,196 @@ mod sampler_variation_render_tests {
         let (open, shut) = (level(&swept, sr, 0.3), level(&swept, sr, 0.8));
         assert!(open > 0.25, "open half-cycle passes the sample: {open}");
         assert!(shut < 0.02, "closed half-cycle filters it out: {shut}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn volume_automation_and_clip_gain_shape_rendered_audio() {
+        let (mut p, dir) = held_note_project("auto-gain", true);
+        p.patterns[0] = serde_json::from_value(serde_json::json!({
+            "type":"piano_roll","id":"hold","name":"Hold","bars":2,"ticks_per_bar":480,
+            "notes":[{"pitch":36,"tick":0,"duration":900,"vel":127}]
+        })).unwrap();
+        p.arrangement = vec![crate::project::ArrangementSlot {
+            track: p.tracks[0].id.clone(), pattern: "hold".into(),
+            bar: 0, offset_ticks: 0, len_bars: None, gain: 0.5,
+        }];
+        p.set_volume_automation(&p.tracks[0].id.clone(), vec![
+            crate::project::VolumePoint { tick: 0, gain: 0.2 },
+            crate::project::VolumePoint { tick: 480, gain: 1.0 },
+        ]).unwrap();
+        let (audio, sr) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
+        let early = level(&audio, sr, 0.08);
+        let late = level(&audio, sr, 1.25);
+        assert!(late > early * 2.5, "automation ramp should boost bar 2 over bar 1: early={early}, late={late}");
+        assert!(late < 0.20, "clip gain 0.5 should attenuate velocity (~0.15): late={late}");
+        std::fs::remove_dir_all(dir).unwrap();
+    }
+
+    #[test]
+    fn seven_four_meter_tempo_map_and_pitch_bends_render_accurately() {
+        let dir = std::env::temp_dir().join(format!(
+            "daw-whiplash-core-{}-{}",
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("pulse.wav");
+        let mut w = hound::WavWriter::create(
+            &path,
+            hound::WavSpec {
+                channels: 1,
+                sample_rate: EXPORT_SR,
+                bits_per_sample: 32,
+                sample_format: hound::SampleFormat::Float,
+            },
+        )
+        .unwrap();
+        for i in 0..512 {
+            w.write_sample(if i == 0 { 0.5f32 } else { 0.0 }).unwrap();
+        }
+        w.finalize().unwrap();
+
+        let mut p = crate::project::Project::default_project();
+        p.tracks.clear();
+        p.patterns.clear();
+        p.arrangement.clear();
+        p.project.bpm = 120.0;
+        p.project.humanize = 0.0;
+        p.project.swing = 0.0;
+        p.project.timing = 0.0;
+        p.set_time_signature(7, 4).unwrap();
+        let tid = p.add_track(crate::project::TrackType::Drum);
+        p.tracks[0].volume = 1.0;
+        p.tracks[0].effects = Default::default();
+        p.tracks[0].instrument = serde_json::from_value(serde_json::json!({
+            "type": "sampler",
+            "pads": [{"pitch": 36, "path": path, "gain": 1.0}]
+        }))
+        .unwrap();
+        let pid = p.tracks[0].patterns[0].clone();
+        p.patterns[0] = serde_json::from_value(serde_json::json!({
+            "type": "piano_roll",
+            "id": pid,
+            "name": "7/4 Pulse",
+            "bars": 2,
+            "ticks_per_bar": 840,
+            "notes": [
+                {"pitch": 36, "tick": 0, "duration": 30, "vel": 127},
+                {"pitch": 36, "tick": 840, "duration": 30, "vel": 127}
+            ]
+        }))
+        .unwrap();
+        p.arrangement.push(crate::project::ArrangementSlot {
+            track: tid,
+            pattern: pid,
+            bar: 0,
+            offset_ticks: 0,
+            len_bars: None,
+            gain: 1.0,
+        });
+        p.set_tempo_changes(vec![
+            crate::project::TempoPoint { tick: 420, bpm: 240.0, ramp: false },
+            crate::project::TempoPoint { tick: 840, bpm: 240.0, ramp: false },
+        ])
+        .unwrap();
+        p.validate().unwrap();
+
+        let (full, sr) = render_project_samples(&p, Path::new("/missing.sf2"), false).unwrap();
+        let expected_bar1_sample =
+            (crate::musical_time::tick_to_seconds(120.0, &p.tempo_changes, 840) * f64::from(sr))
+                .round() as usize;
+        assert!(
+            full[expected_bar1_sample * 2].abs() > 0.4,
+            "bar 1 hit must align with tempo map at sample {expected_bar1_sample}"
+        );
+        let (range, _) =
+            render_range_samples(&p, Path::new("/missing.sf2"), false, Some((1, 2)), &Default::default())
+                .unwrap();
+        let a = crate::musical_time::bar_sample_map(1, 120.0, [7, 4], &p.tempo_changes, sr) as usize * 2;
+        assert_eq!(range, full[a..a + range.len()]);
+
+        // Verify SoundFont pitch bends visibly alter rendered audio when GeneralUser.sf2 is present.
+        let sf2 = Path::new("../../assets/GeneralUser.sf2");
+        if sf2.exists() {
+            let mut plain_sf = crate::project::Project::default_project();
+            plain_sf.tracks.retain(|t| t.id == "t2");
+            plain_sf.set_track_preset("t2", 56);
+            plain_sf.arrangement.retain(|a| a.track == "t2");
+            if let crate::project::Pattern::PianoRoll(pr) = &mut plain_sf.patterns[1] {
+                pr.bars = 1;
+                pr.notes = vec![crate::project::Note { pitch: 72, tick: 0, duration: 240, vel: 110 }];
+            }
+            let (plain_audio, _) = render_project_samples(&plain_sf, sf2, false).unwrap();
+            let mut bent_sf = plain_sf.clone();
+            bent_sf
+                .set_pattern_pitch_bends(
+                    "p2",
+                    vec![crate::project::PitchBendPoint { tick: 0, cents: 200.0 }],
+                )
+                .unwrap();
+            let (bent_audio, _) = render_project_samples(&bent_sf, sf2, false).unwrap();
+            let diff: f32 = plain_audio
+                .iter()
+                .zip(&bent_audio)
+                .take(44100)
+                .map(|(a, b)| (a - b).abs())
+                .sum();
+            assert!(diff > 10.0, "pitch bend must shift SoundFont output, diff={diff}");
+
+            // Wide 12-semitone pitch bend (-700c) via RPN 0 alters output differently than ±200c clamp.
+            let mut wide_sf = bent_sf.clone();
+            wide_sf.set_track_pitch_bend_range("t2", 12).unwrap();
+            wide_sf
+                .set_pattern_pitch_bends(
+                    "p2",
+                    vec![crate::project::PitchBendPoint { tick: 0, cents: -700.0 }],
+                )
+                .unwrap();
+            let (wide_audio, _) = render_project_samples(&wide_sf, sf2, false).unwrap();
+            let wide_diff: f32 = bent_audio
+                .iter()
+                .zip(&wide_audio)
+                .take(44100)
+                .map(|(a, b)| (a - b).abs())
+                .sum();
+            assert!(wide_diff > 10.0, "12-semitone pitch bend via RPN 0 must shift output, wide_diff={wide_diff}");
+        }
+
+        // Per-pattern swing on PianoRoll moves offbeat 8th-note sample onset in export too.
+        let mut sw = crate::project::Project::default_project();
+        sw.tracks.retain(|t| t.id == "t1");
+        sw.tracks[0].volume = 1.0;
+        sw.tracks[0].effects = Default::default();
+        sw.tracks[0].instrument = serde_json::from_value(serde_json::json!({
+            "type": "sampler",
+            "pads": [{"pitch": 36, "path": path, "gain": 1.0}]
+        }))
+        .unwrap();
+        sw.project.bpm = 300.0;
+        sw.project.swing = 0.0;
+        sw.patterns = vec![serde_json::from_value(serde_json::json!({
+            "type": "piano_roll",
+            "id": "p1",
+            "name": "Swung",
+            "bars": 1,
+            "ticks_per_bar": 480,
+            "swing": 1.0,
+            "notes": [{"pitch": 36, "tick": 60, "duration": 30, "vel": 127}]
+        }))
+        .unwrap()];
+        sw.arrangement = vec![crate::project::ArrangementSlot {
+            track: "t1".into(), pattern: "p1".into(), bar: 0, offset_ticks: 0, len_bars: None, gain: 1.0,
+        }];
+        let (sw_audio, sr2) = render_project_samples(&sw, Path::new("/missing.sf2"), false).unwrap();
+        let straight_s = (crate::musical_time::tick_to_seconds(300.0, &[], 60) * f64::from(sr2)).round() as usize;
+        let swung_s = (crate::musical_time::tick_to_seconds(300.0, &[], 80) * f64::from(sr2)).round() as usize;
+        assert!(sw_audio[straight_s * 2].abs() < 0.05, "nominal tick 60 must be silent when swung");
+        assert!(sw_audio[swung_s * 2].abs() > 0.4, "swung tick 80 must strike at sample {swung_s}");
+
         std::fs::remove_dir_all(dir).unwrap();
     }
 }

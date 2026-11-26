@@ -3,39 +3,6 @@ use crate::app::{App, DialogMode, Tab};
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers};
 use daw_core::sequencer::SequencerCommand;
 
-/// Maps a QWERTY key to a MIDI pitch for live piano play.
-/// Lower row  (z–m + s d g h j):  C4–B4
-/// Upper row  (q–u + 2 3 5 6 7):  C5–B5
-fn piano_key_pitch(code: KeyCode) -> Option<u8> {
-    match code {
-        KeyCode::Char('z') => Some(60),  // C4
-        KeyCode::Char('s') => Some(61),  // C#4
-        KeyCode::Char('x') => Some(62),  // D4
-        KeyCode::Char('d') => Some(63),  // D#4
-        KeyCode::Char('c') => Some(64),  // E4
-        KeyCode::Char('v') => Some(65),  // F4
-        KeyCode::Char('g') => Some(66),  // F#4
-        KeyCode::Char('b') => Some(67),  // G4
-        KeyCode::Char('h') => Some(68),  // G#4
-        KeyCode::Char('n') => Some(69),  // A4
-        KeyCode::Char('j') => Some(70),  // A#4
-        KeyCode::Char('m') => Some(71),  // B4
-        KeyCode::Char('q') => Some(72),  // C5
-        KeyCode::Char('2') => Some(73),  // C#5
-        KeyCode::Char('w') => Some(74),  // D5
-        KeyCode::Char('3') => Some(75),  // D#5
-        KeyCode::Char('e') => Some(76),  // E5
-        KeyCode::Char('r') => Some(77),  // F5
-        KeyCode::Char('5') => Some(78),  // F#5
-        KeyCode::Char('t') => Some(79),  // G5
-        KeyCode::Char('6') => Some(80),  // G#5
-        KeyCode::Char('y') => Some(81),  // A5
-        KeyCode::Char('7') => Some(82),  // A#5
-        KeyCode::Char('u') => Some(83),  // B5
-        _ => None,
-    }
-}
-
 pub fn handle_key(app: &mut App, key: KeyEvent) {
     // Dialog mode (Save As / Export WAV): text input, Enter confirms, Esc cancels
     if app.dialog_mode != DialogMode::None {
@@ -104,13 +71,13 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
                 app.live_play = false;
                 return;
             }
-            code => {
-                if let Some(pitch) = piano_key_pitch(code) {
+            KeyCode::Char(key) => {
+                if let Some(pitch) = daw_io::midi::computer_key_pitch(key) {
                     app.live_play_note(pitch);
                     return;
                 }
-                // Non-piano key: fall through to normal global/tab handling below
             }
+            _ => {}
         }
     }
 
@@ -192,12 +159,12 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
         KeyCode::Char('n') if ctrl => { app.toggle_metronome(); return; }
         // BPM
         KeyCode::Char('+') | KeyCode::Char('=') => {
-            app.project.project.bpm = (app.project.project.bpm + 1.0).min(300.0);
+            app.project.project.bpm = (app.project.project.bpm + 1.0).min(daw_core::musical_time::MAX_BPM);
             app.send(SequencerCommand::SetBpm(app.project.project.bpm));
             return;
         }
         KeyCode::Char('-') => {
-            app.project.project.bpm = (app.project.project.bpm - 1.0).max(20.0);
+            app.project.project.bpm = (app.project.project.bpm - 1.0).max(daw_core::musical_time::MIN_BPM);
             app.send(SequencerCommand::SetBpm(app.project.project.bpm));
             return;
         }

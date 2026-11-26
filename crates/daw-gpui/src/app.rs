@@ -2,6 +2,8 @@ mod transport;
 mod controls;
 use controls::*;
 mod arrangement;
+mod comments;
+mod automation;
 mod browser;
 mod editors;
 mod effects;
@@ -143,6 +145,10 @@ pub struct DawView {
     /// (page-follow only when playback carries it out of view).
     playhead_was_visible: bool,
     timeline_scroll_grab: Option<f32>,
+    volume_automation_open: bool,
+    comment_menu: Option<(comments::CommentLocation, gpui::Point<gpui::Pixels>)>,
+    comment_draft: Option<comments::CommentDraft>,
+    comment_focus: FocusHandle,
     /// Latency text last drawn on the Amp button (repaint only when it changes).
     amp_readout_shown: Option<String>,
     ampforge_save_at: Option<std::time::Instant>,
@@ -155,6 +161,7 @@ pub struct DawView {
     piano_scroll: gpui::ScrollHandle,
     piano_scroll_grab: Option<f32>,
     piano_scrolled_pattern: Option<String>,
+    piano_step_input: Option<(String, u32)>,
     piano_note_lights: [u64; 2],
     mix_scroll: gpui::ScrollHandle,
     mix_vertical_scroll: gpui::ScrollHandle,
@@ -225,6 +232,10 @@ impl DawView {
             input_track: None,
             playhead_was_visible: true,
             timeline_scroll_grab: None,
+            volume_automation_open: false,
+            comment_menu: None,
+            comment_draft: None,
+            comment_focus: cx.focus_handle(),
             ir_pick: Default::default(),
             cabinet_export_result: Default::default(),
             guitar_window: None,
@@ -234,6 +245,7 @@ impl DawView {
             piano_scroll: gpui::ScrollHandle::new(),
             piano_scroll_grab: None,
             piano_scrolled_pattern: None,
+            piano_step_input: None,
             piano_note_lights: [0; 2],
             mix_scroll: gpui::ScrollHandle::new(),
             mix_vertical_scroll: gpui::ScrollHandle::new(),
@@ -365,7 +377,7 @@ impl DawView {
     /// Nudge the tempo and push it to the engine.
     fn nudge_bpm(&mut self, delta: f64) {
         self.undo.record("BPM", &self.st.project);
-        let bpm = (self.st.project.project.bpm + delta).clamp(20.0, 300.0);
+        let bpm = (self.st.project.project.bpm + delta).clamp(daw_core::musical_time::MIN_BPM, daw_core::musical_time::MAX_BPM);
         self.st.project.project.bpm = bpm;
         let _ = self.send_command(SequencerCommand::SetBpm(bpm));
     }
@@ -1000,6 +1012,8 @@ impl DawView {
     }
 
     fn new_project(&mut self) {
+        self.comment_menu = None;
+        self.comment_draft = None;
         self.host.disable_track_monitor();
         if self.playing || self.midi_recording { self.stop(); }
         self.undo.record("new project", &self.st.project);
@@ -1016,6 +1030,7 @@ impl DawView {
         self.st.arrange_scroll_x = 0.;
         self.st.arrange_scroll_y = 0.;
         self.piano_scrolled_pattern = None;
+        self.piano_step_input = None;
         self.st.peaks_cache.clear();
         self.st.peaks_dur_cache.clear();
         self.waveform_failed.clear();
@@ -1181,6 +1196,8 @@ impl DawView {
     fn load_project(&mut self, path: std::path::PathBuf) {
         match daw_core::project::format::load(&path) {
             Ok(project) => {
+                self.comment_menu = None;
+                self.comment_draft = None;
                 self.host.disable_track_monitor();
                 // A loaded file is a new document with its own history. Keeping
                 // the old steps let Ctrl+Z put the previous song under the new
@@ -1194,6 +1211,7 @@ impl DawView {
                 }
                 self.playing = false;
                 self.piano_scrolled_pattern = None;
+                self.piano_step_input = None;
                 // Keep the musician's workspace (layout, zoom, JAM, accent).
                 let old = std::mem::replace(&mut self.st, HeadlessState::from_project(project, Some(path.clone())));
                 self.st.mixer_h = old.mixer_h; self.st.dock_h = old.dock_h;
@@ -1821,7 +1839,7 @@ impl Render for DawView {
         // musician scrolled away from is left alone until it re-enters view.
         {
             let bw = self.bar_w();
-            let x = self.st.playhead() as f32 / daw_core::sequencer::TICKS_PER_BAR as f32 * bw;
+            let x = self.st.playhead() as f32 / self.st.project.ticks_per_bar() as f32 * bw;
             let mut visible = x >= self.st.arrange_scroll_x && x <= self.st.arrange_scroll_x + timeline_width;
             if self.playing && !visible && self.playhead_was_visible {
                 self.st.arrange_scroll_x = (x - bw).clamp(0., max_x);
@@ -1840,8 +1858,10 @@ impl Render for DawView {
         let recording = self.midi_recording;
         let bpm = self.st.bpm();
         let tick = self.st.playhead();
-        let bar = tick / daw_core::sequencer::TICKS_PER_BAR + 1;
-        let beat = (tick % daw_core::sequencer::TICKS_PER_BAR) / daw_core::sequencer::TICKS_PER_BEAT + 1;
+        let tpb = self.st.project.ticks_per_bar();
+        let tp_beat = self.st.project.ticks_per_meter_beat();
+        let bar = tick / tpb + 1;
+        let beat = (tick % tpb) / tp_beat + 1;
         let live_status = self.live_status.clone();
         let engine_error = self.engine_error_shown.clone();
         let status_text = if self.st.status.is_empty() {
@@ -1917,7 +1937,7 @@ impl Render for DawView {
                     .rounded_sm()
                     .bg(rgb(theme.bg))
                     .child(div().font_family("monospace").text_size(px(15.)).line_height(px(18.)).text_color(rgb(theme.text))
-                        .child(transport::playhead_time(tick, bpm)))
+                        .child(transport::playhead_time_with_map(tick, bpm, &self.st.project.tempo_changes)))
                     .child(div().font_family("monospace").text_size(px(10.)).line_height(px(12.)).text_color(rgb(theme.text_dim))
                         .child(format!("{bar}.{beat}  ·  tick {tick}"))),
             );
@@ -2053,7 +2073,9 @@ impl Render for DawView {
         let fx_overlay = self.audio_effects_overlay(cx);
         let close_overlay = self.close_overlay(cx);
         let input_overlay = self.track_input_overlay(cx);
+        let comment_overlay = self.comment_overlay(window, cx);
 
+        let piano_visible = layout.editor_height.is_some() && self.st.active_dock == DockTab::PianoRoll;
         let content = div()
             .size_full()
             .relative()
@@ -2065,6 +2087,16 @@ impl Render for DawView {
                 this.root_focus.focus(w);
             }))
             .capture_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+                if !this.close_confirmation && (this.comment_menu.is_some() || this.comment_draft.is_some()) {
+                    if this.comment_draft.is_some() {
+                        this.comment_key(ev, w, cx);
+                    } else if ev.keystroke.key == "escape" {
+                        this.dismiss_comment(w);
+                    }
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 if this.input_track.is_some() {
                     if ev.keystroke.key == "escape" { this.input_track = None; cx.notify(); }
                     cx.stop_propagation();
@@ -2111,9 +2143,16 @@ impl Render for DawView {
                     cx.stop_propagation();
                 }
             }))
-            .on_key_down(cx.listener(|this, ev: &KeyDownEvent, w, cx| {
+            .on_key_down(cx.listener(move |this, ev: &KeyDownEvent, w, cx| {
                 if this.search_focus.is_focused(w) || this.fx_library.focus.is_focused(w)
                     || this.rename_focus.is_focused(w) || this.focus.is_focused(w) { return; }
+                if piano_visible && !this.st.browser_open && !this.st.fx_window_open
+                    && this.handle_piano_step_key(ev)
+                {
+                    cx.stop_propagation();
+                    cx.notify();
+                    return;
+                }
                 let m = &ev.keystroke.modifiers;
                 if ev.keystroke.key == "space" && !m.control { this.toggle_play(); cx.notify(); return; }
                 if m.control && ev.keystroke.key == "s" { this.save_project(); cx.notify(); return; }
@@ -2155,6 +2194,7 @@ impl Render for DawView {
             .children(fx_overlay)
             .children(overlay)
             .children(input_overlay)
+            .children(comment_overlay)
             .children(close_overlay);
         window_frame::frame(theme, content, window, cx.listener(|this, _, w, cx| {
             if this.confirm_close(w, cx) { w.remove_window(); }
@@ -2524,6 +2564,7 @@ mod tests {
         project.patterns.push(daw_core::project::Pattern::PianoRoll(daw_core::project::PianoRollPattern {
             id: "review-piano".into(), name: "Long off-grid phrase".into(), bars: 40, ticks_per_bar: 480,
             notes: vec![daw_core::project::Note { pitch: 60, tick: 62, duration: 55, vel: 80 }], legato: false,
+            cc_events: Vec::new(), pitch_bends: Vec::new(), legato_overlap_ticks: 0, legato_max_gap_ticks: None, swing: None,
         }));
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut view = DawView::new(host, project, None, String::new(), cx);
@@ -2594,6 +2635,7 @@ mod tests {
         project.patterns.push(daw_core::project::Pattern::PianoRoll(daw_core::project::PianoRollPattern {
             id: "offgrid".into(), name: "Off grid".into(), bars: 8, ticks_per_bar: 480, legato: false,
             notes: vec![daw_core::project::Note { pitch: 60, tick: 62, duration: 55, vel: 80 }],
+            cc_events: Vec::new(), pitch_bends: Vec::new(), legato_overlap_ticks: 0, legato_max_gap_ticks: None, swing: None,
         }));
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut v = DawView::new(host, project, None, String::new(), cx);
@@ -2670,6 +2712,47 @@ mod tests {
     }
 
     #[gpui::test]
+    fn volume_lane_edits_the_track_without_changing_clips(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, Modifiers, MouseButton};
+
+        let (host, commands, _audio) = Host::headless();
+        let project = Project::default_project();
+        let clips_before = serde_json::to_value(&project.arrangement).unwrap();
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, project, None, String::new(), cx);
+            view.sf2_missing = false;
+            view
+        });
+        cx.simulate_resize(size(px(1120.), px(720.)));
+        cx.run_until_parked();
+
+        let toggle = cx.debug_bounds("volume-automation").unwrap();
+        cx.simulate_click(toggle.center(), Modifiers::default());
+        let lane = cx.debug_bounds("volume-lane-t1").unwrap();
+        let dot = point(lane.left() + px(50.), lane.bottom() - px(12.));
+        cx.simulate_click(dot, Modifiers::default());
+        let original = view.read_with(cx, |view, _| view.st.project.tracks[0].volume_automation[0]);
+        assert!(original.tick > 0 && original.gain < 1.0);
+        assert!(commands.try_iter().any(|command| matches!(command,
+            SequencerCommand::UpdateLive(p) if p.tracks[0].volume_automation == [original])));
+
+        let end = point(lane.left() + px(100.), lane.top() + px(12.));
+        cx.simulate_mouse_down(dot, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(dot + point(px(8.), px(0.)), MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_move(end, MouseButton::Left, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::default());
+        let moved = view.read_with(cx, |view, _| view.st.project.tracks[0].volume_automation[0]);
+        assert!(moved.tick > original.tick && moved.gain > 1.0);
+
+        cx.simulate_mouse_down(end, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(end, MouseButton::Right, Modifiers::default());
+        view.read_with(cx, |view, _| {
+            assert!(view.st.project.tracks[0].volume_automation.is_empty());
+            assert_eq!(serde_json::to_value(&view.st.project.arrangement).unwrap(), clips_before);
+        });
+    }
+
+    #[gpui::test]
     fn arrangement_navigation_keeps_the_ruler_and_tracks_in_sync(cx: &mut gpui::TestAppContext) {
         use gpui::{point, Modifiers, MouseButton, ScrollDelta, ScrollWheelEvent, TouchPhase};
 
@@ -2739,6 +2822,62 @@ mod tests {
     }
 
     #[gpui::test]
+    fn right_click_adds_whole_track_and_bar_comments(cx: &mut gpui::TestAppContext) {
+        use gpui::{point, Modifiers, MouseButton};
+
+        let (host, commands, _audio) = Host::headless();
+        let mut project = Project::default_project();
+        project.arrangement[0].len_bars = Some(4);
+        let (view, cx) = cx.add_window_view(|_, cx| {
+            let mut view = DawView::new(host, project, None, String::new(), cx);
+            view.sf2_missing = false;
+            view.st.arrange_full = true;
+            view.st.arrange_zoom = 2.;
+            view.st.arrange_scroll_x = 192.;
+            view
+        });
+        cx.simulate_resize(size(px(1000.), px(600.)));
+        cx.run_until_parked();
+
+        let ruler = cx.debug_bounds("timeline-beat-2-1").unwrap().center();
+        let clip = cx.debug_bounds("clip-t1-0").unwrap().center();
+        let position = point(ruler.x, clip.y);
+        cx.simulate_mouse_down(position, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(position, MouseButton::Right, Modifiers::default());
+        let menu = cx.debug_bounds("comment-menu-item").unwrap();
+        cx.simulate_click(menu.center(), Modifiers::default());
+        cx.simulate_keystrokes("a d d space f i l l enter");
+
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.st.project.tracks[0].comment(Some(2)), Some("add fill"));
+            assert_eq!(view.st.project.tracks[0].comment(None), None);
+        });
+        assert!(!commands.try_iter().any(|c| matches!(c, SequencerCommand::Seek(_) | SequencerCommand::Play)));
+
+        let pin = cx.debug_bounds("comment-pin-t1-2").unwrap();
+        cx.simulate_click(pin.center(), Modifiers::default());
+        cx.simulate_keystrokes("ctrl-a s o f t e r enter");
+        view.read_with(cx, |view, _| {
+            let data = serde_json::to_string(&view.st.project).unwrap();
+            let project: Project = serde_json::from_str(&data).unwrap();
+            project.validate().unwrap();
+            assert_eq!(project.tracks[0].comment(Some(2)), Some("softer"));
+        });
+
+        let header = point(px(30.), clip.y);
+        cx.simulate_mouse_down(header, MouseButton::Right, Modifiers::default());
+        cx.simulate_mouse_up(header, MouseButton::Right, Modifiers::default());
+        let menu = cx.debug_bounds("comment-menu-item").unwrap();
+        cx.simulate_click(menu.center(), Modifiers::default());
+        cx.simulate_keystrokes("d r y enter");
+        assert!(cx.debug_bounds("comment-pin-t1-track").is_some());
+        view.read_with(cx, |view, _| {
+            assert_eq!(view.st.project.tracks[0].comment(None), Some("dry"));
+            assert_eq!(view.st.project.tracks[0].comment(Some(2)), Some("softer"));
+        });
+    }
+
+    #[gpui::test]
     fn arrangement_clicks_seek_to_the_pointer_at_any_zoom_and_scroll(cx: &mut gpui::TestAppContext) {
         use daw_core::project::{AudioClip, TrackType};
         use daw_core::sequencer::{TICKS_PER_BAR, TICKS_PER_BEAT};
@@ -2796,6 +2935,7 @@ mod tests {
         project.patterns.push(daw_core::project::Pattern::PianoRoll(daw_core::project::PianoRollPattern {
             id: "long-scroll".into(), name: "Long part".into(), bars: 100, ticks_per_bar: 480,
             legato: false, notes: vec![],
+            cc_events: Vec::new(), pitch_bends: Vec::new(), legato_overlap_ticks: 0, legato_max_gap_ticks: None, swing: None,
         }));
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut view = DawView::new(host, project, None, String::new(), cx);
@@ -2844,12 +2984,60 @@ mod tests {
     }
 
     #[gpui::test]
+    fn laptop_piano_auditions_and_step_enters_notes_only_while_enabled(cx: &mut gpui::TestAppContext) {
+        use daw_core::project::Pattern;
+
+        let (host, commands, _audio) = Host::headless();
+        let (view, cx) = cx.add_window_view(|window, cx| {
+            let mut project = Project::default_project();
+            let Pattern::PianoRoll(pattern) = &mut project.patterns[1] else { panic!("piano roll") };
+            pattern.notes.clear();
+            let mut view = DawView::new(host, project, None, String::new(), cx);
+            view.sf2_missing = false;
+            view.st.select_track("t2");
+            view.st.active_dock = DockTab::PianoRoll;
+            view.st.dock_h = 350.;
+            view.root_focus.focus(window);
+            view
+        });
+        cx.simulate_resize(size(px(1000.), px(700.)));
+        cx.run_until_parked();
+
+        cx.simulate_keystrokes("z");
+        let keyboard = cx.debug_bounds("pr-computer-piano").unwrap().center();
+        cx.simulate_click(keyboard, gpui::Modifiers::default());
+        cx.simulate_keystrokes("z s right w left w escape b");
+        view.read_with(cx, |view, _| {
+            let Pattern::PianoRoll(pattern) = &view.st.project.patterns[1] else { panic!("piano roll") };
+            let notes: Vec<_> = pattern.notes.iter().map(|note| (note.pitch, note.tick, note.duration)).collect();
+            assert_eq!(notes, [(60, 0, 30), (61, 30, 30), (74, 90, 30)]);
+            assert!(view.piano_step_input.is_none());
+        });
+
+        cx.simulate_keystrokes("l ctrl-z");
+        view.read_with(cx, |view, _| {
+            let Pattern::PianoRoll(pattern) = &view.st.project.patterns[1] else { panic!("piano roll") };
+            assert!(pattern.notes.len() < 3, "Ctrl+Z should undo the step entry");
+        });
+
+        let preview: Vec<_> = commands.try_iter().filter_map(|command| match command {
+            SequencerCommand::Audition { track_id, notes } => {
+                assert_eq!(track_id, "t2");
+                Some(notes[0].pitch)
+            }
+            _ => None,
+        }).collect();
+        assert_eq!(preview, [60, 61, 74, 74]);
+    }
+
+    #[gpui::test]
     fn piano_keyboard_stays_visible_on_horizontal_scroll_and_auditions_sharps(cx: &mut gpui::TestAppContext) {
         let (host, commands, _audio) = Host::headless();
         let mut project = Project::default_project();
         project.patterns.push(daw_core::project::Pattern::PianoRoll(daw_core::project::PianoRollPattern {
             id: "keyboard.1".into(), name: "Keys".into(), bars: 8, ticks_per_bar: 480, legato: false,
             notes: vec![daw_core::project::Note { pitch: 60, tick: 0, duration: 120, vel: 88 }],
+            cc_events: Vec::new(), pitch_bends: Vec::new(), legato_overlap_ticks: 0, legato_max_gap_ticks: None, swing: None,
         }));
         let (view, cx) = cx.add_window_view(|_, cx| {
             let mut view = DawView::new(host, project, None, String::new(), cx);
@@ -2945,10 +3133,11 @@ mod tests {
             p.patterns.retain(|pat| !p.tracks.iter().any(|tr| tr.id == id && tr.patterns.contains(&pat.id().to_string())));
             p.patterns.push(daw_core::project::Pattern::PianoRoll(daw_core::project::PianoRollPattern {
                 id: pid.clone(), name: format!("Long {t}"), bars: 100, ticks_per_bar: 480, legato: false, notes,
+                cc_events: Vec::new(), pitch_bends: Vec::new(), legato_overlap_ticks: 0, legato_max_gap_ticks: None, swing: None,
             }));
             let track = p.tracks.iter_mut().find(|tr| tr.id == id).unwrap();
             track.patterns = vec![pid.clone()];
-            p.arrangement.push(daw_core::project::ArrangementSlot { track: id, pattern: pid, bar: 0, len_bars: Some(100), offset_ticks: 0 });
+            p.arrangement.push(daw_core::project::ArrangementSlot { track: id, pattern: pid, bar: 0, len_bars: Some(100), offset_ticks: 0, gain: 1.0 });
         }
         p.validate().unwrap();
         p
@@ -3065,6 +3254,7 @@ mod tests {
                 Note { pitch: 72, tick: 240, duration: 120, vel: 100 },
                 Note { pitch: 42, tick: 600, duration: 120, vel: 100 },
             ], legato: false,
+            cc_events: Vec::new(), pitch_bends: Vec::new(), legato_overlap_ticks: 0, legato_max_gap_ticks: None, swing: None,
         });
         let marks = clip_preview_marks(&pr, 120.0, 40.0, 960);
         assert_eq!(marks.len(), 4, "two notes × two repetitions: {marks:?}");
@@ -3105,6 +3295,7 @@ mod tests {
                 },
             ],
             gate: 0.5,
+            swing: None,
         });
         let marks = clip_preview_marks(&sp, 60.0, 40.0, 480);
         assert_eq!(marks.len(), 3, "{marks:?}");
@@ -3120,6 +3311,7 @@ mod tests {
                 .map(|i| Note { pitch: 60, tick: i % 480, duration: 30, vel: 100 })
                 .collect(),
             legato: false,
+            cc_events: Vec::new(), pitch_bends: Vec::new(), legato_overlap_ticks: 0, legato_max_gap_ticks: None, swing: None,
         });
         assert!(clip_preview_marks(&big, 6000.0, 40.0, 48_000).len() <= 256);
     }

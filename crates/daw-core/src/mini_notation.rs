@@ -331,6 +331,7 @@ pub fn compile(input: &str, id: &str, name: &str, bars: u8, ticks_per_bar: u32, 
         bars: bars.max(1),
         ticks_per_bar,
         notes: to_notes(&events, total, vel), legato: false,
+        cc_events: Vec::new(), pitch_bends: Vec::new(), legato_overlap_ticks: 0, legato_max_gap_ticks: None, swing: None,
     })
 }
 

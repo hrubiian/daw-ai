@@ -1,9 +1,16 @@
 use super::*;
 
+#[cfg(test)]
 pub(super) fn playhead_time(tick: u32, bpm: f64) -> String {
-    use daw_core::musical_time::{seconds_per_bar, TICKS_PER_BAR};
+    playhead_time_with_map(tick, bpm, &[])
+}
 
-    let seconds = f64::from(tick) * seconds_per_bar(bpm) / f64::from(TICKS_PER_BAR);
+pub(super) fn playhead_time_with_map(
+    tick: u32,
+    bpm: f64,
+    tempo_changes: &[daw_core::project::TempoPoint],
+) -> String {
+    let seconds = daw_core::musical_time::tick_to_seconds(bpm, tempo_changes, tick);
     let millis = (seconds * 1000.).round() as u64;
     let hours = millis / 3_600_000;
     let minutes = millis / 60_000 % 60;
@@ -154,7 +161,7 @@ impl DawView {
             }
         }
         self.recorder.punch_window = if lr.punch_in || lr.punch_out {
-            let (s, e) = lr.ticks();
+            let (s, e) = lr.ticks_in(self.st.project.ticks_per_bar());
             Some((
                 if lr.punch_in { s } else { 0 },
                 if lr.punch_out { e } else { u32::MAX },
@@ -165,6 +172,7 @@ impl DawView {
         self.push_live();
         let ph = self.st.playhead();
         self.recorder.start(ph);
+        self.piano_step_input = None;
         self.midi_recording = true;
         self.st.set_status("recording MIDI…");
     }

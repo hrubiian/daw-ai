@@ -26,6 +26,7 @@ pub fn render(frame: &mut Frame, area: Rect, app: &App) {
             Instrument::AudioFile { .. } => String::new(), // waveform rendered as its own span
             Instrument::Sampler { pads } => format!("smplr ({} pads)", pads.len()),
             Instrument::Clap(slot) => format!("clap {}", slot.id),
+            Instrument::Sfz { path } => format!("sfz {}", std::path::Path::new(path).file_stem().and_then(|s| s.to_str()).unwrap_or(path)),
         };
         let vol_filled = (t.volume * 10.0) as usize;
         let vol_bar = format!(
@@ -212,10 +213,11 @@ fn add_track(app: &mut App, track_type: TrackType) {
     };
 
     // Create a blank pattern for non-audio tracks and attach it immediately.
+    let steps = app.project.steps_per_bar() as usize;
+    let tpb = app.project.ticks_per_bar();
     let pattern_ids: Vec<String> = match track_type {
         TrackType::Audio => vec![],
         TrackType::Drum => {
-            let steps = 16usize;
             let pat = Pattern::Step(StepPattern {
                 id:    format!("p{p_idx}"),
                 name:  format!("Pattern {p_idx}"),
@@ -227,6 +229,7 @@ fn add_track(app: &mut App, track_type: TrackType) {
                     StepRow { name: "HH".into(),    pitch: 42, vel: 52, steps: vec![0; steps] },
                 ],
                 gate: 0.5,
+                swing: None,
             });
             app.project.patterns.push(pat);
             vec![format!("p{p_idx}")]
@@ -236,9 +239,14 @@ fn add_track(app: &mut App, track_type: TrackType) {
                 id:           format!("p{p_idx}"),
                 name:         format!("Pattern {p_idx}"),
                 bars:         4,
-                ticks_per_bar: 480,
+                ticks_per_bar: tpb,
                 notes:        vec![],
                 legato:       false,
+                cc_events:    Vec::new(),
+                pitch_bends:  Vec::new(),
+                legato_overlap_ticks: 0,
+                legato_max_gap_ticks: None,
+                swing:        None,
             });
             app.project.patterns.push(pat);
             vec![format!("p{p_idx}")]
@@ -255,9 +263,12 @@ fn add_track(app: &mut App, track_type: TrackType) {
         muted: false,
         patterns: pattern_ids,
         effects: daw_core::EffectChain::default(),
+        comments: Vec::new(),
+        volume_automation: Vec::new(),
         modulators: Vec::new(),
         clap_fx: Vec::new(),
         tuning_cents: 0.0,
+        pitch_bend_range_semitones: 2,
         input: None,
     });
 

@@ -109,18 +109,27 @@ fn excerpt(path: &Path, offset: f64, duration: f64, limit: f64) -> Result<(Vec<f
 /// Small PCM audio block for clients that can receive audio from MCP.
 pub fn preview(report: &JobReport, offset: f64, duration: f64) -> Result<Vec<u8>> {
     let (samples, rate) = excerpt(render_wav(report)?, offset, duration, 6.0)?;
+    encode_preview(&samples, rate, false)
+}
+
+pub(crate) fn encode_preview(samples: &[f32], rate: u32, stereo: bool) -> Result<Vec<u8>> {
     let mut bytes = Cursor::new(Vec::new());
     let spec = hound::WavSpec {
-        channels: 1,
+        channels: if stereo { 2 } else { 1 },
         sample_rate: rate,
         bits_per_sample: 16,
         sample_format: hound::SampleFormat::Int,
     };
     let mut writer = hound::WavWriter::new(&mut bytes, spec)?;
     let (frames, _) = samples.as_chunks::<2>();
+    let pcm = |sample: f32| (sample.clamp(-1.0, 1.0) * f32::from(i16::MAX)).round() as i16;
     for &[left, right] in frames {
-        let mono = (left * 0.5 + right * 0.5).clamp(-1.0, 1.0);
-        writer.write_sample((mono * f32::from(i16::MAX)).round() as i16)?;
+        if stereo {
+            writer.write_sample(pcm(left))?;
+            writer.write_sample(pcm(right))?;
+        } else {
+            writer.write_sample(pcm(left * 0.5 + right * 0.5))?;
+        }
     }
     writer.finalize()?;
     Ok(bytes.into_inner())

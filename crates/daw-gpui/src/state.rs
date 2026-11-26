@@ -1,6 +1,8 @@
 use crate::app::TopMenu;
 use daw_core::project::Project;
-use daw_core::sequencer::{TICKS_PER_BAR, TICKS_PER_BEAT};
+#[cfg(test)]
+use daw_core::sequencer::TICKS_PER_BAR;
+use daw_core::sequencer::TICKS_PER_BEAT;
 use std::collections::HashSet;
 use std::path::PathBuf;
 
@@ -238,7 +240,7 @@ impl HeadlessState {
 
     /// Zero-based bar index the playhead currently sits in.
     pub fn current_bar(&self) -> u32 {
-        self.playhead / TICKS_PER_BAR
+        self.playhead / self.project.ticks_per_bar()
     }
 
     pub fn select_track(&mut self, id: &str) {
@@ -319,6 +321,7 @@ impl HeadlessState {
             daw_core::project::Instrument::Soundfont { preset, .. } => format!("GM preset {preset}"),
             daw_core::project::Instrument::Sampler { .. } => "sampler".into(),
             daw_core::project::Instrument::AudioFile { .. } => "audio".into(),
+            daw_core::project::Instrument::Sfz { path } => format!("sfz {path}"),
         };
         let confirmed = matches!(&self.pending_instrument,
             Some((t, p, id, at)) if t == tid && p == path && id == plugin_id && now.duration_since(*at) <= INSTRUMENT_CONFIRM_WINDOW);

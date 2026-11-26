@@ -6,6 +6,14 @@ use std::sync::{
     Arc,
 };
 
+/// QWERTY note keys shared by the terminal and desktop piano modes.
+pub fn computer_key_pitch(key: char) -> Option<u8> {
+    ["zsxdcvgbhnjm", "q2w3er5t6y7u"]
+        .into_iter()
+        .zip([60, 72])
+        .find_map(|(keys, base)| keys.find(key).map(|offset| base + offset as u8))
+}
+
 pub enum MidiEvent {
     NoteOn        { pitch: u8, velocity: u8 },
     NoteOff       { pitch: u8 },

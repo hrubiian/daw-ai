@@ -207,7 +207,14 @@ impl Jobs {
                 anyhow::ensure!(assets == format::asset_fingerprints(&runtime, &sf2)?, "assets changed during render; retry with stable inputs");
                 let left: Vec<_> = audio.iter().step_by(2).copied().collect();
                 let right: Vec<_> = audio.iter().skip(1).step_by(2).copied().collect();
-                let analysis = serde_json::to_value(crate::analysis::analyze(&left, &right, sr, runtime.project.bpm))?;
+                let analysis = serde_json::to_value(crate::analysis::analyze_with_timing(
+                    &left,
+                    &right,
+                    sr,
+                    runtime.project.bpm,
+                    runtime.project.time_signature,
+                    &runtime.tempo_changes,
+                ))?;
                 control.check()?;
                 let dir = &directory;
                 let wav = dir.join("audio.wav");

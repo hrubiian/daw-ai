@@ -52,7 +52,14 @@ impl DawView {
                     this.st.arrange_zoom = 1.;
                     this.scroll_timeline_to(0., window);
                     cx.notify();
-                })));
+                })))
+            .child(theme.cell_btn_with_help(
+                "volume-automation", "Volume automation", self.volume_automation_open, self.accent(),
+                "Click to add a point. Drag to move it. Right-click to remove it.".into(),
+            ).on_click(cx.listener(|this, _, _, cx| {
+                this.volume_automation_open = !this.volume_automation_open;
+                cx.notify();
+            })));
         div()
             .flex()
             .items_center()

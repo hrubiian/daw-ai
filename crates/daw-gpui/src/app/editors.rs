@@ -2,6 +2,7 @@ use super::*;
 
 pub(super) const EDITOR_TABS_H: f32 = 32.;
 const PIANO_SCROLL_INSET: f32 = 8.;
+const TICKS_PER_COL: u32 = daw_core::musical_time::TICKS_PER_BEAT / 4;
 
 #[derive(Clone)]
 struct PianoTimeDrag;
@@ -45,6 +46,9 @@ impl DawView {
                     .child(tab.label())
                     .on_click(cx.listener(move |this, _ev, _w, cx| {
                         this.st.active_dock = tab;
+                        if tab != DockTab::PianoRoll {
+                            this.piano_step_input = None;
+                        }
                         if compact_mixer {
                             this.st.mixer_open = false;
                         }
@@ -127,7 +131,7 @@ impl DawView {
         let gate = sp.gate;
         // Steps are 16th notes (30 ticks); the play column wraps over the
         // whole pattern length (steps × 30).
-        let ticks_per_step = daw_core::sequencer::TICKS_PER_BAR / 16;
+        let ticks_per_step = daw_core::sequencer::TICKS_PER_BEAT / 4;
         let pat_len = (steps as u32 * ticks_per_step).max(1);
         let play_step = ((self.st.playhead() % pat_len) / ticks_per_step) as usize;
 
@@ -285,11 +289,95 @@ impl DawView {
         }).unwrap_or(0.5)
     }
 
+    fn toggle_piano_step_input(&mut self) -> bool {
+        let Some((_, len)) = self.open_pr_pattern() else { return false };
+        let Some(pid) = self.st.selected_pattern_id() else { return false };
+        if self.midi_recording
+            || self.selected_track_is_audio()
+            || !self.st.track_pattern_ids().contains(&pid)
+        {
+            return false;
+        }
+        self.piano_step_input = if self.piano_step_tick(&pid).is_some() {
+            None
+        } else {
+            let first_col = (-f32::from(self.piano_scroll.offset().x) / PR_COL_W) as u32;
+            Some((pid, first_col.min(len.saturating_sub(1) / TICKS_PER_COL) * TICKS_PER_COL))
+        };
+        true
+    }
+
+    fn piano_step_tick(&self, pid: &str) -> Option<u32> {
+        self.piano_step_input.as_ref().filter(|(id, _)| id == pid).map(|(_, tick)| *tick)
+    }
+
+    fn place_piano_step_cursor(&mut self, pid: &str, col: u32) -> bool {
+        let Some((id, tick)) = &mut self.piano_step_input else { return false };
+        if id != pid { return false; }
+        *tick = col * TICKS_PER_COL;
+        true
+    }
+
+    pub(super) fn handle_piano_step_key(&mut self, event: &KeyDownEvent) -> bool {
+        let stroke = &event.keystroke;
+        if stroke.modifiers.modified() { return false; }
+        if stroke.key == "l" {
+            return !event.is_held && self.toggle_piano_step_input();
+        }
+        let Some(pid) = self.st.selected_pattern_id() else { return false };
+        let Some(tick) = self.piano_step_tick(&pid) else { return false };
+        if stroke.key == "escape" {
+            self.piano_step_input = None;
+            return true;
+        }
+        let Some((idx, len)) = self.open_pr_pattern() else { return false };
+        let tick = tick.min(len);
+        let next_tick = match stroke.key.as_str() {
+            "left" => tick.saturating_sub(1) / TICKS_PER_COL * TICKS_PER_COL,
+            "right" => (tick + TICKS_PER_COL).min(len),
+            key => {
+                let mut chars = key.chars();
+                let Some(key) = chars.next().filter(|_| chars.next().is_none()) else { return false };
+                let Some(pitch) = daw_io::midi::computer_key_pitch(key) else { return false };
+                if event.is_held { return true; }
+                let Some(track_id) = self.st.selected_track.clone() else { return false };
+                if tick < len {
+                    let daw_core::project::Pattern::PianoRoll(pattern) = &self.st.project.patterns[idx] else { return false };
+                    if !pattern.notes.iter().any(|note| note.pitch == pitch && note.tick == tick) {
+                        let duration = TICKS_PER_COL.min(len - tick);
+                        self.edit("piano step input", |project| { project.toggle_note(&pid, pitch, tick, duration); });
+                    }
+                }
+                let bpm = self.st.project.project.bpm;
+                self.audition_piano_note(track_id, pitch, 80, (60_000. / bpm / 4.).round() as u32);
+                (tick + TICKS_PER_COL).min(len)
+            }
+        };
+        self.piano_step_input = Some((pid, next_tick));
+        self.scroll_to_piano_step(next_tick.min(len.saturating_sub(1)) / TICKS_PER_COL);
+        true
+    }
+
+    fn scroll_to_piano_step(&self, col: u32) {
+        let offset = self.piano_scroll.offset();
+        let width = f32::from(self.piano_scroll.bounds().size.width) - PR_KEYBOARD_GUTTER - 2. * PIANO_SCROLL_INSET;
+        let left = -f32::from(offset.x);
+        let x = col as f32 * PR_COL_W;
+        let wanted = left.clamp(x + PR_COL_W - width.max(PR_COL_W), x);
+        self.piano_scroll.set_offset(gpui::point(
+            px(-wanted).clamp(-self.piano_scroll.max_offset().width, px(0.)), offset.y,
+        ));
+    }
+
+    fn audition_piano_note(&self, track_id: String, pitch: u8, velocity: u8, dur_ms: u32) {
+        let note = daw_core::audition::AuditionNote { pitch, velocity, start_ms: 0, dur_ms };
+        let _ = self.send_command(SequencerCommand::Audition { track_id, notes: vec![note] });
+    }
+
     /// Pitch×time grid editor for the selected pattern (when it's piano-roll).
     pub(super) fn piano_roll_editor(&mut self, cx: &mut Context<Self>) -> gpui::Div {
         let theme = self.theme();
         let accent = self.accent();
-        const TICKS_PER_COL: u32 = 30; // Sixteenth notes in supported 4/4 (480/bar).
         let Some(pid) = self.st.selected_pattern_id() else {
             return theme.dock_hint("Select a track with a piano-roll pattern.");
         };
@@ -336,6 +424,8 @@ impl DawView {
         let pressed_keys = self.piano_pressed_keys();
         let track = self.st.selected_track.as_deref();
         let play_col = ((self.st.playhead() % pat_len.max(1)) / TICKS_PER_COL) as usize;
+        let step_tick = self.piano_step_tick(&pid);
+        let step_col = step_tick.filter(|&tick| tick < pat_len).map(|tick| (tick / TICKS_PER_COL) as usize);
 
         // Slim toolbar: pattern length in bars (notes auto-grow it too).
         let pr_bars = pr.bars;
@@ -365,7 +455,20 @@ impl DawView {
                 this.st.project.set_legato(&pbl, !legato_on);
                 this.push_live();
                 cx.notify();
-            })));
+            })))
+            .child(theme.cell_btn_with_help(
+                "pr-computer-piano", "Laptop keys", step_tick.is_some(), accent,
+                "L toggles laptop-key step input. Click the grid or use ←/→ to move. Esc exits.".into(),
+            ).on_click(cx.listener(|this, _, window, cx| {
+                if this.toggle_piano_step_input() {
+                    this.root_focus.focus(window);
+                    cx.notify();
+                }
+            })))
+            .children(step_tick.map(|tick| {
+                if tick >= pat_len { "End of pattern".into() }
+                else { format!("Step {}", tick / TICKS_PER_COL + 1) }
+            }));
 
         // Only the pitch rows inside the scrolled viewport are built (plus a
         // margin); spacers keep the document height, so scrolling is unchanged.
@@ -389,7 +492,8 @@ impl DawView {
                         }
                         let origin = bounds.origin + gpui::point(px(col as f32 * PR_COL_W + 1.), px(1.));
                         let rect = Bounds::new(origin, size(px(PR_COL_W - 2.), px(PR_ROW_H - 2.)));
-                        let color = if col == play_col { theme.panel_alt } else { row_bg };
+                        let color = if Some(col) == step_col { theme.step_playing }
+                            else if col == play_col { theme.panel_alt } else { row_bg };
                         window.paint_quad(gpui::fill(rect, rgb(color)));
                     }
                 },
@@ -420,8 +524,12 @@ impl DawView {
                     .on_drag(NoteStretch { pid: pid.clone(), pitch, tick: note_tick }, |_, _, _, cx| cx.new(|_| EmptyDrag))
                     .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                         cx.stop_propagation();
-                        this.undo.record("note dynamics", &this.st.project);
                         let modifiers = event.modifiers();
+                        if !modifiers.modified() && this.place_piano_step_cursor(&pattern, col as u32) {
+                            cx.notify();
+                            return;
+                        }
+                        this.undo.record("note dynamics", &this.st.project);
                         if modifiers.shift {
                             this.st.project.set_note_velocity(&pattern, pitch, note_tick, info.velocity.saturating_add(16).min(127));
                         } else if modifiers.alt {
@@ -447,6 +555,10 @@ impl DawView {
                 }).into())
                 .on_click(cx.listener(move |this, event: &gpui::ClickEvent, _, cx| {
                     let Some(col) = this.piano_column_at(event.position().x, cols) else { return; };
+                    if !event.modifiers().modified() && this.place_piano_step_cursor(&pattern, col) {
+                        cx.notify();
+                        return;
+                    }
                     if row_cells.contains_key(&(pitch, col)) { return; }
                     this.undo.record("toggle note", &this.st.project);
                     this.st.project.toggle_note(&pattern, pitch, col * TICKS_PER_COL, TICKS_PER_COL);
@@ -656,8 +768,7 @@ impl DawView {
             .on_click(cx.listener(move |this, _, _, cx| {
                 cx.stop_propagation();
                 if let Some(track_id) = &track {
-                    let note = daw_core::audition::AuditionNote { pitch, velocity: 88, start_ms: 0, dur_ms: 240 };
-                    let _ = this.send_command(SequencerCommand::Audition { track_id: track_id.clone(), notes: vec![note] });
+                    this.audition_piano_note(track_id.clone(), pitch, 88, 240);
                 }
             }))
     }

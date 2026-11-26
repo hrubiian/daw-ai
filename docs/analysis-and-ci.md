@@ -12,6 +12,8 @@ For revision-linked background jobs, cancellation and A/B artifacts, see [live c
 |---|---|---|
 | Overall levels / clipping / spectral tilt of the whole mix | `listen` | yes |
 | **Which tracks** are muddy / **which tracks mask** each other | `analyze_mix` | yes (per-track solo) |
+| Where does each track go quiet or change level? | `check_tracks` | yes (per-track solo) |
+| What does a track sound like at a transition? | `listen_track` | yes (stereo excerpt) |
 | Does the piece **build** or is it a flat, static texture? | `analyze_arrangement` | yes (one mix render) |
 | How close are the written patterns to the grid? | `analyze_groove` | no (symbolic) |
 | Is a bass hit ahead of or behind the kick? | `compare_groove` | no (scheduled note events) |
@@ -35,6 +37,25 @@ For revision-linked background jobs, cancellation and A/B artifacts, see [live c
 - **`analyze_groove`** — how notes sit against the 16th grid (on-grid % +
   micro-timing spread) plus `swing`/`humanize`/`timing`; flags `mechanical`.
   This summarizes pattern definitions and settings.
+
+## Check and audition individual tracks
+
+1. Call `project_summary` for track IDs. Run `check_tracks` with the bars you
+   want to review. Omit `track_ids` to check every track. The default is eight
+   bars from the requested start, and each request can cover up to 32 bars.
+2. Look at `has_clip` and `quiet` together. A quiet bar with a clip can be an
+   authored rest, a fade, or a track worth investigating. The report includes
+   saved mute state, per-track render errors, post-master peak/RMS, stereo
+   correlation, and dB changes between consecutive audible bars.
+3. Call `listen_track` with the track ID, zero-based `start_bar`, and an optional
+   `duration_seconds` of 0.25–6 seconds. It returns a stereo WAV in the MCP
+   response and measurements for exactly that excerpt. You can audition a muted
+   track while keeping its saved mute state.
+
+Both tools use one saved-project or live-session snapshot per call and leave the
+project and transport untouched. Bar numbers in their structured reports are
+zero-based. For cross-track masking use `analyze_mix`. For a longer WAV on disk
+use `start_listen` with the desired track IDs.
 
 ## Compare two parts
 
@@ -86,20 +107,28 @@ regression-tested.
   `FAIL` new clipping · `WARN` peak jump / band drift / lost tracks or notes ·
   `INFO` loudness move. Deterministic render ⇒ a re-render with no edits passes.
 
-## A typical loop
+## A typical loop (with the Two-Stave Melody Gate)
 
 ```
-compose (apply_mini_notation / set_steps / set_notes)
-  → listen                     # overall level & tilt
-  → analyze_mix                # any masking? who?
-  → analyze_arrangement        # does it build, or is it flat?
-  → analyze_groove             # human feel, or mechanical?
+write 2-stave Lead + Accompaniment reduction
+  → analyze_melody             # contour, rests, rhythmic variety, motif recurrence, overlaps
+  → listen                     # verify the theme sings on its own before adding layers
+  → orchestrate + shape dynamics (set_volume_automation, set_clip_gain, set_pattern_cc, set_legato)
+  → analyze_mix(lead_track_id) # active-bar spectral balance, overlapping masking & per-bar LAR
+  → analyze_arrangement        # does it build (MIDI + audio clips), or is it flat?
+  → analyze_groove             # human feel, or grid-locked mechanical lead?
   → fix (edit) ; auto_balance  # levels
   → snapshot                   # bank a known-good baseline
   … later edits …
   → check                      # did anything regress?
   → diff_project <baseline>    # what exactly changed
 ```
+
+### Foreground & Melody Tools
+
+- **`analyze_melody(track_id, start_bar?, end_bar?)`** — symbolic audit of an arranged melodic track: interval step/leap mix, rhythmic diversity, breathing rests, 3-interval motif recurrence across phrases, velocity variance, and accompaniment mid-register collisions.
+- **`analyze_mix(lead_track_id?, start_bar?, end_bar?)`** — profiles each track strictly over its **active bars** (MIDI clips + audio clips), flags frequency masking only when tracks overlap in time, and when `lead_track_id` is passed reports per-bar 500–6000 Hz Lead-to-Accompaniment Ratio (`LAR`), flagging `BURIAL` (`< 0 dB`) or `CROWDED FOREGROUND`.
+- **`set_volume_automation`**, **`set_clip_gain`**, **`set_pattern_cc`**, **`set_legato(..., overlap_ticks?, max_gap_ticks?)`** — ride accompaniment levels under soloists and sculpt sustain (`CC64`), expression (`CC11`), and vibrato (`CC1`) directly in patterns.
 
 ## Designing sounds (Surge XT)
 

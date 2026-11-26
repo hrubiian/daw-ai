@@ -464,16 +464,18 @@ impl App {
         let buf = self.repl_bufs.get(&track_id).cloned().unwrap_or_default();
         if buf.trim().is_empty() { self.repl_status = "empty — type some mini-notation".into(); return; }
 
+        let spb = self.project.steps_per_bar();
+        let tpb = self.project.ticks_per_bar();
         let (pid, bars) = match track.patterns.first().cloned() {
             Some(pid) => {
                 let bars = self.project.patterns.iter()
-                    .find(|p| p.id() == pid).map(|p| p.bars() as u8).unwrap_or(1);
+                    .find(|p| p.id() == pid).map(|p| p.bars_in(spb) as u8).unwrap_or(1);
                 (pid, bars.max(1))
             }
             None => (format!("live_{track_id}"), 1),
         };
 
-        match daw_core::mini_notation::compile(&buf, &pid, "live", bars, 480, 100) {
+        match daw_core::mini_notation::compile(&buf, &pid, "live", bars, tpb, 100) {
             Ok(pat) => {
                 let n = pat.notes.len();
                 let pattern = daw_core::project::Pattern::PianoRoll(pat);
@@ -847,6 +849,7 @@ impl App {
             bar,
             offset_ticks: 0,
             len_bars: None,
+            gain: 1.0,
         });
         self.send(SequencerCommand::UpdateLive(self.project.clone()));
     }
@@ -964,9 +967,12 @@ mod tests {
             volume: 1.0, pan: 0.0, muted: false,
             patterns: vec![],
             effects: EffectChain::default(),
+            comments: Vec::new(),
+            volume_automation: Vec::new(),
             modulators: Vec::new(),
             clap_fx: Vec::new(),
             tuning_cents: 0.0,
+            pitch_bend_range_semitones: 2,
             input: None,
         }
     }
@@ -979,9 +985,12 @@ mod tests {
             volume: 1.0, pan: 0.0, muted: false,
             patterns: vec![],
             effects: EffectChain::default(),
+            comments: Vec::new(),
+            volume_automation: Vec::new(),
             modulators: Vec::new(),
             clap_fx: Vec::new(),
             tuning_cents: 0.0,
+            pitch_bend_range_semitones: 2,
             input: None,
         }
     }
@@ -994,9 +1003,12 @@ mod tests {
             volume: 1.0, pan: 0.0, muted: false,
             patterns: vec![],
             effects: EffectChain::default(),
+            comments: Vec::new(),
+            volume_automation: Vec::new(),
             modulators: Vec::new(),
             clap_fx: Vec::new(),
             tuning_cents: 0.0,
+            pitch_bend_range_semitones: 2,
             input: None,
         }
     }

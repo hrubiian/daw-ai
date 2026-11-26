@@ -82,6 +82,29 @@ const SPEC_F_HI: f32 = 16_000.0;
 const SPEC_WIN: usize = 2048;
 
 pub fn analyze(l: &[f32], r: &[f32], sample_rate: u32, bpm: f64) -> AnalysisReport {
+    analyze_from_bar_with_timing(l, r, sample_rate, bpm, [4, 4], &[], 0)
+}
+
+pub fn analyze_with_timing(
+    l: &[f32],
+    r: &[f32],
+    sample_rate: u32,
+    bpm: f64,
+    time_signature: [u8; 2],
+    tempo_changes: &[daw_core::project::TempoPoint],
+) -> AnalysisReport {
+    analyze_from_bar_with_timing(l, r, sample_rate, bpm, time_signature, tempo_changes, 0)
+}
+
+pub(crate) fn analyze_from_bar_with_timing(
+    l: &[f32],
+    r: &[f32],
+    sample_rate: u32,
+    bpm: f64,
+    time_signature: [u8; 2],
+    tempo_changes: &[daw_core::project::TempoPoint],
+    first_bar: u32,
+) -> AnalysisReport {
     let n = l.len().min(r.len());
     let mut peak = 0f32;
     let mut sum_sq = 0f64;
@@ -107,23 +130,27 @@ pub fn analyze(l: &[f32], r: &[f32], sample_rate: u32, bpm: f64) -> AnalysisRepo
         1.0
     };
 
-    // Per-bar RMS (mono mix; 4/4 bars).
+    // Per-bar RMS uses both channels, so stereo phase cancellation cannot
+    // hide an audible bar. Subtract the exact start sample for range renders.
     let bpm = bpm.max(1.0);
-    let samples_per_bar = daw_core::musical_time::seconds_per_bar(bpm) * sample_rate as f64;
+    let bar_sec = daw_core::musical_time::seconds_per_bar_for(bpm, time_signature);
+    let samples_per_bar = bar_sec * sample_rate as f64;
     let mut bar_rms_db = Vec::new();
-    if samples_per_bar >= 1.0 {
-        let bars = (n as f64 / samples_per_bar).ceil() as u32;
-        for bi in 0..bars {
-            let lo = daw_core::musical_time::bar_sample(bi, bpm, sample_rate) as usize;
-            let hi = (daw_core::musical_time::bar_sample(bi + 1, bpm, sample_rate) as usize).min(n);
+    if samples_per_bar >= 1.0 && sample_rate > 0 {
+        let origin = daw_core::musical_time::bar_sample_map(first_bar, bpm, time_signature, tempo_changes, sample_rate);
+        let mut bi = 0u32;
+        loop {
+            let bar = first_bar + bi;
+            let lo = (daw_core::musical_time::bar_sample_map(bar, bpm, time_signature, tempo_changes, sample_rate) - origin) as usize;
+            let hi = ((daw_core::musical_time::bar_sample_map(bar + 1, bpm, time_signature, tempo_changes, sample_rate) - origin) as usize).min(n);
             // Subtracting two rounded range boundaries can leave one extra
             // frame. It is rounding residue, not a meaningful additional bar.
-            if hi <= lo || (bi > 0 && n.saturating_sub(lo) <= 1) { break; }
+            if lo >= n || hi <= lo || (bi > 0 && n.saturating_sub(lo) <= 1) { break; }
             let energy: f64 = (lo..hi).map(|i| {
-                let mono = (l[i] + r[i]) / 2.0;
-                (mono as f64).powi(2)
+                (f64::from(l[i]).powi(2) + f64::from(r[i]).powi(2)) * 0.5
             }).sum();
-            bar_rms_db.push((bi + 1, db((energy / (hi - lo) as f64).sqrt() as f32)));
+            bar_rms_db.push((bar + 1, db((energy / (hi - lo) as f64).sqrt() as f32)));
+            bi += 1;
         }
     }
 
@@ -144,12 +171,21 @@ pub fn analyze(l: &[f32], r: &[f32], sample_rate: u32, bpm: f64) -> AnalysisRepo
 
 /// Analyze a WAV file at its native sample rate.
 pub fn analyze_wav_file(path: &std::path::Path, bpm: f64) -> Result<AnalysisReport, String> {
+    analyze_wav_file_with_timing(path, bpm, [4, 4], &[])
+}
+
+pub fn analyze_wav_file_with_timing(
+    path: &std::path::Path,
+    bpm: f64,
+    time_signature: [u8; 2],
+    tempo_changes: &[daw_core::project::TempoPoint],
+) -> Result<AnalysisReport, String> {
     let sr = hound::WavReader::open(path)
         .map_err(|e| format!("cannot open {}: {e}", path.display()))?
         .spec()
         .sample_rate;
     let (l, r) = daw_core::audio::load_wav_stereo(path, sr).map_err(|e| e.to_string())?;
-    Ok(analyze(&l, &r, sr, bpm))
+    Ok(analyze_with_timing(&l, &r, sr, bpm, time_signature, tempo_changes))
 }
 
 impl AnalysisReport {

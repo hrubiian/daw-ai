@@ -21,6 +21,7 @@ pub mod audio {
 
     pub mod mp3;
     pub mod scheduling;
+    pub mod sfz;
     pub(crate) mod spatial;
     pub use engine::{AudioEngine, load_wav_stereo, wav_peaks, wav_duration_sec, sec_to_sample};
     pub use balance::{auto_balance, compute_balance, BalanceResult};

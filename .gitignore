@@ -6,6 +6,8 @@ assets/*.sf2
 *.wav
 /recordings/
 /assets/samples/
+/assets/sfz/
+/assets/soundfonts/
 /assets/tesla-driver-master/
 renders/
 

@@ -3,8 +3,8 @@
 use anyhow::{ensure, Context, Result};
 use daw_core::project::{Pattern, Project, TrackType};
 use daw_core::sequencer::engine::{
-    arranged_track_patterns, note_fire_tick, pattern_length_ticks, swung_step_tick, TICKS_PER_BAR,
-    TICKS_PER_BEAT,
+    arranged_track_patterns, note_fire_tick, pattern_length_ticks, swung_piano_tick,
+    swung_step_tick, TICKS_PER_BEAT,
 };
 use serde::Serialize;
 use std::collections::{BTreeSet, HashMap};
@@ -86,10 +86,11 @@ pub fn compare(project: &Project, args: GrooveCompareArgs) -> Result<GrooveCompa
         start_bar < end_bar && end_bar - start_bar <= MAX_BARS,
         "compare 1–{MAX_BARS} bars with start_bar < end_bar"
     );
+    let tpb = project.ticks_per_bar();
     let end = end_bar
-        .checked_mul(TICKS_PER_BAR)
+        .checked_mul(tpb)
         .context("bar position is too large")?;
-    let start = start_bar * TICKS_PER_BAR;
+    let start = start_bar * tpb;
     let tolerance_ms = tolerance_ms.unwrap_or(40.0);
     ensure!(
         (0.0..=1000.0).contains(&tolerance_ms),
@@ -108,8 +109,8 @@ pub fn compare(project: &Project, args: GrooveCompareArgs) -> Result<GrooveCompa
     let mut total = OnsetCounts::default();
     let mut bars = Vec::new();
     for bar in start_bar..end_bar {
-        let bar_start = bar * TICKS_PER_BAR;
-        let bar_end = bar_start + TICKS_PER_BAR;
+        let bar_start = bar * tpb;
+        let bar_end = bar_start + tpb;
         let reference_onsets = in_range(&anchors, bar_start..bar_end).len();
         let bar_hits = in_range(&hits, bar_start..bar_end);
         let mut counts = OnsetCounts {
@@ -232,13 +233,15 @@ fn pattern_onsets(
     };
     match pattern {
         Pattern::PianoRoll(pattern) => {
+            let sw = pattern.swing.unwrap_or(0.0);
             for note in pattern.active_notes() {
                 if note.vel > 0 {
-                    hit(note.pitch, note.tick);
+                    hit(note.pitch, swung_piano_tick(note.tick, sw));
                 }
             }
         }
         Pattern::Step(pattern) => {
+            let sw = pattern.swing.unwrap_or(project.project.swing);
             for row in &pattern.rows {
                 if pitch.is_some_and(|pitch| pitch != row.pitch) {
                     continue;
@@ -247,7 +250,7 @@ fn pattern_onsets(
                     if row.step_velocity(step).is_some_and(|velocity| velocity > 0) {
                         hit(
                             row.pitch,
-                            swung_step_tick(step as u32, project.project.swing),
+                            swung_step_tick(step as u32, sw),
                         );
                     }
                 }

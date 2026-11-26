@@ -326,7 +326,7 @@ pub fn handle_key(app: &mut App, key: KeyEvent) {
             };
             let name = format!("Pattern {}", track.patterns.len() + 1);
             app.project.patterns.push(Pattern::Step(StepPattern {
-                id: new_id.clone(), name, bars: bars_n, steps: steps_n, rows, gate: gate_v,
+                id: new_id.clone(), name, bars: bars_n, steps: steps_n, rows, gate: gate_v, swing: None,
             }));
             if let Some(t) = app.project.tracks.get_mut(app.active_track) {
                 t.patterns.push(new_id);

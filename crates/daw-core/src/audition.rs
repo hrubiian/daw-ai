@@ -63,7 +63,7 @@ pub fn default_phrase(kind: PhraseKind, key: &str, scale: &str, octave: i8, bpm:
             .map(|&i| note(steps.get(i).copied().unwrap_or(0), 0, 2000))
             .collect(),
         PhraseKind::Line => {
-            let eighth = (30_000.0 / bpm.clamp(20.0, 300.0)).round() as u32;
+            let eighth = (30_000.0 / bpm.clamp(crate::musical_time::MIN_BPM, crate::musical_time::MAX_BPM)).round() as u32;
             (0..8)
                 .map(|i| {
                     let offset = steps.get(i).copied().unwrap_or(12);
@@ -114,7 +114,10 @@ pub fn audition_project(project: &Project, track_id: &str, notes: &[AuditionNote
     validate_notes(notes)?;
     let mut track = project.tracks.iter().find(|t| t.id == track_id).cloned()
         .ok_or_else(|| format!("no track '{track_id}'"))?;
+    let tpb = project.ticks_per_bar();
     let (notes, bars) = phrase_notes(notes, project.project.bpm);
+    let end = notes.iter().map(|n| n.tick + n.duration).max().unwrap_or(1);
+    let bars = bars.max(end.div_ceil(tpb).clamp(1, u8::MAX as u32) as u8);
     let pid = "audition".to_string();
     track.muted = false;
     track.patterns = vec![pid.clone()];
@@ -124,9 +127,14 @@ pub fn audition_project(project: &Project, track_id: &str, notes: &[AuditionNote
         id: pid,
         name: "Audition".into(),
         bars,
-        ticks_per_bar: TICKS_PER_BAR,
+        ticks_per_bar: tpb,
         notes,
         legato: false,
+        cc_events: Vec::new(),
+        pitch_bends: Vec::new(),
+        legato_overlap_ticks: 0,
+        legato_max_gap_ticks: None,
+        swing: None,
     })];
     out.arrangement.clear();
     out.audio_clips.clear();

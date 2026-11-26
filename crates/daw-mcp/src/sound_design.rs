@@ -112,6 +112,7 @@ fn instrument_name(i: &Instrument) -> String {
         Instrument::Sampler { .. } => "a sampler".into(),
         Instrument::AudioFile { .. } => "audio".into(),
         Instrument::Clap(c) => format!("the plugin {}", c.id),
+        Instrument::Sfz { path } => format!("the SFZ instrument {path}"),
     }
 }
 
@@ -142,9 +143,14 @@ fn place_phrase(p: &mut Project, tid: &str, uid: &str, notes: &[AuditionNote], b
             id: pid.clone(),
             name: format!("{track_name} phrase"),
             bars,
-            ticks_per_bar: daw_core::sequencer::TICKS_PER_BAR,
+            ticks_per_bar: p.ticks_per_bar(),
             notes: pnotes,
             legato: false,
+            cc_events: Vec::new(),
+            pitch_bends: Vec::new(),
+            legato_overlap_ticks: 0,
+            legato_max_gap_ticks: None,
+            swing: None,
         })),
     }
     let others: Vec<String> = p.tracks.iter().find(|t| t.id == tid).expect("track").patterns.iter().filter(|x| **x != pid).cloned().collect();
@@ -392,7 +398,8 @@ impl DawTools {
     /// The playhead's bar in live mode (the open GUI); bar 0 offline.
     fn playhead_bar(&self) -> u32 {
         if self.store.live_socket.is_some() {
-            self.store.inspect_live().map(|r| r.playback_tick / daw_core::sequencer::TICKS_PER_BAR).unwrap_or(0)
+            let tpb = self.store.load().map(|p| p.ticks_per_bar()).unwrap_or(daw_core::sequencer::TICKS_PER_BAR);
+            self.store.inspect_live().map(|r| r.playback_tick / tpb).unwrap_or(0)
         } else {
             0
         }

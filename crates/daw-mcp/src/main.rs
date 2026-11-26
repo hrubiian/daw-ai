@@ -22,8 +22,8 @@ use std::{path::PathBuf, sync::{Arc, Mutex}};
 /// the model always sees the actionable message.
 fn reply(r: Result<String, String>) -> Result<CallToolResult, McpError> {
     Ok(match r {
-        Ok(text) => CallToolResult::success(vec![Content::text(text)]),
-        Err(e) => CallToolResult::error(vec![Content::text(e)]),
+        Ok(text) => CallToolResult::success(vec![ContentBlock::text(text)]),
+        Err(e) => CallToolResult::error(vec![ContentBlock::text(e)]),
     })
 }
 
@@ -162,14 +162,32 @@ struct ModulatorsArgs {
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct TempoArgs {
-    /// Beats per minute, 20-300.
+    /// Beats per minute, 20-400.
     bpm: f64,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct TimeSignatureArgs {
+    /// Beats per bar, 1-16 (e.g. 7 for 7/4).
+    numerator: u8,
+    /// Beat unit: 2, 4, 8, or 16.
+    denominator: u8,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct TempoChangesArgs {
+    /// Ordered tempo change points [{tick, bpm, ramp?}]; tick is arrangement ticks, bpm 20-400, ramp=true linearly ramps from previous tempo. Empty clears.
+    points: serde_json::Value,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
 struct LegatoArgs {
     pattern_id: String,
     on: bool,
+    /// Overlap past next note's onset in ticks (0-240; default 0). Use 8-20 for expressive bowing/wind overlap.
+    overlap_ticks: Option<u16>,
+    /// Maximum rest gap in ticks that legato will bridge (omit to preserve; e.g. 90 preserves intentional phrasing rests).
+    max_gap_ticks: Option<u32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -211,6 +229,81 @@ struct PlaceClipArgs {
     /// Sub-bar start offset in ticks (480/bar; 240 = half a bar, 120 = one
     /// beat). Omit or 0 to start exactly on the bar line.
     offset_ticks: Option<u32>,
+    /// Per-clip gain multiplier (0.0..=2.0; default 1.0) for section-level dynamics.
+    gain: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ClipGainArgs {
+    track_id: String,
+    /// Bar the clip starts in (0-based).
+    bar: u32,
+    /// Gain multiplier (0.0..=2.0; 1.0 = unity).
+    gain: f32,
+    /// Sub-bar offset if disambiguating clips within the same bar.
+    offset_ticks: Option<u32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct VolumeAutomationArgs {
+    track_id: String,
+    /// Ordered breakpoints [{tick, gain}] where tick is arrangement ticks (480/bar) and gain is 0.0..=2.0 (empty clears).
+    points: serde_json::Value,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct PatternCcArgs {
+    pattern_id: String,
+    /// MIDI CC points [{tick, cc, value}] inside the pattern; cc in {1=mod/vibrato, 11=expression, 64=sustain pedal, 74=brightness}, value 0..=127.
+    events: serde_json::Value,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct PatternSwingArgs {
+    pattern_id: String,
+    /// Optional 8th-note swing 0.0..=1.0 for this pattern (omit or null to clear override).
+    swing: Option<f32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct TrackPitchBendRangeArgs {
+    track_id: String,
+    /// Pitch bend range in semitones (1..=24, default 2). Applied via GM RPN 0.
+    semitones: u8,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct TrackSfzArgs {
+    track_id: String,
+    /// Path to an `.sfz` instrument file (relative to project/workspace root or absolute).
+    path: String,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct PatternPitchBendsArgs {
+    pattern_id: String,
+    /// Pitch bend points [{tick, cents}] inside the pattern; cents in -2400.0..=2400.0 relative to track tuning_cents.
+    events: serde_json::Value,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AnalyzeMixArgs {
+    /// Optional protagonist track id to compute per-bar 500-6000 Hz Lead-to-Accompaniment Ratio (LAR) and foreground burial warnings.
+    lead_track_id: Option<String>,
+    /// Optional start bar (0-based) for LAR window.
+    start_bar: Option<u32>,
+    /// Optional end bar (exclusive) for LAR window.
+    end_bar: Option<u32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct AnalyzeMelodyArgs {
+    /// Track id of the melodic lead to inspect across arranged clips.
+    track_id: String,
+    /// Optional start bar (0-based).
+    start_bar: Option<u32>,
+    /// Optional end bar (exclusive).
+    end_bar: Option<u32>,
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
@@ -415,6 +508,25 @@ struct RenderArgs {
 }
 
 #[derive(serde::Deserialize, schemars::JsonSchema)]
+struct CheckTracksArgs {
+    /// Track IDs to check. Omit for every track in project order.
+    track_ids: Option<Vec<String>>,
+    /// First bar, zero-based. Defaults to 0.
+    start_bar: Option<u32>,
+    /// Exclusive end bar. Defaults to start_bar + 8. Maximum span is 32 bars.
+    end_bar: Option<u32>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
+struct ListenTrackArgs {
+    track_id: String,
+    /// Start bar of the excerpt, zero-based. Defaults to 0.
+    start_bar: Option<u32>,
+    /// Excerpt duration, 0.25–6 seconds. Defaults to 3.
+    duration_seconds: Option<f64>,
+}
+
+#[derive(serde::Deserialize, schemars::JsonSchema)]
 struct ListeningJobArgs {
     #[serde(flatten)]
     render: RenderArgs,
@@ -520,12 +632,12 @@ impl DawServer {
         }).await {
             Ok((report, bytes)) => {
                 use base64::Engine;
-                let audio = RawContent::Audio(RawAudioContent {
-                    data: base64::engine::general_purpose::STANDARD.encode(bytes),
-                    mime_type: "audio/wav".into(),
-                }).no_annotation();
+                let audio = ContentBlock::audio(
+                    base64::engine::general_purpose::STANDARD.encode(bytes),
+                    "audio/wav",
+                );
                 let paths = report.artifacts.iter().map(|path| path.display().to_string()).collect::<Vec<_>>().join(", ");
-                Ok(CallToolResult::success(vec![Content::text(format!("Mono excerpt from render {}. Full render artifacts: {paths}", report.id)), audio]))
+                Ok(CallToolResult::success(vec![ContentBlock::text(format!("Mono excerpt from render {}. Full render artifacts: {paths}", report.id)), audio]))
             }
             Err(error) => reply(Err(error)),
         }
@@ -582,7 +694,7 @@ impl DawServer {
         reply(result)
     }
 
-    #[tool(description = "Compact project overview: tracks, patterns, arrangement, clips, loop region, returns. Call this first.")]
+    #[tool(description = "Compact project overview: tracks, track comments, patterns, arrangement, clips, loop region, returns. Call this first.")]
     fn project_summary(&self) -> Result<CallToolResult, McpError> {
         reply(self.tools.project_summary())
     }
@@ -612,9 +724,19 @@ impl DawServer {
         reply(self.tools.set_track(a.track_id, a.volume, a.pan, a.muted, a.name, a.preset, a.soundfont, a.tuning_cents))
     }
 
-    #[tool(description = "Set the tempo in BPM (20-300).")]
+    #[tool(description = "Set the tempo in BPM (20-400).")]
     fn set_tempo(&self, Parameters(a): Parameters<TempoArgs>) -> Result<CallToolResult, McpError> {
         reply(self.tools.set_tempo(a.bpm))
+    }
+
+    #[tool(description = "Set the project time signature (numerator 1-16, denominator 2|4|8|16, e.g. 7/4).")]
+    fn set_time_signature(&self, Parameters(a): Parameters<TimeSignatureArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_time_signature(a.numerator, a.denominator))
+    }
+
+    #[tool(description = "Set arrangement tempo changes [{tick, bpm, ramp?}] (empty clears).")]
+    fn set_tempo_changes(&self, Parameters(a): Parameters<TempoChangesArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_tempo_changes(a.points))
     }
 
     #[tool(description = "Set swing 0.0-1.0 (offbeat 8th-note delay).")]
@@ -622,14 +744,44 @@ impl DawServer {
         reply(self.tools.set_swing(a.amount))
     }
 
+    #[tool(description = "Set or clear a per-pattern 8th-note swing override (0.0-1.0, or null to clear) on a step or piano-roll pattern.")]
+    fn set_pattern_swing(&self, Parameters(a): Parameters<PatternSwingArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_pattern_swing(a.pattern_id, a.swing))
+    }
+
+    #[tool(description = "Set pitch-bend sensitivity in semitones (1..=24, default 2) on a track via GM RPN 0.")]
+    fn set_track_pitch_bend_range(&self, Parameters(a): Parameters<TrackPitchBendRangeArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_track_pitch_bend_range(a.track_id, a.semitones))
+    }
+
+    #[tool(description = "Assign a multi-sampled `.sfz` instrument file to a track.")]
+    fn set_track_sfz(&self, Parameters(a): Parameters<TrackSfzArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_track_sfz(a.track_id, a.path))
+    }
+
     #[tool(description = "Set note-timing humanization 0.0-1.0 (looseness; ~32nd jitter at full) for a less mechanical feel.")]
     fn set_timing(&self, Parameters(a): Parameters<SwingArgs>) -> Result<CallToolResult, McpError> {
         reply(self.tools.set_timing(a.amount))
     }
 
-    #[tool(description = "Toggle legato on a piano-roll pattern: notes connect to the next note's start (smoother melodic lines).")]
+    #[tool(description = "Toggle legato on a piano-roll pattern, with optional overlap_ticks (0..=240) and max_gap_ticks (rest threshold beyond which legato does not bridge).")]
     fn set_legato(&self, Parameters(a): Parameters<LegatoArgs>) -> Result<CallToolResult, McpError> {
-        reply(self.tools.set_legato(a.pattern_id, a.on))
+        reply(self.tools.set_legato(a.pattern_id, a.on, a.overlap_ticks, a.max_gap_ticks))
+    }
+
+    #[tool(description = "Set MIDI CC events [{tick, cc, value}] on a piano-roll pattern (cc: 1=vibrato/mod, 11=expression, 64=sustain pedal, 74=brightness; value 0..=127).")]
+    fn set_pattern_cc(&self, Parameters(a): Parameters<PatternCcArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_pattern_cc(a.pattern_id, a.events))
+    }
+
+    #[tool(description = "Set pitch bend events [{tick, cents}] on a piano-roll pattern (cents -2400..=2400 relative to track tuning_cents) for horn scoops, falls, and expressive bends.")]
+    fn set_pattern_pitch_bends(&self, Parameters(a): Parameters<PatternPitchBendsArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_pattern_pitch_bends(a.pattern_id, a.events))
+    }
+
+    #[tool(description = "Set volume automation points [{tick, gain}] on a track (absolute arrangement ticks, 120 per quarter note; a bar is the project's ticks_per_bar, 480 in 4/4; gain 0.0..=2.0). Gain follows a smooth curve between points. Empty clears automation.")]
+    fn set_volume_automation(&self, Parameters(a): Parameters<VolumeAutomationArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_volume_automation(a.track_id, a.points))
     }
 
     #[tool(description = "Add a new pattern to a track. Returns its id.")]
@@ -642,7 +794,7 @@ impl DawServer {
         reply(self.tools.set_steps(a.pattern_id, a.rows))
     }
 
-    #[tool(description = "Replace a piano-roll pattern's notes (480 ticks/bar, 120/beat).")]
+    #[tool(description = "Replace a piano-roll pattern's notes (120 ticks per quarter note; a bar is the project's ticks_per_bar, 480 in 4/4, 360 in 3/4).")]
     fn set_notes(&self, Parameters(a): Parameters<NotesArgs>) -> Result<CallToolResult, McpError> {
         reply(self.tools.set_notes(a.pattern_id, a.notes))
     }
@@ -652,12 +804,17 @@ impl DawServer {
         reply(self.tools.apply_mini_notation(a.track_id, a.source))
     }
 
-    #[tool(description = "Place a pattern clip on the arrangement timeline at a bar (optionally stretched to len_bars; optional sub-bar offset_ticks for off-grid placement, 480/bar).")]
+    #[tool(description = "Place a pattern clip on the arrangement timeline at a bar (optionally stretched to len_bars, sub-bar offset_ticks, and clip gain 0.0..=2.0).")]
     fn place_clip(&self, Parameters(a): Parameters<PlaceClipArgs>) -> Result<CallToolResult, McpError> {
-        reply(self.tools.place_clip(a.track_id, a.pattern_id, a.bar, a.len_bars, a.offset_ticks))
+        reply(self.tools.place_clip(a.track_id, a.pattern_id, a.bar, a.len_bars, a.offset_ticks, a.gain))
     }
 
-    #[tool(description = "Nudge a clip off the bar line: set its sub-bar start offset in ticks (480/bar; 240 = half a bar, 120 = one beat).")]
+    #[tool(description = "Set per-clip gain multiplier (0.0..=2.0) on a placed clip for section-level dynamics and foreground spotlighting.")]
+    fn set_clip_gain(&self, Parameters(a): Parameters<ClipGainArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.set_clip_gain(a.track_id, a.bar, a.gain, a.offset_ticks))
+    }
+
+    #[tool(description = "Nudge a clip off the bar line: set its sub-bar start offset in ticks (120 = one quarter note; must stay below the project's ticks_per_bar, 480 in 4/4).")]
     fn set_clip_offset(&self, Parameters(a): Parameters<ClipOffsetArgs>) -> Result<CallToolResult, McpError> {
         reply(self.tools.set_clip_offset(a.track_id, a.bar, a.offset_ticks))
     }
@@ -800,10 +957,15 @@ impl DawServer {
         blocking(move || tools.auto_balance()).await
     }
 
-    #[tool(description = "ANALYZE MIX: solo-render each track and report where each lives in the spectrum plus which tracks mask each other (frequency collisions, low-band first). Use after composing to find a muddy/cluttered mix that whole-mix `listen` can't localize.")]
-    async fn analyze_mix(&self) -> Result<CallToolResult, McpError> {
+    #[tool(description = "ANALYZE MIX: solo-render each track over its active bars, report spectral placement and overlapping masking pairs, and optionally compute per-bar 500-6000 Hz Lead-to-Accompaniment Ratio (LAR) for lead_track_id.")]
+    async fn analyze_mix(&self, Parameters(a): Parameters<AnalyzeMixArgs>) -> Result<CallToolResult, McpError> {
         let tools = self.tools.clone();
-        blocking(move || tools.analyze_mix()).await
+        blocking(move || tools.analyze_mix(a.lead_track_id, a.start_bar, a.end_bar)).await
+    }
+
+    #[tool(description = "ANALYZE MELODY: audit a track's arranged melody for pitch contour, rhythmic diversity, breathing rests, motivic recurrence, and accompaniment range overlaps before or after orchestrating.")]
+    fn analyze_melody(&self, Parameters(a): Parameters<AnalyzeMelodyArgs>) -> Result<CallToolResult, McpError> {
+        reply(self.tools.analyze_melody(a.track_id, a.start_bar, a.end_bar))
     }
 
     #[tool(description = "ANALYZE ARRANGEMENT: report the song's density (tracks active per bar) and dynamic arc as sparklines, and flag flat/static textures or a missing intro build. Use to check the piece has shape — a build, variation, sections — not just a constant wall of sound.")]
@@ -847,6 +1009,25 @@ impl DawServer {
         blocking(move || tools.check()).await
     }
 
+    #[tool(description = "Check tracks one by one over the same arrangement range. Reports saved mute state, isolated post-master peak and RMS, stereo correlation, spectrum, per-bar clip occupancy, quiet bars, adjacent audible level changes, and track-specific render errors. Bars are zero-based.")]
+    async fn check_tracks(&self, Parameters(a): Parameters<CheckTracksArgs>) -> Result<CallToolResult, McpError> {
+        let tools = self.tools.clone();
+        blocking(move || tools.check_tracks(a.track_ids, a.start_bar, a.end_bar)).await
+    }
+
+    #[tool(description = "Audition one track as a short stereo WAV and get measurements for the same excerpt. Uses the saved automation, effects, and sends. Can audition a muted track without changing its saved mute or the live transport.")]
+    async fn listen_track(&self, Parameters(a): Parameters<ListenTrackArgs>) -> Result<CallToolResult, McpError> {
+        let tools = self.tools.clone();
+        match blocking_result(move || tools.listen_track(a.track_id, a.start_bar, a.duration_seconds)).await {
+            Ok((report, wav)) => {
+                use base64::Engine;
+                let audio = ContentBlock::audio(base64::engine::general_purpose::STANDARD.encode(wav), "audio/wav");
+                Ok(CallToolResult::success(vec![ContentBlock::text(report), audio]))
+            }
+            Err(error) => reply(Err(error)),
+        }
+    }
+
     #[tool(description = "Render a bar range and return a numerical report: peak/RMS dBFS, clipping, per-bar loudness, stereo width, and spectral balance. tracks=[…] solos a subset. For audio use a completed start_listen job and audition_excerpt.")]
     async fn listen(&self, Parameters(a): Parameters<RenderArgs>) -> Result<CallToolResult, McpError> {
         let tools = self.tools.clone();
@@ -872,7 +1053,7 @@ impl ServerHandler for DawServer {
         &self,
         request: CallToolRequestParams,
         context: RequestContext<RoleServer>,
-    ) -> Result<CallToolResult, McpError> {
+    ) -> Result<CallToolResponse, McpError> {
         let bound;
         let server = if let Some(automatic) = &self.automatic_session {
             let automatic = automatic.clone();
@@ -886,7 +1067,7 @@ impl ServerHandler for DawServer {
                 .and_then(|result| result);
             let tools = match resolved {
                 Ok(tools) => tools,
-                Err(error) => return reply(Err(error)),
+                Err(error) => return reply(Err(error)).map(Into::into),
             };
             // Pin all reads and writes in this call to the same socket.
             bound = Self {
@@ -901,14 +1082,16 @@ impl ServerHandler for DawServer {
         self.tool_router.call(ToolCallContext::new(server, request, context)).await
     }
 
-    fn get_info(&self) -> ServerInfo {
-        ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+    fn get_info(&self) -> ServerConfig {
+        ServerConfig::new(ServerCapabilities::builder().enable_tools().build())
             .with_server_info(Implementation::from_build_env())
             .with_instructions(
                 "daw-ai project server. Start with project_summary; in live mode also inspect session_state. \
-                 Compose short editable phrases with explicit velocities, note lengths, intentional timing, rests and musical development. \
-                 Global swing and random humanization do not replace phrasing. Use set_notes for detailed performances, set_sampler_pad to build sampler kits (gate=true for sounds that should follow note length), set_sampler_variants for velocity-layered or alternate takes, and set_modulators for filter/volume/pan movement. \
-                 Use composition_guide for the composition loop. Write the motif and its answer first, then render comparable revisions with start_listen. Use audition_excerpt for actual audio if the client supports it, and prepare_audition to ask the musician one focused question with loudness-matched A/B clips. Treat numeric diagnostics as technical measurements and record only real listener feedback. \
+                 Read track comments as musical context for the requested work. Comments can be scoped to the whole track or to a specific bar. \
+                 Follow the Two-Stave Melody Gate before orchestrating: write a lead melody + chord reduction first with rests, varied durations, motif development, and expressive CC/legato (set_pattern_cc, set_legato), then verify it with analyze_melody and listen. \
+                 Keep one foreground protagonist clear per section using set_volume_automation, set_clip_gain, and analyze_mix(lead_track_id=...) rather than static track volumes alone. \
+                 Use set_notes for detailed performances, set_sampler_pad to build sampler kits (gate=true for sounds that should follow note length), set_sampler_variants for velocity-layered or alternate takes, and set_modulators for filter/volume/pan movement. \
+                 Use check_tracks to find quiet bars, level transitions and render errors per track, then listen_track for an isolated stereo excerpt. Use composition_guide for the composition loop. Write the motif and its answer first, then render comparable revisions with start_listen. Use audition_excerpt for actual audio if the client supports it, and prepare_audition to ask the musician one focused question with loudness-matched A/B clips. Treat numeric diagnostics as technical measurements and record only real listener feedback. \
                  Live mode shares revision-checked edits and undo with the musician; inspect engine application status. Offline mode edits files only. \
                  Designing sounds from words (Surge XT): find_patches → load_patch → describe_sound → shape_sound → audition_sound, then let the musician steer; the musician judges by ear."
                     .to_string(),

@@ -10,6 +10,7 @@ fn instrument_label(i: &Instrument) -> String {
         Instrument::Sampler { pads } => format!("sampler ({} pads)", pads.len()),
         Instrument::AudioFile { .. } => "audio".into(),
         Instrument::Clap(_) => "clap".into(),
+        Instrument::Sfz { path } => format!("sfz ({})", std::path::Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path)),
     }
 }
 
@@ -26,6 +27,13 @@ fn diff_meta(o: &Project, n: &Project, out: &mut Vec<String>) {
         out.push(format!(
             "time signature: {}/{} -> {}/{}",
             om.time_signature[0], om.time_signature[1], nm.time_signature[0], nm.time_signature[1]
+        ));
+    }
+    if o.tempo_changes != n.tempo_changes {
+        out.push(format!(
+            "tempo changes: {} -> {} points",
+            o.tempo_changes.len(),
+            n.tempo_changes.len()
         ));
     }
     if om.key != nm.key || om.scale != nm.scale {
@@ -62,6 +70,18 @@ fn diff_track_fields(o: &Track, n: &Track, out: &mut Vec<String>) {
     }
     if changed(o.tuning_cents, n.tuning_cents) {
         out.push(format!("{who}: tuning {:+.0}c -> {:+.0}c", o.tuning_cents, n.tuning_cents));
+    }
+    if o.volume_automation.len() != n.volume_automation.len()
+        || o.volume_automation
+            .iter()
+            .zip(&n.volume_automation)
+            .any(|(a, b)| a.tick != b.tick || changed(a.gain, b.gain))
+    {
+        out.push(format!(
+            "{who}: volume_automation {} -> {} points",
+            o.volume_automation.len(),
+            n.volume_automation.len()
+        ));
     }
     for (name, a, b) in [
         ("reverb", o.effects.reverb, n.effects.reverb),
@@ -122,6 +142,14 @@ fn diff_patterns(old: &Project, new: &Project, out: &mut Vec<String>) {
                 if a.legato != b.legato {
                     out.push(format!("pattern \"{}\": legato {}", n.name(), if b.legato { "on" } else { "off" }));
                 }
+                if a.cc_events.len() != b.cc_events.len() {
+                    out.push(format!(
+                        "pattern \"{}\": {} -> {} CC events",
+                        n.name(),
+                        a.cc_events.len(),
+                        b.cc_events.len()
+                    ));
+                }
             }
             (Pattern::Step(_), Pattern::Step(_)) => {
                 let (a, b) = (active_steps(o), active_steps(n));
@@ -145,6 +173,9 @@ fn diff_arrangement(old: &Project, new: &Project, out: &mut Vec<String>) {
                 }
                 if o.len_bars != n.len_bars {
                     out.push(format!("clip {} on {}: length {:?} -> {:?}", n.pattern, n.track, o.len_bars, n.len_bars));
+                }
+                if changed(o.gain, n.gain) {
+                    out.push(format!("clip {} on {}: gain {:.2} -> {:.2}", n.pattern, n.track, o.gain, n.gain));
                 }
             }
         }

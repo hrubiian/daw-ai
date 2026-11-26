@@ -56,7 +56,14 @@ pub fn render_fingerprint(project: &Project, sf2: &Path) -> anyhow::Result<Finge
     let (samples, sr) = daw_core::audio::export::render_project_samples(project, sf2, false)?;
     let l: Vec<f32> = samples.iter().step_by(2).copied().collect();
     let r: Vec<f32> = samples.iter().skip(1).step_by(2).copied().collect();
-    let rep = crate::analysis::analyze(&l, &r, sr, project.project.bpm);
+    let rep = crate::analysis::analyze_with_timing(
+        &l,
+        &r,
+        sr,
+        project.project.bpm,
+        project.project.time_signature,
+        &project.tempo_changes,
+    );
     Ok(fingerprint(project, &rep))
 }
 

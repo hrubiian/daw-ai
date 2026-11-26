@@ -206,10 +206,29 @@ impl DawTools {
 
     pub fn set_tempo(&self, bpm: f64) -> Result<String, String> {
         self.store.mutate(|p| {
-            p.project.bpm = bpm.clamp(20.0, 300.0);
+            p.project.bpm = bpm.clamp(daw_core::musical_time::MIN_BPM, daw_core::musical_time::MAX_BPM);
             Ok(format!("bpm {}", p.project.bpm))
         })?;
         self.with_summary(format!("tempo set to {bpm}"))
+    }
+
+    pub fn set_time_signature(&self, numerator: u8, denominator: u8) -> Result<String, String> {
+        self.store.mutate(|p| {
+            p.set_time_signature(numerator, denominator)?;
+            Ok(format!("time signature {numerator}/{denominator}"))
+        })?;
+        self.with_summary(format!("time signature set to {numerator}/{denominator}"))
+    }
+
+    pub fn set_tempo_changes(&self, points: serde_json::Value) -> Result<String, String> {
+        let parsed: Vec<daw_core::project::TempoPoint> = serde_json::from_value(points)
+            .map_err(|e| format!("invalid tempo points: {e}"))?;
+        let count = parsed.len();
+        self.store.mutate(|p| {
+            p.set_tempo_changes(parsed)?;
+            Ok(format!("{count} tempo changes set"))
+        })?;
+        self.with_summary(format!("set {count} tempo changes"))
     }
 
     pub fn set_swing(&self, amount: f32) -> Result<String, String> {
@@ -220,17 +239,87 @@ impl DawTools {
         self.with_summary(format!("swing set to {amount}"))
     }
 
+    pub fn set_pattern_swing(&self, pattern_id: String, swing: Option<f32>) -> Result<String, String> {
+        self.store.mutate(|p| {
+            p.set_pattern_swing(&pattern_id, swing)?;
+            Ok(match swing {
+                Some(s) => format!("pattern {pattern_id} swing {s:.2}"),
+                None => format!("pattern {pattern_id} swing cleared"),
+            })
+        })?;
+        self.with_summary(format!("pattern {pattern_id} swing updated"))
+    }
+
+    pub fn set_track_pitch_bend_range(&self, track_id: String, semitones: u8) -> Result<String, String> {
+        self.store.mutate(|p| {
+            p.set_track_pitch_bend_range(&track_id, semitones)?;
+            Ok(format!("track {track_id} bend range +/-{semitones} st"))
+        })?;
+        self.with_summary(format!("track {track_id} pitch bend range set to {semitones} semitones"))
+    }
+
+    pub fn set_track_sfz(&self, track_id: String, path: String) -> Result<String, String> {
+        self.store.mutate(|p| {
+            p.set_track_sfz(&track_id, path.clone())?;
+            Ok(format!("track {track_id} sfz {path}"))
+        })?;
+        self.with_summary(format!("assigned SFZ {path} to {track_id}"))
+    }
+
     pub fn set_timing(&self, amount: f32) -> Result<String, String> {
         self.store.mutate(|p| { p.set_timing(amount); Ok(format!("timing {:.2}", p.project.timing)) })?;
         self.with_summary(format!("timing set to {amount}"))
     }
 
-    pub fn set_legato(&self, pattern_id: String, on: bool) -> Result<String, String> {
+    pub fn set_legato(
+        &self,
+        pattern_id: String,
+        on: bool,
+        overlap_ticks: Option<u16>,
+        max_gap_ticks: Option<u32>,
+    ) -> Result<String, String> {
         self.store.mutate(|p| {
-            if p.set_legato(&pattern_id, on) { Ok(format!("legato {on}")) }
-            else { Err(format!("no piano-roll pattern '{pattern_id}'")) }
+            p.set_legato_options(&pattern_id, on, overlap_ticks, max_gap_ticks.map(Some))?;
+            Ok(format!("legato {on}"))
         })?;
         self.with_summary(format!("legato {on} on {pattern_id}"))
+    }
+
+    pub fn set_pattern_cc(&self, pattern_id: String, events: serde_json::Value) -> Result<String, String> {
+        let parsed: Vec<daw_core::project::CcPoint> = serde_json::from_value(events)
+            .map_err(|e| format!("invalid cc events: {e}"))?;
+        let count = parsed.len();
+        self.store.mutate(|p| {
+            p.set_pattern_cc(&pattern_id, parsed)?;
+            Ok(format!("{count} CC events set"))
+        })?;
+        self.with_summary(format!("set {count} CC events on {pattern_id}"))
+    }
+
+    pub fn set_pattern_pitch_bends(&self, pattern_id: String, events: serde_json::Value) -> Result<String, String> {
+        let parsed: Vec<daw_core::project::PitchBendPoint> = serde_json::from_value(events)
+            .map_err(|e| format!("invalid pitch bend events: {e}"))?;
+        let count = parsed.len();
+        self.store.mutate(|p| {
+            p.set_pattern_pitch_bends(&pattern_id, parsed)?;
+            Ok(format!("{count} pitch bends set"))
+        })?;
+        self.with_summary(format!("set {count} pitch bends on {pattern_id}"))
+    }
+
+    pub fn set_volume_automation(
+        &self,
+        track_id: String,
+        points: serde_json::Value,
+    ) -> Result<String, String> {
+        let parsed: Vec<daw_core::project::VolumePoint> = serde_json::from_value(points)
+            .map_err(|e| format!("invalid volume automation points: {e}"))?;
+        let count = parsed.len();
+        self.store.mutate(|p| {
+            p.set_volume_automation(&track_id, parsed)?;
+            Ok(format!("{count} automation points set"))
+        })?;
+        self.with_summary(format!("set {count} volume automation points on {track_id}"))
     }
 
     // ── Patterns + notes ─────────────────────────────────────────────────────
@@ -318,7 +407,13 @@ impl DawTools {
         bar: u32,
         len_bars: Option<u32>,
         offset_ticks: Option<u32>,
+        gain: Option<f32>,
     ) -> Result<String, String> {
+        if let Some(g) = gain {
+            if !g.is_finite() || !(0.0..=2.0).contains(&g) {
+                return Err(format!("clip gain {g} outside 0.0..=2.0"));
+            }
+        }
         self.store.mutate(|p| {
             if !p.place_pattern_id(&track_id, bar, &pattern_id) {
                 return Err(format!(
@@ -329,12 +424,36 @@ impl DawTools {
             if let Some(len) = len_bars {
                 p.resize_clip(&track_id, bar, len);
             }
+            let off = offset_ticks.unwrap_or(0);
             if let Some(off) = offset_ticks {
                 p.set_clip_offset(&track_id, bar, off);
+            }
+            if let Some(g) = gain {
+                p.set_clip_gain(&track_id, bar, off, g);
             }
             Ok(format!("placed {pattern_id} on {track_id} @ bar {bar}"))
         })?;
         self.with_summary(format!("placed {pattern_id} at bar {bar}"))
+    }
+
+    pub fn set_clip_gain(
+        &self,
+        track_id: String,
+        bar: u32,
+        gain: f32,
+        offset_ticks: Option<u32>,
+    ) -> Result<String, String> {
+        if !gain.is_finite() || !(0.0..=2.0).contains(&gain) {
+            return Err(format!("clip gain {gain} outside 0.0..=2.0"));
+        }
+        self.store.mutate(|p| {
+            if p.set_clip_gain(&track_id, bar, offset_ticks.unwrap_or(0), gain) {
+                Ok("clip gain set".into())
+            } else {
+                Err(format!("no clip on '{track_id}' at bar {bar}"))
+            }
+        })?;
+        self.with_summary(format!("clip at bar {bar} on {track_id} gain {gain:.2}"))
     }
 
     /// Nudge an existing clip off the bar line by `offset_ticks` (480/bar; e.g.
@@ -793,9 +912,14 @@ impl DawTools {
         crate::arrangement::arrangement_report(&p, &self.sf2_path).map_err(|e| e.to_string())
     }
 
-    /// Solo-render each track, profile its spectrum, and report where each
-    /// track lives + which tracks mask each other (frequency collisions).
-    pub fn analyze_mix(&self) -> Result<String, String> {
+    /// Solo-render each track, profile its active-bar spectrum, and report
+    /// masking collisions plus optional per-bar foreground Lead-to-Accompaniment Ratio.
+    pub fn analyze_mix(
+        &self,
+        lead_track_id: Option<String>,
+        start_bar: Option<u32>,
+        end_bar: Option<u32>,
+    ) -> Result<String, String> {
         let p = self.runtime_project(&self.store.load()?)?;
         if !self.sf2_path.exists() {
             return Err(format!(
@@ -803,7 +927,26 @@ impl DawTools {
                 self.sf2_path.display()
             ));
         }
-        crate::mix_analysis::mix_report(&p, &self.sf2_path).map_err(|e| e.to_string())
+        crate::mix_analysis::mix_report_with_lead(
+            &p,
+            &self.sf2_path,
+            lead_track_id.as_deref(),
+            start_bar,
+            end_bar,
+        )
+        .map_err(|e| e.to_string())
+    }
+
+    /// Analyze a melodic track's symbolic contour, rhythmic diversity, motif
+    /// recurrence, breathing rests, and accompaniment range collisions.
+    pub fn analyze_melody(
+        &self,
+        track_id: String,
+        start_bar: Option<u32>,
+        end_bar: Option<u32>,
+    ) -> Result<String, String> {
+        let p = self.store.load()?;
+        crate::melody::melody_report(&p, &track_id, start_bar, end_bar)
     }
 
     // ── Listening ────────────────────────────────────────────────────────────
@@ -815,7 +958,7 @@ impl DawTools {
         start_bar: Option<u32>,
         end_bar: Option<u32>,
         tracks: Option<Vec<String>>,
-    ) -> Result<(std::path::PathBuf, f64), String> {
+    ) -> Result<(std::path::PathBuf, Project), String> {
         let mut p = self.store.load()?;
         if let Some(keep) = &tracks {
             for id in keep {
@@ -852,7 +995,6 @@ impl DawTools {
         let s = start_bar.unwrap_or(0);
         let e_label = end_bar.map(|e| e.to_string()).unwrap_or_else(|| "end".into());
         let out = dir.join(format!("{stem}-{s}-{e_label}-{}.wav", daw_io::session::operation_id()));
-        let bpm = p.project.bpm;
         let p = self.runtime_project(&p)?;
         let range = if start_bar.is_some() || end_bar.is_some() { Some((s, end_bar.unwrap_or_else(|| p.song_bars()))) } else { None };
         let (samples, sr) = daw_core::audio::export::render_range_samples(&p, &self.sf2_path, false, range, &Default::default()).map_err(|e| e.to_string())?;
@@ -860,7 +1002,7 @@ impl DawTools {
         let mut writer = hound::WavWriter::create(&out, spec).map_err(|e| e.to_string())?;
         for sample in samples { writer.write_sample(sample).map_err(|e| e.to_string())?; }
         writer.finalize().map_err(|e| e.to_string())?;
-        Ok((out, bpm))
+        Ok((out, p))
     }
 
     pub fn render(
@@ -869,7 +1011,7 @@ impl DawTools {
         end_bar: Option<u32>,
         tracks: Option<Vec<String>>,
     ) -> Result<String, String> {
-        let (path, _bpm) = self.render_range(start_bar, end_bar, tracks)?;
+        let (path, _p) = self.render_range(start_bar, end_bar, tracks)?;
         let dur = daw_core::audio::wav_duration_sec(&path).unwrap_or(0.0);
         Ok(format!("rendered {} ({dur:.2}s) — play it to audition", path.display()))
     }
@@ -880,14 +1022,22 @@ impl DawTools {
         end_bar: Option<u32>,
         tracks: Option<Vec<String>>,
     ) -> Result<String, String> {
-        let (path, bpm) = self.render_range(start_bar, end_bar, tracks)?;
-        let rep = crate::analysis::analyze_wav_file(&path, bpm)?;
+        let (path, p) = self.render_range(start_bar, end_bar, tracks)?;
+        let rep = crate::analysis::analyze_wav_file_with_timing(
+            &path,
+            p.project.bpm,
+            p.project.time_signature,
+            &p.tempo_changes,
+        )?;
         Ok(format!("render: {}\n{}", path.display(), rep.to_text()))
     }
 
     pub fn analyze_wav(&self, path: String) -> Result<String, String> {
-        let bpm = self.store.load().map(|p| p.project.bpm).unwrap_or(120.0);
-        let rep = crate::analysis::analyze_wav_file(std::path::Path::new(&path), bpm)?;
+        let p = self.store.load().ok();
+        let bpm = p.as_ref().map(|p| p.project.bpm).unwrap_or(120.0);
+        let ts = p.as_ref().map(|p| p.project.time_signature).unwrap_or([4, 4]);
+        let tc = p.as_ref().map(|p| p.tempo_changes.as_slice()).unwrap_or(&[]);
+        let rep = crate::analysis::analyze_wav_file_with_timing(std::path::Path::new(&path), bpm, ts, tc)?;
         Ok(rep.to_text())
     }
 }
@@ -998,7 +1148,7 @@ mod tests {
     #[test]
     fn arrange_region_effects_and_raw_json() {
         let (t, path) = tools("arrange");
-        t.place_clip("t1".into(), "p1".into(), 4, Some(2), Some(240)).unwrap();
+        t.place_clip("t1".into(), "p1".into(), 4, Some(2), Some(240), None).unwrap();
         t.set_loop_region(0, 4, Some(true), None, None).unwrap();
         t.set_effects("t1".into(), serde_json::json!({"reverb": 0.4, "drive": 0.2})).unwrap();
         let p = daw_core::project::format::load(&path).unwrap();
@@ -1064,7 +1214,7 @@ mod tests {
         };
         let t = DawTools { store: crate::store::ProjectStore::new(path.clone()), sf2_path: sf2, history: Default::default() };
         t.store.save(&p).unwrap();
-        t.analyze_mix().expect("analyze_mix finds project-relative samples");
+        t.analyze_mix(None, None, None).expect("analyze_mix finds project-relative samples");
         t.analyze_arrangement().expect("analyze_arrangement finds project-relative samples");
         t.snapshot().expect("snapshot finds project-relative samples");
         t.check().expect("check finds project-relative samples");
@@ -1154,5 +1304,51 @@ mod tests {
         assert_eq!(gain["readonly"],false);assert_eq!(gain["stepped"],false);
         assert!(gain["id"].is_u64());assert_eq!(std::fs::read(&path).unwrap(),saved);
         assert!(t.get_clap_params("missing".into()).is_err());
+    }
+
+    #[test]
+    fn foreground_and_melody_tools_validate_and_persist() {
+        let (t, path) = tools("fg");
+        t.set_volume_automation(
+            "t2".into(),
+            serde_json::json!([
+                {"tick": 0, "gain": 0.45},
+                {"tick": 480, "gain": 1.0}
+            ]),
+        )
+        .unwrap();
+        t.set_pattern_cc(
+            "p2".into(),
+            serde_json::json!([
+                {"tick": 0, "cc": 64, "value": 127},
+                {"tick": 420, "cc": 64, "value": 0},
+                {"tick": 0, "cc": 11, "value": 95}
+            ]),
+        )
+        .unwrap();
+        t.set_legato("p2".into(), true, Some(15), Some(90)).unwrap();
+        t.set_clip_gain("t2".into(), 0, 0.85, None).unwrap();
+        t.set_notes(
+            "p2".into(),
+            vec![
+                NoteArg { pitch: 67, tick: 0, duration: 90, vel: 82 },
+                NoteArg { pitch: 72, tick: 120, duration: 180, vel: 98 },
+                NoteArg { pitch: 71, tick: 300, duration: 60, vel: 88 },
+                NoteArg { pitch: 69, tick: 360, duration: 90, vel: 80 },
+            ],
+        )
+        .unwrap();
+        let report = t.analyze_melody("t2".into(), None, None).unwrap();
+        assert!(report.contains("melody (t2"), "{report}");
+        let p = daw_core::project::format::load(&path).unwrap();
+        assert_eq!(p.tracks[1].volume_automation.len(), 2);
+        assert_eq!(p.arrangement[1].gain, 0.85);
+        let daw_core::project::Pattern::PianoRoll(pr) = &p.patterns[1] else { panic!() };
+        assert!(pr.legato);
+        assert_eq!(pr.legato_overlap_ticks, 15);
+        assert_eq!(pr.legato_max_gap_ticks, Some(90));
+        assert_eq!(pr.cc_events.len(), 3);
+        assert!(t.set_clip_gain("t2".into(), 0, 2.5, None).is_err());
+        assert!(t.set_pattern_cc("p2".into(), serde_json::json!([{"tick": 0, "cc": 99, "value": 64}])).is_err());
     }
 }

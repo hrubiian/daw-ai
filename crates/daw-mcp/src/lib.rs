@@ -7,6 +7,7 @@ pub mod audition;
 pub mod diff;
 pub mod groove;
 pub mod groove_compare;
+pub mod melody;
 pub mod mix_analysis;
 pub mod snapshot;
 pub mod sound_design;
@@ -14,5 +15,6 @@ pub mod sound_traits;
 pub mod store;
 pub mod synth_map;
 pub mod tools;
+mod track_review;
 
 pub mod jobs;

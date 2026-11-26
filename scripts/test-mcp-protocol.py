@@ -1,14 +1,18 @@
 #!/usr/bin/env python3
 """MCP wire regression; run after cargo build -p daw-mcp. No audio device needed."""
 from contextlib import contextmanager
+import base64
+import io
 import json
 import os
 from pathlib import Path
 import select
+import struct
 from socketserver import StreamRequestHandler, UnixStreamServer
 import subprocess
 import tempfile
 from threading import Thread
+import wave
 
 ROOT = Path(__file__).resolve().parents[1]
 BINARY = ROOT / "target/debug/daw-mcp"
@@ -47,7 +51,7 @@ with tempfile.TemporaryDirectory(prefix="daw-mcp-protocol-") as directory:
     with mcp(Path(directory) / "song.daw.json") as rpc:
         response = rpc(2, "tools/list", {})
         names = {tool["name"] for tool in response["result"]["tools"]}
-        assert {"session_state", "session_command", "start_listen", "cancel_job", "job_status", "rate_render", "compare_renders", "render_history", "set_sampler_variants", "apply_spatial_preset", "rescan_clap_plugins", "get_clap_params", "audition_excerpt", "prepare_audition", "record_audition_choice", "composition_guide"} <= names, names
+        assert {"session_state", "session_command", "start_listen", "cancel_job", "job_status", "rate_render", "compare_renders", "render_history", "set_sampler_variants", "apply_spatial_preset", "rescan_clap_plugins", "get_clap_params", "audition_excerpt", "prepare_audition", "record_audition_choice", "composition_guide", "analyze_melody", "set_volume_automation", "set_pattern_cc", "set_clip_gain"} <= names, names
         response = rpc(3, "tools/call", dict(name="project_summary", arguments={}))
         assert not response["result"].get("isError"), response
         response = rpc(4, "tools/call", dict(name="session_state", arguments={}))
@@ -79,7 +83,62 @@ with tempfile.TemporaryDirectory(prefix="daw-mcp-protocol-") as directory:
         report = json.loads(response["result"]["content"][0]["text"])
         assert report["total"]["exact"] == 4 and report["total"]["target_onsets"] == 6, report
         assert report["bars"][0]["offsets"][2]["next_delta_ms"] < 0, report
-        print("MCP initialization, history, error handling and groove comparison: passed")
+        response = rpc(13, "tools/call", dict(name="analyze_melody", arguments={"track_id": "bass"}))
+        assert not response["result"].get("isError"), response
+        assert "melody (bass" in response["result"]["content"][0]["text"], response
+        print("MCP initialization, history, error handling, groove comparison and melody analysis: passed")
+
+
+with tempfile.TemporaryDirectory(prefix="daw-mcp-track-check-") as directory:
+    song = Path(directory) / "tracks.daw.json"
+    project = json.loads(DEMO.read_text())
+    project["project"]["bpm"] = 120
+    project["patterns"] = []
+    project["arrangement"] = []
+    project["tracks"] = [
+        dict(id=track_id, name=track_id, type="audio", muted=muted, volume=1, pan=0,
+             patterns=[], instrument=dict(type="audio_file", path=audio))
+        for track_id, audio, muted in [
+            ("stereo", "transition.wav", False),
+            ("missing", "missing.wav", False),
+            ("muted", "transition.wav", True),
+        ]
+    ]
+    song.write_text(json.dumps(project))
+    with wave.open(str(song.with_name("transition.wav")), "wb") as source:
+        source.setparams((2, 2, 8000, 0, "NONE", "not compressed"))
+        source.writeframes(struct.pack("<hh", 8000, -8000) * 16000)
+        source.writeframes(struct.pack("<hh", 2000, -2000) * 16000)
+    before = song.read_bytes()
+    with mcp(song) as rpc:
+        result = rpc(2, "tools/call", dict(name="check_tracks", arguments={"end_bar": 2}))["result"]
+        assert not result.get("isError"), result
+        review = json.loads(result["content"][0]["text"])
+        stereo, missing, muted = review["tracks"]
+        assert [t["status"] for t in (stereo, missing, muted)] == ["audible", "render_error", "muted"], review
+        bars = stereo["measurements"]["bars"]
+        assert [bar["bar"] for bar in bars] == [0, 1], bars
+        assert all(bar["has_clip"] and not bar["quiet"] for bar in bars), bars
+        assert bars[1]["change_from_previous_db"] < -10, bars
+        assert stereo["measurements"]["stereo_correlation"] < -.99, stereo
+
+        args = dict(track_id="muted", start_bar=1, duration_seconds=.25)
+        result = rpc(3, "tools/call", dict(name="listen_track", arguments=args))["result"]
+        assert not result.get("isError"), result
+        text, audio = result["content"]
+        audition = json.loads(text["text"])
+        assert audition["project_hash"] == review["project_hash"], audition
+        track = audition["tracks"][0]
+        assert track["saved_muted"] and track["status"] == "audible", track
+        assert track["measurements"]["bars"][0]["bar"] == 1, track
+        assert audio["type"] == "audio" and audio["mimeType"] == "audio/wav", audio.keys()
+        with wave.open(io.BytesIO(base64.b64decode(audio["data"])), "rb") as wav:
+            assert (wav.getnchannels(), wav.getsampwidth(), wav.getnframes()) == (2, 2, 11025)
+            left, right = struct.unpack("<hh", wav.readframes(1))
+            assert left > 1000 and right < -1000, (left, right)
+    assert song.read_bytes() == before
+    assert not song.with_name("renders").exists()
+    print("MCP track checks, render isolation, stereo excerpt and saved mute state: passed")
 
 
 class SessionFixture(StreamRequestHandler):

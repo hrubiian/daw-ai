@@ -11,12 +11,18 @@ fn db(x: f32) -> f32 {
 }
 
 /// One solo-rendered track's spectral fingerprint.
+#[derive(Clone)]
 pub struct TrackProfile {
+    pub id: String,
     pub name: String,
-    /// Overall loudness of the solo render, dBFS.
+    /// Overall loudness of the solo render over its active bars, dBFS.
     pub rms_db: f32,
     /// Per-band level (name, dB), low band -> high band.
     pub bands: Vec<(&'static str, f32)>,
+    /// 0-based bars where the track had audible energy (> -65 dBFS).
+    pub active_bars: Vec<u32>,
+    /// Linear energy in the focal presence range (500..6000 Hz) per 0-based bar.
+    pub bar_focal_energy: Vec<f32>,
 }
 
 /// A band where two or more audible tracks pile up — a masking risk.
@@ -72,7 +78,7 @@ fn living_bands(p: &TrackProfile) -> Vec<bool> {
         .collect()
 }
 
-/// Bands where >= 2 audible tracks both live — ordered low band -> high.
+/// Bands where >= 2 audible tracks both live (and overlap in time) — ordered low band -> high.
 pub fn detect_masking(profiles: &[TrackProfile]) -> Vec<MaskingFinding> {
     let Some(first) = profiles.first() else { return Vec::new() };
     let n_bands = first.bands.len();
@@ -82,18 +88,33 @@ pub fn detect_masking(profiles: &[TrackProfile]) -> Vec<MaskingFinding> {
         .iter()
         .flat_map(|p| p.bands.iter().map(|(_, v)| *v))
         .fold(f32::MIN, f32::max);
+    let bars_overlap = |a: &TrackProfile, b: &TrackProfile| -> bool {
+        a.active_bars.is_empty()
+            || b.active_bars.is_empty()
+            || a.active_bars.iter().any(|bar| b.active_bars.contains(bar))
+    };
     let mut findings = Vec::new();
     for j in 0..n_bands {
-        let mut contenders: Vec<(String, f32)> = Vec::new();
+        let mut candidates: Vec<usize> = Vec::new();
         for (pi, p) in profiles.iter().enumerate() {
             if p.rms_db <= AUDIBLE_DB {
                 continue; // inaudible track can't mask anything
             }
             // Real collision only if this band carries near-peak energy, not floor noise.
             if living[pi][j] && p.bands[j].1 >= global_max - MASK_WINDOW_DB {
-                contenders.push((p.name.clone(), p.bands[j].1));
+                candidates.push(pi);
             }
         }
+        let mut contenders: Vec<(String, f32)> = candidates
+            .iter()
+            .copied()
+            .filter(|&pi| {
+                candidates
+                    .iter()
+                    .any(|&pj| pi != pj && bars_overlap(&profiles[pi], &profiles[pj]))
+            })
+            .map(|pi| (profiles[pi].name.clone(), profiles[pi].bands[j].1))
+            .collect();
         if contenders.len() >= 2 {
             contenders.sort_by(|a, b| b.1.total_cmp(&a.1)); // loudest first
             findings.push(MaskingFinding { band: first.bands[j].0, tracks: contenders });
@@ -102,10 +123,19 @@ pub fn detect_masking(profiles: &[TrackProfile]) -> Vec<MaskingFinding> {
     findings
 }
 
-/// Solo-render every unmuted track and profile its loudness + 7-band spectrum.
-/// Mirrors `auto_balance`'s solo-render loop; silent renders are skipped.
+fn focal_band_energy(bands: &[(&'static str, f32)]) -> f32 {
+    bands
+        .iter()
+        .filter(|(name, _)| matches!(*name, "mid" | "high-mid"))
+        .map(|(_, d)| 10f32.powf(*d / 10.0))
+        .sum()
+}
+
+/// Solo-render every unmuted track and profile its active-bar loudness + 7-band spectrum.
 pub fn track_profiles(project: &Project, sf2: &Path) -> anyhow::Result<Vec<TrackProfile>> {
     let mut out = Vec::new();
+    let bpm = project.project.bpm.max(1.0);
+    let song_bars = project.song_bars();
     for t in project.tracks.iter().filter(|t| !t.muted) {
         let mut solo = project.clone();
         for o in &mut solo.tracks {
@@ -117,27 +147,71 @@ pub fn track_profiles(project: &Project, sf2: &Path) -> anyhow::Result<Vec<Track
             continue;
         }
         let mono: Vec<f32> = samples.as_chunks::<2>().0.iter().map(|c| (c[0] + c[1]) * 0.5).collect();
-        let rms = (mono.iter().map(|&m| (m * m) as f64).sum::<f64>() / frames as f64).sqrt() as f32;
-        let bands = crate::analysis::spectral_bands(&mono, sr);
-        out.push(TrackProfile { name: t.name.clone(), rms_db: db(rms), bands });
+        let mut active_bars = Vec::new();
+        let mut active_mono = Vec::new();
+        let mut bar_focal_energy = Vec::with_capacity(song_bars as usize);
+        for bi in 0..song_bars {
+            let lo = (daw_core::musical_time::bar_sample_map(bi, bpm, project.project.time_signature, &project.tempo_changes, sr) as usize).min(mono.len());
+            let hi = (daw_core::musical_time::bar_sample_map(bi + 1, bpm, project.project.time_signature, &project.tempo_changes, sr) as usize).min(mono.len());
+            if hi <= lo {
+                bar_focal_energy.push(0.0);
+                continue;
+            }
+            let slice = &mono[lo..hi];
+            let bar_rms = (slice.iter().map(|&m| (m * m) as f64).sum::<f64>() / slice.len() as f64).sqrt() as f32;
+            let bar_bands = crate::analysis::spectral_bands(slice, sr);
+            bar_focal_energy.push(focal_band_energy(&bar_bands));
+            if db(bar_rms) > -65.0 {
+                active_bars.push(bi);
+                active_mono.extend_from_slice(slice);
+            }
+        }
+        let used = if active_mono.is_empty() { &mono[..] } else { &active_mono[..] };
+        let rms = (used.iter().map(|&m| (m * m) as f64).sum::<f64>() / used.len().max(1) as f64).sqrt() as f32;
+        let bands = crate::analysis::spectral_bands(used, sr);
+        out.push(TrackProfile {
+            id: t.id.clone(),
+            name: t.name.clone(),
+            rms_db: db(rms),
+            bands,
+            active_bars,
+            bar_focal_energy,
+        });
     }
     Ok(out)
 }
 
-/// Human/agent-readable mix report: per-track spectral home + masking findings.
+/// Human/agent-readable mix report: per-track active-bar spectral home + masking findings.
 pub fn mix_report(project: &Project, sf2: &Path) -> anyhow::Result<String> {
+    mix_report_with_lead(project, sf2, None, None, None)
+}
+
+/// Mix report plus optional foreground Lead-to-Accompaniment Ratio (LAR) in 500..6000 Hz.
+pub fn mix_report_with_lead(
+    project: &Project,
+    sf2: &Path,
+    lead_track_id: Option<&str>,
+    start_bar: Option<u32>,
+    end_bar: Option<u32>,
+) -> anyhow::Result<String> {
+    if let Some(lid) = lead_track_id {
+        anyhow::ensure!(
+            project.tracks.iter().any(|t| t.id == lid),
+            "unknown lead_track_id '{lid}'"
+        );
+    }
     let profiles = track_profiles(project, sf2)?;
     if profiles.is_empty() {
         return Ok("no audible tracks to analyze.".into());
     }
-    let mut s = String::from("per-track spectral profile:\n");
+    let mut s = String::from("per-track spectral profile (active bars):\n");
     for p in &profiles {
         // A silent solo render has an all-floor spectrum, whose centroid is a
         // meaningless middle band — label it "silent" instead of a bogus home.
         let home = if p.rms_db <= SILENT_DB {
             "silent".to_string()
         } else {
-            format!("lives in {}", dominant_band(p))
+            format!("lives in {} ({} active bars)", dominant_band(p), p.active_bars.len())
         };
         s.push_str(&format!("  {:<22} {:>6.1} dBFS  {}\n", p.name, p.rms_db, home));
     }
@@ -156,7 +230,70 @@ pub fn mix_report(project: &Project, sf2: &Path) -> anyhow::Result<String> {
             s.push_str(&format!("  {}: {}\n", f.band, who));
         }
     }
+
+    if let Some(lid) = lead_track_id {
+        s.push_str(&foreground_lar_report(
+            &profiles,
+            lid,
+            start_bar.unwrap_or(0),
+            end_bar.unwrap_or_else(|| project.song_bars()),
+        ));
+    }
     Ok(s)
+}
+
+pub fn foreground_lar_report(
+    profiles: &[TrackProfile],
+    lead_track_id: &str,
+    start_bar: u32,
+    end_bar: u32,
+) -> String {
+    let Some(lead) = profiles.iter().find(|p| p.id == lead_track_id) else {
+        return format!("\nforeground check ({lead_track_id}): track is muted or silent.\n");
+    };
+    let mut bars_lar: Vec<(u32, f32)> = Vec::new();
+    for &b in &lead.active_bars {
+        if b < start_bar || b >= end_bar {
+            continue;
+        }
+        let Some(&lead_e) = lead.bar_focal_energy.get(b as usize) else { continue };
+        let accomp_e: f32 = profiles
+            .iter()
+            .filter(|p| p.id != lead_track_id)
+            .filter_map(|p| p.bar_focal_energy.get(b as usize).copied())
+            .sum();
+        let lar_db = 10.0 * (lead_e.max(1e-12) / accomp_e.max(1e-12)).log10();
+        bars_lar.push((b, lar_db));
+    }
+    if bars_lar.is_empty() {
+        return format!(
+            "\nforeground check ({} in bars {start_bar}..{end_bar}): no active lead bars.\n",
+            lead.name
+        );
+    }
+    let mean_lar = bars_lar.iter().map(|(_, v)| *v).sum::<f32>() / bars_lar.len() as f32;
+    let &(min_bar, min_lar) = bars_lar
+        .iter()
+        .min_by(|a, b| a.1.total_cmp(&b.1))
+        .expect("non-empty");
+    let mut out = format!(
+        "\nforeground Lead-to-Accompaniment Ratio (500–6000 Hz) for \"{}\" (bars {start_bar}..{end_bar}):\n  mean LAR: {mean_lar:+.1} dB | min LAR: {min_lar:+.1} dB at bar {}\n",
+        lead.name,
+        min_bar + 1
+    );
+    if min_lar < 0.0 {
+        out.push_str(&format!(
+            "  - BURIAL: accompaniment exceeds lead in 500–6000 Hz at bar {} ({min_lar:+.1} dB) — duck accompaniment or lift lead.\n",
+            min_bar + 1
+        ));
+    } else if mean_lar < 2.5 {
+        out.push_str(&format!(
+            "  - CROWDED FOREGROUND: mean LAR {mean_lar:+.1} dB (< +2.5 dB) — lead sits too close to accompaniment bed.\n"
+        ));
+    } else {
+        out.push_str("  lead sits clearly in front of accompaniment.\n");
+    }
+    out
 }
 
 #[cfg(test)]
@@ -171,7 +308,14 @@ mod tests {
             .iter()
             .map(|n| (*n, peaks.iter().find(|(b, _)| b == n).map(|(_, v)| *v).unwrap_or(-80.0)))
             .collect();
-        TrackProfile { name: name.into(), rms_db, bands }
+        TrackProfile {
+            id: name.to_lowercase(),
+            name: name.into(),
+            rms_db,
+            bands,
+            active_bars: Vec::new(),
+            bar_focal_energy: Vec::new(),
+        }
     }
 
     #[test]
@@ -259,5 +403,22 @@ mod tests {
         // The bass sits in the low third; the lead's energy sits clearly higher.
         assert!(band_index(bb) <= band_index("low-mid"), "bass should be low, got {bb}");
         assert!(band_index(lb) > band_index(bb), "lead should be higher than bass, got {lb} vs {bb}");
+    }
+
+    #[test]
+    fn non_overlapping_active_bars_do_not_collide_and_lar_flags_burial() {
+        let mut a = profile("Flute", -32.0, &[("mid", -28.0)]);
+        a.active_bars = vec![0, 1];
+        a.bar_focal_energy = vec![0.002, 0.002, 0.0, 0.0];
+        let mut b = profile("Horn", -32.0, &[("mid", -28.0)]);
+        b.active_bars = vec![2, 3];
+        b.bar_focal_energy = vec![0.0, 0.0, 0.005, 0.005];
+        assert!(detect_masking(&[a.clone(), b.clone()]).is_empty(), "non-overlapping bars do not mask");
+
+        let mut pad = profile("Pad", -24.0, &[("mid", -20.0)]);
+        pad.active_bars = vec![0, 1];
+        pad.bar_focal_energy = vec![0.010, 0.010, 0.0, 0.0];
+        let lar = foreground_lar_report(&[a, pad], "flute", 0, 2);
+        assert!(lar.contains("BURIAL"), "{lar}");
     }
 }

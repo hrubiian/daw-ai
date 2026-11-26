@@ -62,6 +62,15 @@ pub fn swung_step_tick(step: u32, swing: f32) -> u32 {
     }
 }
 
+/// Swing offbeat 8th-note piano-roll ticks (`tick % 120 == 60`), matching step swing.
+pub fn swung_piano_tick(tick: u32, swing: f32) -> u32 {
+    if swing > 0.0 && tick % TICKS_PER_BEAT == TICKS_PER_BEAT / 2 {
+        tick + ((TICKS_PER_BEAT as f32 / 6.0) * swing.clamp(0.0, 1.0)).round() as u32
+    } else {
+        tick
+    }
+}
+
 /// Apply deterministic velocity humanization. The jitter is a pure function of
 /// `(channel, pitch, tick)`, so live playback and offline export agree and
 /// renders are reproducible. At `humanize = 1.0`, velocity varies by ±35%.
@@ -93,10 +102,35 @@ pub fn note_fire_tick(pitch: u8, nominal: u32, strip: u8, timing: f32, pattern_l
 }
 
 pub fn piano_note_duration(pattern: &crate::project::PianoRollPattern, note: &crate::project::Note) -> u32 {
-    if pattern.legato {
-        pattern.active_notes().map(|n| n.tick).filter(|&tick| tick > note.tick).min()
-            .map(|next| next - note.tick).unwrap_or(note.duration)
-    } else { note.duration }
+    if !pattern.legato {
+        return note.duration;
+    }
+    let swing = pattern.swing.unwrap_or(0.0);
+    let note_start = swung_piano_tick(note.tick, swing);
+    let Some(next_raw) = pattern
+        .active_notes()
+        .map(|n| n.tick)
+        .filter(|&tick| tick > note.tick)
+        .min()
+    else {
+        return note.duration;
+    };
+    let next = swung_piano_tick(next_raw, swing);
+    let natural_end = note_start.saturating_add(note.duration);
+    if let Some(max_gap) = pattern.legato_max_gap_ticks {
+        if next > natural_end && next - natural_end > max_gap {
+            return note.duration;
+        }
+    }
+    let span = next.saturating_sub(note_start).max(1);
+    let same_pitch_at_next = pattern
+        .active_notes()
+        .any(|n| n.tick == next_raw && n.pitch == note.pitch);
+    if pattern.legato_overlap_ticks > 0 && !same_pitch_at_next {
+        span.saturating_add(u32::from(pattern.legato_overlap_ticks))
+    } else {
+        span
+    }
 }
 
 pub fn humanize_velocity(vel: u8, channel: u8, pitch: u8, tick: u32, humanize: f32) -> u8 {
@@ -138,9 +172,8 @@ pub fn modulated_value(m: &Modulator, base01: f32, t_secs: f32) -> f32 {
 pub fn pattern_length_ticks(pattern: &Pattern) -> u32 {
     match pattern {
         // Steps are 16th notes: length derives from the count (32 steps =
-        // 2 bars, 4 steps = a 1-beat loop). The serialized `bars` field is
-        // back-compat only.
-        Pattern::Step(p)      => (p.steps as u32).max(1) * (TICKS_PER_BAR / 16),
+        // 2 bars of 4/4, 28 steps = 1 bar of 7/4).
+        Pattern::Step(p)      => (p.steps as u32).max(1) * (TICKS_PER_BEAT / 4),
         Pattern::PianoRoll(p) => p.length_ticks(),
     }
 }
@@ -150,6 +183,7 @@ pub struct PatternPlacement<'a> {
     pub end: u32,
     pub pattern: &'a Pattern,
     pub repeats: bool,
+    pub gain: f32,
 }
 
 impl PatternPlacement<'_> {
@@ -167,22 +201,24 @@ pub fn arranged_track_patterns<'a>(
     project: &'a Project,
     track_id: &str,
 ) -> Vec<PatternPlacement<'a>> {
+    let tpb = project.ticks_per_bar();
     let mut placements: Vec<_> = project
         .arrangement
         .iter()
         .filter(|clip| clip.track == track_id)
         .filter_map(|clip| {
             let pattern = project.patterns.iter().find(|p| p.id() == clip.pattern)?;
-            let start = clip.start_tick();
+            let start = clip.start_tick_in(tpb);
             let length = clip.len_bars.map_or_else(
                 || pattern_length_ticks(pattern),
-                |bars| bars.max(1) * TICKS_PER_BAR,
+                |bars| bars.max(1) * tpb,
             );
             Some(PatternPlacement {
                 start,
                 end: start + length,
                 pattern,
                 repeats: clip.len_bars.is_some(),
+                gain: clip.gain,
             })
         })
         .collect();
@@ -216,6 +252,7 @@ struct SlotState {
     start_tick: u32,
     end_tick:   u32,
     loop_pat:   bool,   // true = pattern loops within the slot (pattern-mode auto-fill)
+    gain:       f32,
     pattern:    Pattern,
 }
 
@@ -224,12 +261,15 @@ struct TrackState {
     strip:    u8,
     slots:    Vec<SlotState>,
     muted:    bool,
+    volume_automation: Vec<crate::project::VolumePoint>,
     /// True when this track triggers sampler pads instead of a synth.
     is_sampler: bool,
     /// Sampler pitches whose pad follows note length (note-off releases them).
     gated: Vec<u8>,
     /// (CC number, static base value 0..1, modulator) for each LFO on this track.
     mod_jobs: Vec<(u8, f32, Modulator)>,
+    tuning_cents: f32,
+    pitch_bend_range_semitones: u8,
 }
 
 /// Static base value (0..1) a modulator oscillates around, read from the track.
@@ -258,6 +298,11 @@ pub struct Sequencer {
     next_sample: Option<f64>,
     event_frame: Option<u64>,
     bpm:           f64,
+    time_signature: [u8; 2],
+    ticks_per_bar: u32,
+    ticks_per_meter_beat: u32,
+    tempo_changes: Vec<crate::project::TempoPoint>,
+    last_emitted_bpm: f64,
     swing:         f32,
     humanize:      f32,
     timing:        f32,
@@ -301,6 +346,11 @@ impl Sequencer {
             next_sample: None,
             event_frame: None,
             bpm: 120.0,
+            time_signature: [4, 4],
+            ticks_per_bar: TICKS_PER_BAR,
+            ticks_per_meter_beat: TICKS_PER_BEAT,
+            tempo_changes: Vec::new(),
+            last_emitted_bpm: 120.0,
             swing: 0.0,
             humanize: 0.0,
             timing: 0.0,
@@ -402,10 +452,14 @@ impl Sequencer {
 
     /// Desired gate state at `tick` while armed + rolling.
     fn punch_wants_open(&self, tick: u32) -> bool {
-        let (s, e) = self.loop_region.ticks();
+        let (s, e) = self.loop_region.ticks_in(self.ticks_per_bar);
         let after_in = !self.loop_region.punch_in || tick >= s;
         let before_out = !self.loop_region.punch_out || tick < e;
         after_in && before_out
+    }
+
+    fn current_bpm(&self) -> f64 {
+        crate::musical_time::bpm_at_tick(self.bpm, &self.tempo_changes, self.tick)
     }
 
     /// Reconcile the gate with the punch window (armed + rolling only).
@@ -421,7 +475,7 @@ impl Sequencer {
     }
 
     fn tick_duration(&self) -> Duration {
-        let secs = 60.0 / self.bpm / TICKS_PER_BEAT as f64;
+        let secs = 60.0 / self.current_bpm() / TICKS_PER_BEAT as f64;
         Duration::from_secs_f64(secs)
     }
 
@@ -432,7 +486,7 @@ impl Sequencer {
             .max()
             .unwrap_or(0);
         let audio = self.audio_jobs.iter().map(|j| j.end_tick).max().unwrap_or(0);
-        pat.max(audio).max(TICKS_PER_BAR)
+        pat.max(audio).max(self.ticks_per_bar)
     }
 
     /// Flip a track's live mute. Event gating in `fire_tick` uses `ts.muted`;
@@ -455,12 +509,13 @@ impl Sequencer {
     /// Muted clips are still triggered; the engine silences them via its mute set.
     fn arm_audio_clips_at_playhead(&self) {
         let _ = self.emit(AudioEvent::StopAudioClips);
-        let spt = 60.0 / self.bpm / TICKS_PER_BEAT as f64; // seconds per tick
+        let playhead_sec = crate::musical_time::tick_to_seconds(self.bpm, &self.tempo_changes, self.tick);
         for job in &self.audio_jobs {
             // Clips starting exactly here are triggered by fire_tick. Arming
             // them too would double their voices on Play/Seek/loop boundaries.
             if job.start_tick < self.tick && self.tick < job.end_tick {
-                let into_sec = (self.tick - job.start_tick) as f32 * spt as f32;
+                let start_sec = crate::musical_time::tick_to_seconds(self.bpm, &self.tempo_changes, job.start_tick);
+                let into_sec = (playhead_sec - start_sec).max(0.0) as f32;
                 let _ = self.emit(AudioEvent::TriggerAudioClip {
                     strip: job.strip,
                     clip_id: job.clip_id,
@@ -488,6 +543,26 @@ impl Sequencer {
         } else {
             let _ = self.emit(AudioEvent::StopAudioClips);
         }
+        for (_, ts) in &self.tracks {
+            if !ts.volume_automation.is_empty() {
+                let mult = crate::project::VolumePoint::segment_at(&ts.volume_automation, self.tick).0;
+                let _ = self.emit(AudioEvent::SetStripVolumeAutomation {
+                    strip: ts.strip,
+                    gain: mult,
+                });
+            }
+            // A loop or song wrap seeks without a Panic, so a bend set late in
+            // the previous pass would otherwise carry into the new one. Return
+            // to base tuning; the clips re-send their bends at their points.
+            if ts.slots.iter().any(|sl| matches!(&sl.pattern, Pattern::PianoRoll(pr) if !pr.pitch_bends.is_empty())) {
+                let bend = crate::audio::mixer::bend14_from_cents_with_range(ts.tuning_cents, ts.pitch_bend_range_semitones);
+                let _ = self.emit(AudioEvent::PitchBend {
+                    strip: ts.strip,
+                    lsb: (bend & 0x7F) as u8,
+                    msb: ((bend >> 7) & 0x7F) as u8,
+                });
+            }
+        }
     }
 
     /// Transition into rolling playback: mark the state and arm arranged
@@ -510,7 +585,7 @@ impl Sequencer {
             self.update_gate();
             return;
         }
-        self.count_in = count_in_bars as u32 * TICKS_PER_BAR;
+        self.count_in = count_in_bars as u32 * self.ticks_per_bar;
         self.playing = true;
         if self.count_in == 0 {
             self.start_roll();
@@ -541,8 +616,8 @@ impl Sequencer {
     /// One count-in tick: click on beats (accented on the bar), playhead held.
     /// Count-in clicks always sound, regardless of the metronome toggle.
     fn fire_count_in_tick(&mut self) {
-        if self.count_in.is_multiple_of(TICKS_PER_BEAT) {
-            let vel = if self.count_in.is_multiple_of(TICKS_PER_BAR) { 110u8 } else { 80u8 };
+        if self.count_in.is_multiple_of(self.ticks_per_meter_beat) {
+            let vel = if self.count_in.is_multiple_of(self.ticks_per_bar) { 110u8 } else { 80u8 };
             let _ = self.emit(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
             let _ = self.emit(AudioEvent::NoteOn { strip: STRIP_UTILITY, pitch: 75, velocity: vel });
         }
@@ -568,13 +643,19 @@ impl Sequencer {
         if self.event_frame.is_some() { self.publish_u32(&self.playback_tick, self.tick); }
         // 0. On a bar boundary, apply any queued live edit (cycle-quantized swap)
         //    before generating this bar's events, so it starts on the downbeat.
-        if self.tick.is_multiple_of(TICKS_PER_BAR) {
+        if self.tick.is_multiple_of(self.ticks_per_bar) {
             if let Some(p) = self.pending_update.take() {
                 self.apply_project(p, false);
                 if let Some((revision, ack)) = self.pending_ack.take() {
                     let _ = self.emit(AudioEvent::Applied { revision, ack });
                 }
             }
+        }
+
+        let cur_bpm = self.current_bpm();
+        if (cur_bpm - self.last_emitted_bpm).abs() > 0.05 {
+            let _ = self.emit(AudioEvent::SetTempo { bpm: cur_bpm });
+            self.last_emitted_bpm = cur_bpm;
         }
 
         // 1. Drain scheduled NoteOffs whose tick has arrived
@@ -587,7 +668,8 @@ impl Sequencer {
             }
         }
 
-        // 2. Collect NoteOns/NoteOffs for current tick (immutable read phase)
+        // 2. Collect NoteOns/NoteOffs and pattern CCs for current tick (immutable read phase)
+        let mut cc_events: Vec<AudioEvent>          = Vec::new();
         let mut note_ons:  Vec<AudioEvent>          = Vec::new();
         let mut note_offs: Vec<(u32, AudioEvent)>   = Vec::new();
 
@@ -595,11 +677,32 @@ impl Sequencer {
             if ts.muted { continue; }
             let strip = ts.strip;
 
+            // Release sustain pedal if a pattern clip using CC64 just ended.
+            if ts.slots.iter().any(|sl| {
+                sl.end_tick == self.tick
+                    && matches!(&sl.pattern, Pattern::PianoRoll(pr) if pr.cc_events.iter().any(|c| c.cc == 64))
+            }) {
+                cc_events.push(AudioEvent::RawCC { strip, cc: 64, value: 0 });
+            }
+            // Reset pitch bend back to track base tuning if a clip using pitch_bends just ended.
+            if ts.slots.iter().any(|sl| {
+                sl.end_tick == self.tick
+                    && matches!(&sl.pattern, Pattern::PianoRoll(pr) if !pr.pitch_bends.is_empty())
+            }) {
+                let bend = crate::audio::mixer::bend14_from_cents_with_range(ts.tuning_cents, ts.pitch_bend_range_semitones);
+                cc_events.push(AudioEvent::PitchBend {
+                    strip,
+                    lsb: (bend & 0x7F) as u8,
+                    msb: ((bend >> 7) & 0x7F) as u8,
+                });
+            }
+
             // Find the slot that covers the current tick
             let slot = ts.slots.iter().find(|s| {
                 s.start_tick <= self.tick && self.tick < s.end_tick
             });
             let Some(slot) = slot else { continue };
+            if slot.gain <= 0.0 { continue; }
 
             let local_tick  = self.tick - slot.start_tick;
             let pat_len     = pattern_length_ticks(&slot.pattern).max(1);
@@ -610,15 +713,16 @@ impl Sequencer {
             match &slot.pattern {
                 Pattern::Step(sp) => {
                     let step_count    = sp.steps as u32;
-                    let ticks_per_step = TICKS_PER_BAR / 16; // steps are 16ths
-                    let swing         = self.swing;
+                    let ticks_per_step = TICKS_PER_BEAT / 4; // steps are 16ths
+                    let swing         = sp.swing.unwrap_or(self.swing);
                     for step in 0..step_count {
                         let nominal = swung_step_tick(step, swing);
                         for row in &sp.rows {
                             if let Some(velocity) = row.step_velocity(step as usize) {
                                 let fire = note_fire_tick(row.pitch, nominal, strip, self.timing, pat_len);
                                 if fire != pat_tick { continue; }
-                                let velocity = humanize_velocity(velocity, strip, row.pitch, self.tick, self.humanize);
+                                let scaled = ((velocity as f32) * slot.gain).round().clamp(1.0, 127.0) as u8;
+                                let velocity = humanize_velocity(scaled, strip, row.pitch, self.tick, self.humanize);
                                 if ts.is_sampler {
                                     note_ons.push(AudioEvent::TriggerSample { strip, pitch: row.pitch, gain: velocity as f32 / 127.0 });
                                     if ts.gated.contains(&row.pitch) {
@@ -635,10 +739,31 @@ impl Sequencer {
                     }
                 }
                 Pattern::PianoRoll(pr) => {
+                    for pb in &pr.pitch_bends {
+                        if pb.tick < pat_len && pb.tick == pat_tick {
+                            let bend = crate::audio::mixer::bend14_from_cents_with_range(
+                                ts.tuning_cents + pb.cents,
+                                ts.pitch_bend_range_semitones,
+                            );
+                            cc_events.push(AudioEvent::PitchBend {
+                                strip,
+                                lsb: (bend & 0x7F) as u8,
+                                msb: ((bend >> 7) & 0x7F) as u8,
+                            });
+                        }
+                    }
+                    for c in &pr.cc_events {
+                        if c.tick < pat_len && c.tick == pat_tick {
+                            cc_events.push(AudioEvent::RawCC { strip, cc: c.cc, value: c.value });
+                        }
+                    }
+                    let pr_swing = pr.swing.unwrap_or(0.0);
                     for note in pr.active_notes() {
-                        let fire = note_fire_tick(note.pitch, note.tick, strip, self.timing, pat_len);
+                        let nominal = swung_piano_tick(note.tick, pr_swing);
+                        let fire = note_fire_tick(note.pitch, nominal, strip, self.timing, pat_len);
                         if fire == pat_tick {
-                            let velocity = humanize_velocity(note.vel, strip, note.pitch, self.tick, self.humanize);
+                            let scaled = ((note.vel as f32) * slot.gain).round().clamp(1.0, 127.0) as u8;
+                            let velocity = humanize_velocity(scaled, strip, note.pitch, self.tick, self.humanize);
                             if ts.is_sampler {
                                 note_ons.push(AudioEvent::TriggerSample { strip, pitch: note.pitch, gain: velocity as f32 / 127.0 });
                                 if ts.gated.contains(&note.pitch) {
@@ -659,11 +784,23 @@ impl Sequencer {
         }
 
         // Apply collected events (mutable write phase — no borrow conflict)
+        for ev in cc_events {
+            let _ = self.emit(ev);
+        }
         for ev in note_ons {
             let _ = self.emit(ev);
         }
         for (off_tick, ev) in note_offs {
             self.schedule.entry(off_tick).or_default().push(ev);
+        }
+
+        // Sample the same automation curves as export. The mixer glides between updates.
+        let auto_ev: Vec<AudioEvent> = self.tracks.iter().filter_map(|(_, ts)| {
+            let gain = crate::project::VolumePoint::scheduled_gain(&ts.volume_automation, self.tick, cur_bpm)?;
+            Some(AudioEvent::SetStripVolumeAutomation { strip: ts.strip, gain })
+        }).collect();
+        for ev in auto_ev {
+            let _ = self.emit(ev);
         }
 
         // Fire arranged audio clips whose start tick is the current tick.
@@ -682,8 +819,7 @@ impl Sequencer {
         // LFO modulation: refresh every 32nd note (≈30–60 ms at usual tempos);
         // the mixer glides between values, so sweeps stay smooth without flooding.
         if self.tick.is_multiple_of(TICKS_PER_BEAT / 8) {
-            let spt = 60.0 / self.bpm / TICKS_PER_BEAT as f64; // seconds per tick
-            let t = (self.tick as f64 * spt) as f32;
+            let t = crate::musical_time::tick_to_seconds(self.bpm, &self.tempo_changes, self.tick) as f32;
             let mut ccs: Vec<AudioEvent> = Vec::new();
             for (_, ts) in &self.tracks {
                 for (cc, base01, m) in &ts.mod_jobs {
@@ -695,17 +831,17 @@ impl Sequencer {
         }
 
         // Metronome click (utility synth, pitch 75 = Claves)
-        if self.metronome && self.tick.is_multiple_of(TICKS_PER_BEAT) {
-            let vel = if self.tick.is_multiple_of(TICKS_PER_BAR) { 100u8 } else { 60u8 };
+        if self.metronome && self.tick.is_multiple_of(self.ticks_per_meter_beat) {
+            let vel = if self.tick.is_multiple_of(self.ticks_per_bar) { 100u8 } else { 60u8 };
             let _ = self.emit(AudioEvent::NoteOn { strip: STRIP_UTILITY, pitch: 75, velocity: vel });
-            let off = self.tick + TICKS_PER_BEAT / 4;
+            let off = self.tick + self.ticks_per_meter_beat / 4;
             self.schedule.entry(off).or_default().push(AudioEvent::NoteOff { strip: STRIP_UTILITY, pitch: 75 });
         }
 
         // 3. Advance tick: loop-region wrap takes precedence over the song
         //    boundary. Region wrap = seek semantics (schedule dropped,
         //    straddling clips re-armed) + a take split while recording.
-        let (ls, le) = self.loop_region.ticks();
+        let (ls, le) = self.loop_region.ticks_in(self.ticks_per_bar);
         let next = self.tick + 1;
         if self.loop_region.enabled && next >= le && self.tick < le {
             // Fire pending NoteOffs before seek() drops the schedule, so
@@ -823,8 +959,18 @@ impl Sequencer {
             let _ = self.emit(AudioEvent::LoadStrips { specs: specs.clone() });
         }
         self.strip_state = project.tracks.iter().map(|track| track.id.clone()).zip(specs).collect();
-        self.bpm       = project.project.bpm.clamp(20.0, 300.0);
-        let _ = self.emit(AudioEvent::SetTempo { bpm: self.bpm });
+        self.bpm       = project.project.bpm.clamp(crate::musical_time::MIN_BPM, crate::musical_time::MAX_BPM);
+        self.time_signature = project.project.time_signature;
+        self.ticks_per_bar = project.ticks_per_bar();
+        self.ticks_per_meter_beat = project.ticks_per_meter_beat();
+        self.tempo_changes = project.tempo_changes.clone();
+        let cur_bpm = self.current_bpm();
+        self.last_emitted_bpm = cur_bpm;
+        let _ = self.emit(AudioEvent::SetTempo { bpm: cur_bpm });
+        let _ = self.emit(AudioEvent::SetTimeSignature {
+            numerator: self.time_signature[0],
+            denominator: self.time_signature[1],
+        });
         self.swing     = project.project.swing;
         self.humanize  = project.project.humanize;
         self.timing    = project.project.timing;
@@ -834,6 +980,9 @@ impl Sequencer {
         // modulator this edit removed (the strip would keep the last LFO value).
         let old_mods: Vec<(u8, Vec<u8>)> = if reusable {
             self.tracks.iter().map(|(_, ts)| (ts.strip, ts.mod_jobs.iter().map(|j| j.0).collect())).collect()
+        } else { Vec::new() };
+        let old_autos: Vec<u8> = if reusable {
+            self.tracks.iter().filter(|(_, ts)| !ts.volume_automation.is_empty()).map(|(_, ts)| ts.strip).collect()
         } else { Vec::new() };
         self.tracks.clear();
 
@@ -848,8 +997,8 @@ impl Sequencer {
         let mut clip_specs: Vec<(u32, String)> = Vec::new();
         for (ci, clip) in project.audio_clips.iter().enumerate() {
             let strip = project.tracks.iter().position(|t| t.id == clip.track).unwrap_or(0) as u8;
-            let start_tick = sec_to_tick(clip.start_sec, self.bpm);
-            let end_tick   = sec_to_tick(clip.start_sec + clip.len_sec, self.bpm);
+            let start_tick = crate::musical_time::seconds_to_tick(self.bpm, &self.tempo_changes, clip.start_sec);
+            let end_tick   = crate::musical_time::seconds_to_tick(self.bpm, &self.tempo_changes, clip.start_sec + clip.len_sec);
             let clip_id = ci as u32;
             self.audio_jobs.push(AudioClipJob {
                 clip_id, strip, start_tick, end_tick,
@@ -868,7 +1017,7 @@ impl Sequencer {
             let clip_id = (project.audio_clips.len() + i) as u32;
             self.audio_jobs.push(AudioClipJob {
                 clip_id, strip: i as u8, start_tick: 0,
-                end_tick: sec_to_tick(len_sec, self.bpm),
+                end_tick: crate::musical_time::seconds_to_tick(self.bpm, &self.tempo_changes, len_sec),
                 offset_sec: 0.0, len_sec: len_sec as f32, gain: 1.0,
             });
             clip_specs.push((clip_id, path.clone()));
@@ -887,7 +1036,7 @@ impl Sequencer {
             .filter_map(|pid| project.patterns.iter().find(|p| p.id() == pid))
             .map(pattern_length_ticks)
             .max()
-            .unwrap_or(TICKS_PER_BAR);
+            .unwrap_or(self.ticks_per_bar);
 
         // Determine arrangement mode
         let has_arrangement = !project.arrangement.is_empty();
@@ -901,10 +1050,13 @@ impl Sequencer {
                     strip,
                     slots:    Vec::new(),
                     muted:    track.muted,
+                    volume_automation: track.volume_automation.clone(),
                     is_sampler: false,
                     gated: Vec::new(),
                     // Audio strips have no synth: only mixer-level destinations apply.
                     mod_jobs: mixer_mod_jobs(track),
+                    tuning_cents: track.tuning_cents,
+                    pitch_bend_range_semitones: track.pitch_bend_range_semitones,
                 }));
                 continue;
             }
@@ -917,6 +1069,7 @@ impl Sequencer {
                         start_tick: clip.start,
                         end_tick: clip.end,
                         loop_pat: clip.repeats,
+                        gain: clip.gain,
                         pattern: clip.pattern.clone(),
                     })
                     .collect()
@@ -928,14 +1081,15 @@ impl Sequencer {
                         start_tick: 0,
                         end_tick:   auto_loop_len,
                         loop_pat:   true,
+                        gain:       1.0,
                         pattern:    pat,
                     }])
                     .unwrap_or_default()
             };
 
-            // Synth-less strips (sampler, CLAP) take the mixer-level
+            // Synth-less strips (sampler, CLAP, SFZ) take mixer-level
             // destinations; SoundFont strips also take resonance as a CC.
-            let synthless = is_sampler || matches!(track.instrument, Instrument::Clap(_));
+            let synthless = is_sampler || matches!(track.instrument, Instrument::Clap(_) | Instrument::Sfz { .. });
             let mod_jobs = if synthless {
                 mixer_mod_jobs(track)
             } else {
@@ -952,9 +1106,12 @@ impl Sequencer {
                 strip,
                 slots,
                 muted:    track.muted,
+                volume_automation: track.volume_automation.clone(),
                 is_sampler,
                 gated,
                 mod_jobs,
+                tuning_cents: track.tuning_cents,
+                pitch_bend_range_semitones: track.pitch_bend_range_semitones,
             }));
         }
 
@@ -965,12 +1122,25 @@ impl Sequencer {
                 if !now.contains(&cc) { let _ = self.emit(AudioEvent::Modulate { strip, cc, value: None }); }
             }
         }
-
-        // Live swap: keep the playhead, but clamp it to the (possibly new) length.
+        // Live swap: keep the playhead within the possibly changed length.
         if !reset_tick {
             let max = self.song_length_ticks().max(1);
             self.tick %= max;
             self.publish_u32(&self.playback_tick, self.tick);
+        }
+        for (_, ts) in &self.tracks {
+            if !ts.volume_automation.is_empty() {
+                let mult = crate::project::VolumePoint::segment_at(&ts.volume_automation, self.tick).0;
+                let _ = self.emit(AudioEvent::SetStripVolumeAutomation {
+                    strip: ts.strip,
+                    gain: mult,
+                });
+            } else if old_autos.contains(&ts.strip) {
+                let _ = self.emit(AudioEvent::SetStripVolumeAutomation {
+                    strip: ts.strip,
+                    gain: 1.0,
+                });
+            }
         }
     }
 
@@ -985,7 +1155,7 @@ impl Sequencer {
                         if frame.round() as u64 > horizon { break; }
                         self.event_frame = Some(frame.round() as u64);
                         self.advance();
-                        frame += sample_rate as f64 * 60.0 / self.bpm / TICKS_PER_BEAT as f64;
+                        frame += sample_rate as f64 * 60.0 / self.current_bpm() / TICKS_PER_BEAT as f64;
                     }
                     self.next_sample = Some(frame);
                     self.event_frame = None;
@@ -1028,7 +1198,7 @@ impl Sequencer {
                     }
                     SequencerCommand::SetBpm(bpm) => {
                         // A zero/NaN tempo would make tick_duration() panic.
-                        self.bpm = if bpm.is_finite() { bpm.clamp(20.0, 300.0) } else { self.bpm };
+                        self.bpm = if bpm.is_finite() { bpm.clamp(crate::musical_time::MIN_BPM, crate::musical_time::MAX_BPM) } else { self.bpm };
                         let _ = self.emit(AudioEvent::SetTempo { bpm: self.bpm });
                         next_tick = Instant::now();
                     }
@@ -1605,9 +1775,12 @@ mod tests {
             muted: track_muted,
             patterns: vec![],
             effects: Default::default(),
+            comments: Vec::new(),
+            volume_automation: Vec::new(),
             modulators: vec![],
             clap_fx: vec![],
             tuning_cents: 0.0,
+            pitch_bend_range_semitones: 2,
             input: None,
         });
         p.audio_clips.push(AudioClip {
@@ -1977,5 +2150,181 @@ mod tests {
             _ => None,
         }).expect("Play should trigger the clip spanning the playhead");
         assert!((off - 1.0).abs() < 0.05, "expected ~1.0s in-clip offset, got {off}");
+    }
+
+    #[test]
+    fn rest_preserving_overlap_legato_keeps_phrase_rests_and_repeated_pitches() {
+        let pattern: crate::project::PianoRollPattern = serde_json::from_value(serde_json::json!({
+            "id":"phrase", "name":"Phrase", "bars":2, "ticks_per_bar":480,
+            "legato": true, "legato_overlap_ticks": 15, "legato_max_gap_ticks": 90,
+            "notes":[
+                {"pitch":62,"tick":0,"duration":100,"vel":80},
+                {"pitch":65,"tick":120,"duration":100,"vel":80},
+                {"pitch":65,"tick":240,"duration":80,"vel":80},
+                {"pitch":69,"tick":480,"duration":120,"vel":80}
+            ]
+        })).unwrap();
+        // Gap 100..120 = 20 <= 90 and pitch changes (62->65): overlap +15 => 135.
+        assert_eq!(piano_note_duration(&pattern, &pattern.notes[0]), 135);
+        // Pitch repeats (65->65): touch at 120 without overlapping the re-strike.
+        assert_eq!(piano_note_duration(&pattern, &pattern.notes[1]), 120);
+        // Phrase rest 320..480 = 160 > 90: keep natural duration 80!
+        assert_eq!(piano_note_duration(&pattern, &pattern.notes[2]), 80);
+    }
+
+    #[test]
+    fn sequencer_emits_pattern_cc_events_and_volume_automation() {
+        let (mut seq, _, audio_rx) = make_sequencer();
+        let mut p = Project::default_project();
+        p.tracks[1].volume = 0.8;
+        p.set_volume_automation("t2", vec![
+            crate::project::VolumePoint { tick: 0, gain: 0.5 },
+            crate::project::VolumePoint { tick: 120, gain: 1.0 },
+        ]).unwrap();
+        p.set_pattern_cc("p2", vec![
+            crate::project::CcPoint { cc: 64, tick: 0, value: 127 },
+            crate::project::CcPoint { cc: 11, tick: 0, value: 96 },
+        ]).unwrap();
+        seq.load_project(p);
+        let _ = audio_rx.try_iter().count();
+        seq.fire_tick();
+        let evs: Vec<_> = audio_rx.try_iter().collect();
+        assert!(evs.iter().any(|e| matches!(e, AudioEvent::RawCC { strip: 1, cc: 64, value: 127 })));
+        assert!(evs.iter().any(|e| matches!(e, AudioEvent::RawCC { strip: 1, cc: 11, value: 96 })));
+        assert!(evs.iter().any(|e| matches!(e, AudioEvent::SetStripVolumeAutomation { strip: 1, gain } if (*gain - 0.5).abs() < 1e-4)));
+        seq.seek(30);
+        assert!(audio_rx.try_iter().any(|e| matches!(e,
+            AudioEvent::SetStripVolumeAutomation { strip: 1, gain } if (gain - 0.578125).abs() < 1e-4)));
+    }
+
+    #[test]
+    fn sequencer_emits_odd_meter_pitch_bends_and_tempo_map() {
+        let (mut seq, _, audio_rx) = make_sequencer();
+        let mut p = Project::default_project();
+        p.set_time_signature(7, 4).unwrap();
+        p.tracks[1].tuning_cents = 25.0;
+        if let Pattern::PianoRoll(pr) = &mut p.patterns[1] {
+            pr.bars = 1;
+            pr.notes = vec![crate::project::Note { pitch: 60, tick: 0, duration: 120, vel: 100 }];
+        }
+        p.set_pattern_pitch_bends("p2", vec![
+            crate::project::PitchBendPoint { tick: 0, cents: -100.0 },
+        ]).unwrap();
+        p.arrangement = vec![crate::project::ArrangementSlot {
+            track: "t2".into(), pattern: "p2".into(), bar: 0, offset_ticks: 0, len_bars: None, gain: 1.0,
+        }];
+        p.set_tempo_changes(vec![
+            crate::project::TempoPoint { tick: 1, bpm: 240.0, ramp: false },
+        ]).unwrap();
+        seq.load_project(p);
+        let load_evs: Vec<_> = audio_rx.try_iter().collect();
+        assert!(load_evs.iter().any(|e| matches!(e,
+            AudioEvent::SetTimeSignature { numerator: 7, denominator: 4 })));
+
+        // Tick 0: PitchBend (-75c = 25 - 100) must precede NoteOn on strip 1.
+        seq.fire_tick();
+        let tick0_evs: Vec<_> = audio_rx.try_iter().collect();
+        let expected_bend = crate::audio::mixer::bend14_from_cents(-75.0);
+        let pb_pos = tick0_evs.iter().position(|e| matches!(e,
+            AudioEvent::PitchBend { strip: 1, lsb, msb }
+                if *lsb == (expected_bend & 0x7F) as u8 && *msb == ((expected_bend >> 7) & 0x7F) as u8
+        )).expect("pitch bend at tick 0");
+        let on_pos = tick0_evs.iter().position(|e| matches!(e,
+            AudioEvent::NoteOn { strip: 1, pitch: 60, .. }
+        )).expect("note on at tick 0");
+        assert!(pb_pos < on_pos, "pitch bend must precede note on");
+
+        // Tick 1: tempo change to 240 BPM triggers SetTempo.
+        seq.tick = 1;
+        seq.fire_tick();
+        let tick1_evs: Vec<_> = audio_rx.try_iter().collect();
+        assert!(tick1_evs.iter().any(|e| matches!(e, AudioEvent::SetTempo { bpm } if (*bpm - 240.0).abs() < 1e-6)));
+
+        // Tick 840 (clip end in 7/4): resets pitch bend back to track base tuning (+25c).
+        seq.tick = 840;
+        seq.fire_tick();
+        let end_evs: Vec<_> = audio_rx.try_iter().collect();
+        let base_bend = crate::audio::mixer::bend14_from_cents(25.0);
+        assert!(end_evs.iter().any(|e| matches!(e,
+            AudioEvent::PitchBend { strip: 1, lsb, msb }
+                if *lsb == (base_bend & 0x7F) as u8 && *msb == ((base_bend >> 7) & 0x7F) as u8
+        )));
+    }
+
+    #[test]
+    fn swung_piano_roll_and_pattern_swing_override() {
+        assert_eq!(swung_piano_tick(0, 0.6), 0);
+        assert_eq!(swung_piano_tick(60, 0.0), 60);
+        assert_eq!(swung_piano_tick(60, 1.0), 80);
+        assert_eq!(swung_piano_tick(180, 0.6), 192);
+
+        let (mut seq, _, audio_rx) = make_sequencer();
+        let mut p = Project::default_project();
+        p.project.bpm = 320.0;
+        p.project.swing = 0.0; // project is straight
+        p.set_track_pitch_bend_range("t2", 12).unwrap();
+        if let Pattern::PianoRoll(pr) = &mut p.patterns[1] {
+            pr.bars = 1;
+            pr.swing = Some(0.6); // pattern swings offbeat 8ths by +12 ticks -> 72
+            pr.notes = vec![
+                crate::project::Note { pitch: 60, tick: 0, duration: 50, vel: 100 },
+                crate::project::Note { pitch: 62, tick: 60, duration: 50, vel: 100 },
+            ];
+        }
+        p.set_pattern_pitch_bends("p2", vec![
+            crate::project::PitchBendPoint { tick: 0, cents: -600.0 },
+        ]).unwrap();
+        p.arrangement = vec![crate::project::ArrangementSlot {
+            track: "t2".into(), pattern: "p2".into(), bar: 0, offset_ticks: 0, len_bars: None, gain: 1.0,
+        }];
+        seq.load_project(p);
+        let _ = audio_rx.try_iter().count();
+
+        seq.fire_tick();
+        let evs0: Vec<_> = audio_rx.try_iter().collect();
+        let expected_wide = crate::audio::mixer::bend14_from_cents_with_range(-600.0, 12);
+        assert!(evs0.iter().any(|e| matches!(e,
+            AudioEvent::PitchBend { strip: 1, lsb, msb }
+                if *lsb == (expected_wide & 0x7F) as u8 && *msb == ((expected_wide >> 7) & 0x7F) as u8
+        )));
+
+        // Offbeat 8th (nominal 60) must NOT fire at tick 60, and MUST fire at tick 72.
+        seq.tick = 60;
+        seq.fire_tick();
+        assert!(!audio_rx.try_iter().any(|e| matches!(e, AudioEvent::NoteOn { strip: 1, pitch: 62, .. })));
+        seq.tick = 72;
+        seq.fire_tick();
+        assert!(audio_rx.try_iter().any(|e| matches!(e, AudioEvent::NoteOn { strip: 1, pitch: 62, .. })));
+    }
+
+    #[test]
+    fn loop_wrap_returns_pitch_bend_to_base_tuning() {
+        let (mut seq, _, audio_rx) = make_sequencer();
+        let mut p = Project::default_project();
+        p.tracks[1].tuning_cents = 25.0;
+        p.set_pattern_pitch_bends("p2", vec![
+            crate::project::PitchBendPoint { tick: 300, cents: -100.0 },
+        ]).unwrap();
+        p.arrangement = vec![crate::project::ArrangementSlot {
+            track: "t2".into(), pattern: "p2".into(), bar: 0, offset_ticks: 0, len_bars: Some(4), gain: 1.0,
+        }];
+        p.loop_region.start_bar = 0;
+        p.loop_region.end_bar = 1;
+        p.loop_region.enabled = true;
+        seq.load_project(p);
+        seq.playing = true;
+        seq.tick = 300;
+        seq.fire_tick();
+        let _: Vec<_> = audio_rx.try_iter().collect();
+
+        // Advance to the loop end; the wrap must undo the -100 c bend.
+        while seq.tick != 0 {
+            seq.fire_tick();
+        }
+        let base = crate::audio::mixer::bend14_from_cents(25.0);
+        assert!(audio_rx.try_iter().any(|e| matches!(e,
+            AudioEvent::PitchBend { strip: 1, lsb, msb }
+                if lsb == (base & 0x7F) as u8 && msb == ((base >> 7) & 0x7F) as u8)),
+            "loop wrap leaves the previous pass's pitch bend in place");
     }
 }

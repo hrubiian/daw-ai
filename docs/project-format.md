@@ -171,3 +171,22 @@ project files compatible. The route affects recording on Audio tracks.
 print the rack when guitar monitoring is active on the same mono input). Device/channel changes
 require finishing the current take. Unavailable named devices or channels
 produce an error instead of silently recording another input.
+
+## Volume automation, clip gain & MIDI CC expression
+
+- **Track `volume_automation`**: optional sorted array of `{ "tick": u32, "gain": f32 }`
+  breakpoints in arrangement ticks (480/bar, `gain` `0.0..=2.0`). Gain eases between
+  points without overshooting them, and holds its final value after the last
+  point. Gain multiplies the mixer
+  level during live playback and offline export. In the desktop arrangement,
+  turn on **Volume automation**, click to add a point, drag to move it, and
+  right-click to remove it. Agents can edit the same points via
+  `set_volume_automation`. To crossfade two tracks, draw a fade out on one
+  and a fade in across the same bars on the other.
+- **Arrangement slot `gain`**: optional per-clip gain multiplier (`0.0..=2.0`, default
+  `1.0`) for spotlighting sections without duplicating patterns or tracks.
+- **Piano-roll `cc_events` & expressive legato**: optional `cc_events` array of
+  `{ "tick": u32, "cc": u8, "value": u8 }` (`cc` in `{1, 11, 64, 74}`) inside a
+  piano-roll pattern, plus `legato_overlap_ticks` (`0..=240`) and optional
+  `legato_max_gap_ticks` (rest threshold beyond which legato does not bridge notes).
+

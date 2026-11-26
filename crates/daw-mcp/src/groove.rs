@@ -9,20 +9,43 @@ use daw_core::project::{Pattern, Project};
 pub fn groove_report(project: &Project) -> String {
     let mut offsets: Vec<i32> = Vec::new();
     let mut n_pat = 0usize;
+    let mut per_track: Vec<(String, usize, f32, f32)> = Vec::new();
+    let m = &project.project;
+    let has_settings = m.swing >= 0.02 || m.humanize >= 0.02 || m.timing >= 0.02;
+
+    const SIXTEENTH: u32 = daw_core::musical_time::TICKS_PER_BEAT / 4; // 30 ticks
+
     for pat in &project.patterns {
         if let Pattern::PianoRoll(pr) = pat {
             let mut notes = pr.active_notes().peekable();
             if notes.peek().is_none() {
                 continue;
             }
-            let grid = (pr.ticks_per_bar / 16).max(1);
             n_pat += 1;
             for note in notes {
-                offsets.push(nearest_grid_offset(note.tick, grid));
+                offsets.push(nearest_grid_offset(note.tick, SIXTEENTH));
             }
         }
     }
-    let m = &project.project;
+
+    for tr in &project.tracks {
+        if tr.muted || tr.track_type != daw_core::project::TrackType::Melodic {
+            continue;
+        }
+        let mut t_offsets = Vec::new();
+        for pid in &tr.patterns {
+            if let Some(Pattern::PianoRoll(pr)) = project.patterns.iter().find(|p| p.id() == pid) {
+                for note in pr.active_notes() {
+                    t_offsets.push(nearest_grid_offset(note.tick, SIXTEENTH));
+                }
+            }
+        }
+        if !t_offsets.is_empty() {
+            let (tfrac, trms) = timing_stats(&t_offsets, 1);
+            per_track.push((tr.name.clone(), t_offsets.len(), tfrac, trms));
+        }
+    }
+
     if offsets.is_empty() {
         return format!(
             "groove: no piano-roll notes to analyze (step patterns are grid-locked; \
@@ -31,7 +54,21 @@ pub fn groove_report(project: &Project) -> String {
         );
     }
     let (frac, rms) = timing_stats(&offsets, 1);
-    let findings = groove_findings(frac, rms, m.swing, m.humanize, m.timing);
+    let mut findings = groove_findings(frac, rms, m.swing, m.humanize, m.timing);
+    if !has_settings {
+        let locked: Vec<String> = per_track
+            .iter()
+            .filter(|(_, count, tfrac, trms)| *count >= 8 && *tfrac > 0.98 && *trms < 1.0)
+            .map(|(name, _, _, _)| name.clone())
+            .collect();
+        if !locked.is_empty() && findings.is_empty() {
+            findings.push(format!(
+                "mechanical track(s): {} is 100% grid-locked while another track supplies all timing spread",
+                locked.join(", ")
+            ));
+        }
+    }
+
     let mut s = format!("groove: {} notes across {n_pat} melodic pattern(s)\n", offsets.len());
     s.push_str(&format!(
         "  on-grid (16th): {:.0}%   micro-timing RMS: {rms:.1} ticks\n",
@@ -41,6 +78,15 @@ pub fn groove_report(project: &Project) -> String {
         "  swing: {:.2}   humanize: {:.2}   timing: {:.2}\n",
         m.swing, m.humanize, m.timing
     ));
+    if !per_track.is_empty() {
+        s.push_str("  per-track:\n");
+        for (name, count, tfrac, trms) in &per_track {
+            s.push_str(&format!(
+                "    {name}: {count} notes, {:.0}% on-grid, RMS {trms:.1} ticks\n",
+                tfrac * 100.0
+            ));
+        }
+    }
     if findings.is_empty() {
         s.push_str("notes depart from the grid or playback feel settings are enabled.\n");
     } else {
@@ -137,5 +183,50 @@ mod tests {
     fn authored_microtiming_is_not_mechanical() {
         let f = groove_findings(0.5, 6.0, 0.0, 0.0, 0.0);
         assert!(!f.iter().any(|s| s.contains("mechanical")), "{f:?}");
+    }
+
+    #[test]
+    fn flags_mechanical_lead_track_even_when_accompaniment_rolls_chords() {
+        let mut p = Project::default_project();
+        let lead = p.add_track(daw_core::project::TrackType::Melodic);
+        let lead_pid = p.tracks.iter().find(|t| t.id == lead).unwrap().patterns[0].clone();
+        if let Some(Pattern::PianoRoll(pr)) = p.patterns.iter_mut().find(|pat| pat.id() == lead_pid) {
+            pr.notes = (0..8).map(|i| daw_core::project::Note {
+                pitch: 69, tick: i * 240, duration: 200, vel: 80,
+            }).collect();
+        }
+        // Accompaniment track has rolled off-grid notes
+        if let Some(Pattern::PianoRoll(pr)) = p.patterns.iter_mut().find(|pat| pat.id() == "p2") {
+            pr.notes = (0..8).map(|i| daw_core::project::Note {
+                pitch: 48, tick: i * 120 + 10, duration: 100, vel: 70,
+            }).collect();
+        }
+        let rep = groove_report(&p);
+        assert!(rep.contains("mechanical track(s):"), "{rep}");
+    }
+
+    #[test]
+    fn seven_four_sixteenth_notes_are_recognized_as_on_grid() {
+        let mut p = Project::default_project();
+        p.set_time_signature(7, 4).unwrap();
+        p.patterns[1] = Pattern::PianoRoll(daw_core::project::PianoRollPattern {
+            id: "p2".into(),
+            name: "7/4 Ostinato".into(),
+            bars: 1,
+            ticks_per_bar: 840,
+            notes: [0, 30, 60, 90, 120, 150]
+                .into_iter()
+                .map(|tick| daw_core::project::Note { pitch: 48, tick, duration: 25, vel: 90 })
+                .collect(),
+            legato: false,
+            cc_events: Vec::new(),
+            pitch_bends: Vec::new(),
+            legato_overlap_ticks: 0,
+            legato_max_gap_ticks: None,
+            swing: None,
+        });
+        let rep = groove_report(&p);
+        assert!(rep.contains("on-grid (16th): 100%"), "{rep}");
+        assert!(rep.contains("RMS: 0.0 ticks"), "{rep}");
     }
 }

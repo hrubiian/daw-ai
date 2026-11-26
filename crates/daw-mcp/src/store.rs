@@ -80,11 +80,19 @@ pub fn summary(p: &Project) -> String {
     let mut s = String::new();
     let m = &p.project;
     let lr = &p.loop_region;
+    let tc = if p.tempo_changes.is_empty() {
+        String::new()
+    } else {
+        format!(" (+{} tempo)", p.tempo_changes.len())
+    };
     let _ = writeln!(
         s,
-        "{} — bpm {} · {} {} · swing {:.2} · timing {:.2} · loop bars {}..{} ({}{}{})",
+        "{} — bpm {}{} · {}/{} · {} {} · swing {:.2} · timing {:.2} · loop bars {}..{} ({}{}{})",
         m.name,
         m.bpm,
+        tc,
+        m.time_signature[0],
+        m.time_signature[1],
         m.key,
         m.scale,
         m.swing,
@@ -114,6 +122,10 @@ pub fn summary(p: &Project) -> String {
                 format!("sampler(pads {list}){lfos}")
             }
             daw_core::project::Instrument::Clap(c) => format!("clap {}", c.id),
+            daw_core::project::Instrument::Sfz { path } => {
+                let name = std::path::Path::new(path).file_name().and_then(|s| s.to_str()).unwrap_or(path);
+                format!("sfz {name}")
+            }
         };
         let clap_fx = if t.clap_fx.is_empty() {
             String::new()
@@ -127,14 +139,20 @@ pub fn summary(p: &Project) -> String {
                     .join(",")
             )
         };
+        let auto = if t.volume_automation.is_empty() {
+            String::new()
+        } else {
+            format!(" auto[{}]", t.volume_automation.len())
+        };
         let _ = writeln!(
             s,
-            "  {} \"{}\" {:?} {} vol {:.2} pan {:+.1}{} rev {:.2} dly {:.2}{}",
+            "  {} \"{}\" {:?} {} vol {:.2}{} pan {:+.1}{} rev {:.2} dly {:.2}{}",
             t.id,
             t.name,
             t.track_type,
             inst,
             t.volume,
+            auto,
             t.pan,
             if t.muted { " MUTED" } else { "" },
             t.effects.reverb,
@@ -151,11 +169,18 @@ pub fn summary(p: &Project) -> String {
                 .map(|a| {
                     let off = if a.offset_ticks != 0 { format!("+{}t", a.offset_ticks) } else { String::new() };
                     let len = a.len_bars.map(|n| format!("×{n}")).unwrap_or_default();
-                    format!("{}@{}{}{}", a.pattern, a.bar, off, len)
+                    let gain = if (a.gain - 1.0).abs() > 1e-3 { format!("*{:.2}", a.gain) } else { String::new() };
+                    format!("{}@{}{}{}{}", a.pattern, a.bar, off, len, gain)
                 })
                 .collect::<Vec<_>>()
                 .join(", ")
         );
+        for comment in &t.comments {
+            let location = comment.bar.map_or_else(|| "whole track".to_owned(), |bar| {
+                format!("bar {} (bar index {bar})", bar + 1)
+            });
+            let _ = writeln!(s, "    comment on {location}: {:?}", comment.text);
+        }
     }
     let _ = writeln!(s, "patterns:");
     for pat in &p.patterns {
@@ -164,7 +189,22 @@ pub fn summary(p: &Project) -> String {
                 let _ = writeln!(s, "  {} step {} steps × {} rows", sp.id, sp.steps, sp.rows.len());
             }
             daw_core::project::Pattern::PianoRoll(pr) => {
-                let _ = writeln!(s, "  {} piano-roll {} bars, {} notes", pr.id, pr.bars, pr.notes.len());
+                let leg = if pr.legato {
+                    format!(" leg(+{}t)", pr.legato_overlap_ticks)
+                } else {
+                    String::new()
+                };
+                let cc = if pr.cc_events.is_empty() {
+                    String::new()
+                } else {
+                    format!(" cc[{}]", pr.cc_events.len())
+                };
+                let pb = if pr.pitch_bends.is_empty() {
+                    String::new()
+                } else {
+                    format!(" pb[{}]", pr.pitch_bends.len())
+                };
+                let _ = writeln!(s, "  {} piano-roll {} bars, {} notes{}{}{}", pr.id, pr.bars, pr.notes.len(), leg, cc, pb);
             }
         }
     }
@@ -236,13 +276,17 @@ mod tests {
     }
 
     #[test]
-    fn summary_lists_tracks_patterns_region() {
-        let p = daw_core::project::Project::default_project();
+    fn summary_lists_tracks_patterns_region_and_comments() {
+        let mut p = daw_core::project::Project::default_project();
+        p.tracks[0].set_comment(None, "Keep the kick dry.").unwrap();
+        p.tracks[1].set_comment(Some(4), "Leave room for the guitar.").unwrap();
         let s = summary(&p);
         assert!(s.contains("Drums"), "{s}");
         assert!(s.contains("Bass"));
         assert!(s.contains("bpm 120"));
         assert!(s.contains("loop"), "region line present");
         assert!(s.contains("p1") && s.contains("p2"), "pattern ids");
+        assert!(s.contains("comment on whole track: \"Keep the kick dry.\""));
+        assert!(s.contains("comment on bar 5 (bar index 4): \"Leave room for the guitar.\""));
     }
 }

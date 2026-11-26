@@ -196,6 +196,11 @@ pub(super) fn instrument_label(t: &daw_core::project::Track) -> String {
         AudioFile { .. } => "Audio".to_string(),
         Sampler { pads } => format!("Sampler ({} pads, {} takes)", pads.len(), pads.iter().map(|p| p.variants.len()).sum::<usize>()),
         Clap(slot) => slot.id.clone(),
+        Sfz { path } => std::path::Path::new(path)
+            .file_stem()
+            .and_then(|s| s.to_str())
+            .unwrap_or("SFZ")
+            .to_string(),
     }
 }
 

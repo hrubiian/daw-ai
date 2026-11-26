@@ -1,5 +1,5 @@
 use super::*;
-use daw_core::musical_time::{seconds_per_bar, BEATS_PER_BAR, TICKS_PER_BAR, TICKS_PER_BEAT};
+use super::comments::CommentLocation;
 
 struct TimelineScrollDrag;
 
@@ -27,10 +27,13 @@ impl DawView {
         (BAR_W * self.st.arrange_zoom).clamp(MIN_BAR_W, MAX_BAR_W)
     }
 
+    fn timeline_bar_at_x(&self, x: gpui::Pixels) -> f64 {
+        let timeline_x = f64::from(f32::from(x) - TRACK_HEADER_W) + f64::from(self.st.arrange_scroll_x);
+        timeline_x / f64::from(self.bar_w())
+    }
+
     fn seek_at_timeline_x(&mut self, x: gpui::Pixels) {
-        let timeline_x = f64::from(f32::from(x) - TRACK_HEADER_W)
-            + f64::from(self.st.arrange_scroll_x);
-        let tick = (timeline_x * f64::from(TICKS_PER_BAR) / f64::from(self.bar_w())).round();
+        let tick = (self.timeline_bar_at_x(x) * f64::from(self.st.project.ticks_per_bar())).round();
         self.seek_to_tick(tick as u32);
     }
 
@@ -54,7 +57,10 @@ impl DawView {
 
     fn timeline_bars(&self, width: f32) -> u32 {
         let viewport_bars = (width / self.bar_w()).ceil() as u32;
+        let comment_end = self.st.project.tracks.iter().flat_map(|track| &track.comments)
+            .filter_map(|comment| comment.bar).max().map_or(0, |bar| bar + 1);
         self.st.project.song_bars()
+            .max(comment_end)
             .max(self.st.project.loop_region.end_bar)
             .max(viewport_bars)
             .saturating_add(8)
@@ -71,7 +77,7 @@ impl DawView {
     pub(super) fn scroll_timeline_to(&mut self, offset: f32, window: &Window) {
         self.st.arrange_scroll_x = offset.clamp(0., self.timeline_max_scroll(self.timeline_width(window)));
         // Explicit navigation can leave the playhead offscreen during playback.
-        let x = self.st.playhead() as f32 / TICKS_PER_BAR as f32 * self.bar_w();
+        let x = self.st.playhead() as f32 / self.st.project.ticks_per_bar() as f32 * self.bar_w();
         self.playhead_was_visible = (self.st.arrange_scroll_x..=self.st.arrange_scroll_x + self.timeline_width(window)).contains(&x);
     }
 
@@ -176,7 +182,8 @@ impl DawView {
             // The plugged instrument shows in the accent color so it's an
             // obvious, always-visible confirmation of what's loaded.
             let instr_color = match &t.instrument {
-                daw_core::project::Instrument::Soundfont { bank: 0, .. } => accent,
+                daw_core::project::Instrument::Soundfont { bank: 0, .. }
+                | daw_core::project::Instrument::Sfz { .. } => accent,
                 _ => theme.text_dim,
             };
             let tcolor = track_color(ti);
@@ -194,6 +201,14 @@ impl DawView {
                 .border_b_1()
                 .border_color(rgb(theme.border))
                 .cursor_pointer()
+                .on_mouse_down(gpui::MouseButton::Right, cx.listener({
+                    let id = id.clone();
+                    move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        this.open_comment_menu(CommentLocation { track_id: id.clone(), bar: None }, event.position);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
                 .on_click(cx.listener({
                     let id = id.clone();
                     move |this, _e, _w, cx| {
@@ -232,6 +247,9 @@ impl DawView {
                                     }))
                                     .into_any_element()
                             })
+                            .children(t.comment(None).map(|text| self.comment_pin(
+                                CommentLocation { track_id: id.clone(), bar: None }, text, 22., cx,
+                            )))
                             .child(theme.cell_btn(format!("m-{id}"), "M", muted, RECORD).on_click(cx.listener({
                                 let id = id.clone();
                                 move |this, _e, _w, cx| {
@@ -372,12 +390,16 @@ impl DawView {
         let accent = self.accent();
         let bars = self.timeline_bars(vis_w);
         let cur_bar = self.st.current_bar();
-        let bar_seconds = seconds_per_bar(self.st.project.project.bpm);
+        let tpb_u32 = self.st.project.ticks_per_bar();
+        let bpb = self.st.project.beats_per_bar();
+        let meter_beat_ticks = self.st.project.ticks_per_meter_beat();
+        let spb_steps = self.st.project.steps_per_bar();
+        let bar_seconds = self.st.project.seconds_per_bar();
         let bw = self.bar_w();
         let pps = (bw as f64 / bar_seconds) as f32; // pixels per second
         let scroll_x = self.st.arrange_scroll_x;
         let playhead_x = self.st.playhead() as f32
-            / TICKS_PER_BAR as f32 * bw - scroll_x;
+            / tpb_u32 as f32 * bw - scroll_x;
         let document_w = (bars as f32 * bw).max(vis_w);
 
         // Virtualize: only build the bars within the visible scroll window (plus a
@@ -421,8 +443,8 @@ impl DawView {
             }));
 
         // Hide labels first and then ticks as the available space per beat shrinks.
-        let beat_w = bw / BEATS_PER_BAR as f32;
-        let active_beat = (self.st.playhead() % TICKS_PER_BAR) / TICKS_PER_BEAT;
+        let beat_w = bw / bpb as f32;
+        let active_beat = (self.st.playhead() % tpb_u32) / meter_beat_ticks;
         let label_stride = if bw >= 32. { 1 } else if bw >= 16. { 2 } else { 4 };
         let ruler = div()
             .flex()
@@ -450,7 +472,7 @@ impl DawView {
                         .children(b.is_multiple_of(label_stride).then(|| (b + 1).to_string())))
                     .children((beat_w >= 4.).then(|| {
                         div().flex().border_t_1().border_color(rgb(theme.border)).children(
-                            (0..BEATS_PER_BAR).map(|beat| {
+                            (0..bpb).map(|beat| {
                                 let active = b == cur_bar && beat == active_beat;
                                 div().w(px(beat_w)).h(px(14.)).flex_shrink_0()
                                     .border_l_1().border_color(rgb(if active { accent } else { theme.border }))
@@ -467,7 +489,7 @@ impl DawView {
                     }))
             }));
 
-        let tpb = TICKS_PER_BAR as f32;
+        let tpb = tpb_u32 as f32;
         // One lane per track; clip blocks span their bars (in document flow), empty
         // bars are grid cells. A clip's sub-bar `offset_ticks` is shown as a small
         // left margin so off-grid starts are visible; the engine plays the true
@@ -484,7 +506,7 @@ impl DawView {
                 .filter(|s| s.track == t.id)
                 .filter_map(|s| {
                     let pat = self.st.project.patterns.iter().find(|p| p.id() == s.pattern)?;
-                    let span = s.len_bars.unwrap_or_else(|| pat.bars().max(1)).max(1);
+                    let span = s.len_bars.unwrap_or_else(|| pat.bars_in(spb_steps).max(1)).max(1);
                     Some((s.bar, s.offset_ticks, span, pat.name().to_string(), s.pattern.clone()))
                 })
                 .collect();
@@ -542,7 +564,7 @@ impl DawView {
                                     .map(|p| {
                                         // Clip-local x of the visible timeline window.
                                         let clip_x = bar as f32 * bw + off_px;
-                                        clip_preview_marks_in(p, bw * span as f32, th - 8.0, span * TICKS_PER_BAR,
+                                        clip_preview_marks_in(p, bw * span as f32, th - 8.0, span * tpb_u32,
                                             scroll_x - clip_x - 16.0, scroll_x - clip_x + vis_w + 16.0)
                                     })
                                     .unwrap_or_default();
@@ -781,6 +803,7 @@ impl DawView {
                 }).collect();
 
             div()
+                .id(SharedString::from(format!("track-lane-{tid}")))
                 .relative()
                 .flex()
                 .items_center()
@@ -788,8 +811,27 @@ impl DawView {
                 .flex_shrink_0()
                 .border_b_1()
                 .border_color(rgb(theme.border))
+                .on_mouse_down(gpui::MouseButton::Right, cx.listener({
+                    let tid = tid.clone();
+                    move |this, event: &gpui::MouseDownEvent, _, cx| {
+                        let bar = this.timeline_bar_at_x(event.position.x).floor() as u32;
+                        this.open_comment_menu(CommentLocation { track_id: tid.clone(), bar: Some(bar) }, event.position);
+                        cx.stop_propagation();
+                        cx.notify();
+                    }
+                }))
                 .children(cells)
                 .children(audio_blocks)
+                .children(self.volume_automation_open.then(|| self.volume_lane(t, vis_w, cx)))
+                .children(t.comments.iter().filter_map(|comment| {
+                    let bar = comment.bar.filter(|bar| (first_bar..last_bar).contains(bar))?;
+                    let pin_width = bw.min(22.);
+                    Some(div().absolute().left(px((bar + 1) as f32 * bw - pin_width)).bottom_1()
+                        .child(self.comment_pin(
+                            CommentLocation { track_id: tid.clone(), bar: Some(bar) },
+                            &comment.text, pin_width, cx,
+                        )))
+                }))
         });
 
         // Shift the document within stationary viewports so the ruler, lanes
